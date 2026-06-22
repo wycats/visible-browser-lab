@@ -1,0 +1,25 @@
+[package]
+name = "visible-browser-lab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[[bin]]
+name = "visible-browser-lab-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6.1", features = ["derive"] }
+rmcp = { version = "1.7.0", features = ["transport-io"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["fs", "macros", "rt-multi-thread"] }
+tokio-tungstenite = "0.29.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3.23"
