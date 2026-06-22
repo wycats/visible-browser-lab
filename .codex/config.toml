@@ -1,0 +1,17 @@
+[mcp_servers.visible-playwright]
+command = "npx"
+args = [
+    "-y",
+    "@playwright/mcp@latest",
+    "--cdp-endpoint=http://127.0.0.1:9222",
+    "--browser=chrome",
+]
+
+[mcp_servers.visible-devtools]
+command = "npx"
+args = [
+    "-y",
+    "chrome-devtools-mcp@latest",
+    "--browserUrl=http://127.0.0.1:9222",
+    "--no-usage-statistics",
+]

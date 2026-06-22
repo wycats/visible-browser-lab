@@ -1,0 +1,22 @@
+{
+  "name": "visible-browser-lab",
+  "version": "0.1.0+codex.20260620214718",
+  "description": "Visible Chrome automation through a shared CDP endpoint",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Visible Browser Lab",
+    "shortDescription": "Control a visible Chrome profile through CDP-backed MCP tools.",
+    "longDescription": "Visible Browser Lab launches a persistent visible Chrome profile and connects Codex automation to it through a shared Chrome DevTools Protocol endpoint.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "browser",
+      "mcp"
+    ],
+    "defaultPrompt": "Use the visible browser lab workflow."
+  },
+  "mcpServers": "./.mcp.json"
+}
