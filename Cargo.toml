@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.6.1", features = ["derive"] }
 fs2 = "0.4"
+interprocess = { version = "2.4.2", features = ["tokio"] }
 libc = "0.2"
 rmcp = { version = "1.7.0", features = ["transport-io"] }
 serde = { version = "1.0", features = ["derive"] }

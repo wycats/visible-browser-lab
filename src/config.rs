@@ -38,14 +38,14 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct BrokerArgs {
-    #[arg(long, value_name = "PATH")]
-    pub socket: Option<PathBuf>,
+    #[arg(long, value_name = "ENDPOINT")]
+    pub socket: Option<String>,
 }
 
 impl BrokerArgs {
     pub fn apply(self, mut config: RuntimeConfig) -> RuntimeConfig {
-        if let Some(socket_path) = self.socket {
-            config.socket_path = socket_path;
+        if let Some(ipc_endpoint) = self.socket {
+            config.ipc_endpoint = ipc_endpoint;
         }
 
         config
@@ -79,6 +79,7 @@ impl RuntimeOptions {
 pub struct RuntimeConfig {
     pub cdp_endpoint: String,
     pub state_dir: PathBuf,
+    pub ipc_endpoint: String,
     pub socket_path: PathBuf,
     pub lock_path: PathBuf,
     pub pid_path: PathBuf,
@@ -91,6 +92,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             cdp_endpoint,
+            ipc_endpoint: derive_ipc_endpoint(&state_dir),
             socket_path: state_dir.join("broker.sock"),
             lock_path: state_dir.join("broker.lock"),
             pid_path: state_dir.join("broker.pid"),
@@ -98,6 +100,10 @@ impl RuntimeConfig {
             state_dir,
         })
     }
+}
+
+pub fn derive_ipc_endpoint(state_dir: &std::path::Path) -> String {
+    crate::ipc::default_endpoint_display(state_dir)
 }
 
 pub fn resolve_cdp_endpoint(
@@ -200,6 +206,10 @@ mod tests {
             PathBuf::from("/tmp/visible-browser-lab-test/broker.sock")
         );
         assert_eq!(
+            config.ipc_endpoint,
+            "/tmp/visible-browser-lab-test/broker.sock"
+        );
+        assert_eq!(
             config.lock_path,
             PathBuf::from("/tmp/visible-browser-lab-test/broker.lock")
         );
@@ -234,6 +244,6 @@ mod tests {
             panic!("expected broker subcommand");
         };
 
-        assert_eq!(args.socket, Some(PathBuf::from("/tmp/lab.sock")));
+        assert_eq!(args.socket.as_deref(), Some("/tmp/lab.sock"));
     }
 }
