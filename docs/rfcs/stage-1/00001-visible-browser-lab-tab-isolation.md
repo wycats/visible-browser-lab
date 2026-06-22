@@ -72,7 +72,7 @@ The MCP server is a Rust facade over the visible Chrome CDP endpoint. It provide
 
 The first implementation uses direct CDP for the broker and tab actions. It must not expose arbitrary raw Playwright or DevTools pass-through calls, because pass-through calls bypass the lease boundary.
 
-## Build and Package Shape
+## Build Shape
 
 Add a root Rust package to this plugin repo:
 
@@ -97,14 +97,6 @@ Use these implementation choices for v1:
 - Internal broker protocol: newline-delimited JSON request/response over Unix domain sockets using `tokio::net::UnixListener` and `UnixStream`.
 
 Do not add a browser automation dependency that reintroduces global page selection as the primary abstraction.
-
-Package this repository for all three agent surfaces, following the local pattern in `/Users/wycats/Code/vscode-ai-plugin`:
-
-- Codex: build a `.codex-plugin` package and publish a generated Codex marketplace root to a `codex-plugin` branch.
-- Claude Code: build a `.claude-plugin` package and publish a generated Claude Code marketplace root to a `cc-plugin` branch.
-- VS Code: build a VS Code plugin output under `dist/visible-browser-lab/` and publish a root `marketplace.json` for source installation.
-
-CI should keep these generated artifacts current on pushes to `main`. The source repository remains the source of truth; generated branch or `dist/` outputs are publication targets.
 
 ## Runtime Shape
 
@@ -459,7 +451,6 @@ This RFC does not require a new Chrome profile per agent.
 7. Add `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events` after the ownership boundary is tested.
 8. Replace `.mcp.json` and `.codex/config.toml` with the facade server and remove raw wrapper exposure from this plugin.
 9. Update the skill text to describe the explicit session-and-tab workflow.
-10. Add CI packaging for Codex, Claude Code, and VS Code using the `vscode-ai-plugin` branch/output pattern as the local reference.
 
 ## Test Plan
 
@@ -489,7 +480,6 @@ Live Chrome smoke tests:
 - Verify `claim_tab` succeeds for an unowned target and refuses an owned target without takeover.
 - Verify closing a Chrome tab outside the broker marks the lease `missing` and produces `target_missing` on the next action.
 - Verify the plugin exposes only `visible-browser-lab` and no raw `visible-playwright` or `visible-devtools` tools.
-- Verify CI package scripts can build Codex, Claude Code, and VS Code artifacts without changing source files outside the expected generated output locations.
 
 ## Acceptance Criteria
 
@@ -498,7 +488,5 @@ An agent using the visible-browser-lab skill can open, list, inspect, and naviga
 An agent cannot mutate another agent's tab unless it performs a takeover call that records user instruction text.
 
 The raw wrapper MCP servers are no longer exposed by `.mcp.json`, `.codex/config.toml`, or the visible-browser-lab skill.
-
-Codex, Claude Code, and VS Code plugin artifacts can be built and published from CI so installed copies can stay current.
 
 The RFC's implementation can start without deciding identity model, crate layout, broker lifecycle, broker socket protocol, tab listing shape, tab state transitions, direct CDP action semantics, endpoint precedence, or test layers.
