@@ -117,7 +117,7 @@ The release workflow attaches:
 - `SHA256SUMS`;
 - GitHub artifact attestations for release artifacts.
 
-Real publication runs only from protected `v*` tags. Dry-run release builds may run manually without publishing a release.
+Real publication runs only from protected `v*` tags. Pull requests run the release workflow as a dry-run: they build binaries, package assets, write checksums, validate package contents, and upload workflow artifacts without creating a GitHub Release. Manual dry-runs remain available after the workflow exists on the default branch.
 
 Repository protection is configured outside this repo: mandatory pull requests, required checks, resolved conversations, protected `main`, and protected `v*` tags.
 
@@ -126,7 +126,7 @@ Repository protection is configured outside this repo: mandatory pull requests, 
 Add release-oriented workflows:
 
 - A PR validation workflow builds and tests the crate on native Linux, macOS, and Windows runners.
-- A release workflow builds every target binary, packages every host/target archive, writes checksums, generates artifact attestations, and publishes a GitHub Release for protected version tags.
+- A release workflow builds every target binary, packages every host/target archive, writes checksums, generates artifact attestations, runs as a PR dry-run, and publishes a GitHub Release only for protected version tags.
 
 Workflow permissions should be minimal:
 
@@ -180,7 +180,7 @@ CI validation:
 
 Release validation:
 
-- Run release workflow in dry-run mode before publishing.
+- Run the release workflow in PR dry-run mode before merging the publishing change.
 - Verify GitHub Release assets, checksums, and attestations are generated from the same commit.
 - Verify Codex, Claude Code, and VS Code package archives can be unpacked and locate their packaged binary.
 
