@@ -50,9 +50,12 @@ pub struct GlobalTabSummary {
     pub target_id: String,
     pub title: String,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_display_id: Option<OwnerDisplayId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_label: Option<String>,
     pub owned_by_caller: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_tab_id: Option<TabId>,
     pub claimable: bool,
     pub focused: bool,
@@ -60,7 +63,9 @@ pub struct GlobalTabSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalTabGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_display_id: Option<OwnerDisplayId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_label: Option<String>,
     pub tabs: Vec<GlobalTabSummary>,
 }
@@ -77,7 +82,6 @@ pub enum RecoveryAction {
     StartSession,
     ListTabs,
     NewTab,
-    CreateReplacementTab,
     ClaimExistingTab,
     ReleaseTab,
     StartChrome,
@@ -87,14 +91,32 @@ pub enum RecoveryAction {
 pub struct BrowserToolError {
     pub code: BrowserToolErrorCode,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryAction>,
+}
+
+impl BrowserToolError {
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::InvalidInput,
+            message: message.into(),
+            recovery: None,
+        }
+    }
+
+    pub fn chrome_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ChromeUnavailable,
+            message: message.into(),
+            recovery: Some(RecoveryAction::StartChrome),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserToolErrorCode {
     ChromeUnavailable,
-    MissingAgentSessionId,
     UnknownSession,
     UnknownTab,
     TabNotOwned,
@@ -139,7 +161,7 @@ mod tests {
 
         let value = serde_json::to_value(summary).unwrap();
 
-        assert!(value.get("caller_tab_id").unwrap().is_null());
+        assert!(value.get("caller_tab_id").is_none());
         assert!(value.get("owner_display_id").is_some());
         assert!(value.get("owner_session_id").is_none());
     }
