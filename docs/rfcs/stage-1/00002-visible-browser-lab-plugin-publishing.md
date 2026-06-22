@@ -1,128 +1,197 @@
 <!-- exo:2 ulid:01kvrete0gprvgvsnrfm67dzhv -->
 
-# RFC 2: Visible Browser Lab Plugin Publishing
+# RFC 00002: Visible Browser Lab Plugin Publishing
 
 ## Summary
 
-Visible Browser Lab should be installable and updateable through the agent surfaces where this browser tooling is used: Codex, Claude Code, and VS Code. Today the repository is a local plugin source tree. That is enough for development, but it does not give us a repeatable publishing path for installed copies or a CI check that generated plugin artifacts stay current.
+Visible Browser Lab should be installable and updateable through the agent surfaces where this browser tooling is used: Codex, Claude Code, and VS Code. The repository is currently a local plugin source tree. That is enough for development, but not enough for installed copies that should run without a local Rust toolchain or a local source checkout.
 
-This RFC adds a publishing track for the repository. It follows the local packaging pattern in `/Users/wycats/Code/vscode-ai-plugin`: keep source files on `main`, generate marketplace or installable outputs from CI, and publish those outputs to the expected branch or directory for each host.
+This RFC adds a trusted binary publishing track. CI builds the Rust MCP facade for supported platforms, packages each host plugin around a prebuilt binary, and publishes immutable GitHub Release assets with checksums and provenance. Installed machines consume release artifacts. They do not compile Rust and they do not need Node or pnpm at runtime.
 
-This RFC is independent from the tab-isolation MCP facade. The facade can ship without publishing automation, and publishing automation can be implemented once the plugin surface is ready to distribute.
+This publishing track is independent from the tab-isolation tool implementation, except that Windows release binaries require RFC 00001's broker IPC to be cross-platform.
 
 ## Current State
 
-The repository currently contains a Codex plugin manifest at `.codex-plugin/plugin.json`, local skill files under `skills/`, local MCP configuration, shell scripts, and the new Rust MCP facade crate.
+The repository currently contains:
+
+- a Codex plugin manifest at `.codex-plugin/plugin.json`;
+- local skill files under `skills/`;
+- local MCP configuration;
+- shell scripts for development startup;
+- a Rust MCP facade crate.
 
 The repository does not yet contain:
 
 - a Claude Code plugin manifest or package shape;
-- a VS Code plugin output shape;
-- CI workflows for generated plugin artifacts;
-- packaging scripts that can be run locally and in CI;
-- a validation command that proves generated outputs match source.
+- a VS Code plugin package shape;
+- Rust-native packaging commands;
+- CI workflows for multi-platform release binaries;
+- GitHub Release packaging, checksums, or artifact attestations;
+- validation that proves generated packages contain only expected files.
 
 ## Proposal
 
-Add explicit packaging support for three distribution surfaces:
+Add Rust-native publishing support for three distribution surfaces:
 
 - Codex plugin distribution.
 - Claude Code plugin distribution.
 - VS Code plugin distribution.
 
-The source repository remains authoritative. Generated outputs must be reproducible from source, and CI should refresh the publication targets on pushes to `main` after validation passes.
+The source repository remains authoritative. CI builds platform binaries from protected source, assembles platform-specific plugin archives, and publishes those archives through GitHub Releases.
 
-Use `/Users/wycats/Code/vscode-ai-plugin` as the implementation reference for script names, workflow structure, branch publishing, and generated marketplace layout. Copy the pattern, not unrelated implementation details.
+Do not publish through generated branches in v1. Do not force-push publication branches. Do not require Node or pnpm for packaging or runtime.
+
+## Binary Targets
+
+Build release binaries for:
+
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+
+Windows support is part of the publishing scope. If the broker cannot compile on Windows, the publishing track is not complete.
 
 ## Package Targets
 
-### Codex
+Each release includes host-specific plugin packages for each binary target:
 
-Codex packaging produces a `.codex-plugin` package rooted in this repository's Codex manifest and plugin files.
+- Codex package archives.
+- Claude Code package archives.
+- VS Code package archives.
 
-CI publishes a generated Codex marketplace root to the `codex-plugin` branch. That branch is a publication target, not the source of truth.
+Each package archive contains exactly one prebuilt `visible-browser-lab-mcp` binary for its target platform. The generated MCP configuration points directly at that packaged binary.
 
-The generated output must include the plugin manifest, skills, scripts, MCP configuration, and built Rust binary or runnable launcher needed by installed Codex copies.
+Release assets also include individual binary archives for debugging and manual installation.
 
-### Claude Code
+## Rust-Native Tooling
 
-Claude Code packaging produces a `.claude-plugin` package with the same user-facing plugin capability: visible browser lab tooling backed by the repository's MCP facade.
+Add an `xtask` crate under `xtask/` and expose these commands:
 
-CI publishes a generated Claude Code marketplace root to the `cc-plugin` branch. That branch is a publication target, not the source of truth.
+```text
+cargo xtask validate
+cargo xtask package --target <target-triple>
+cargo xtask checksums
+```
 
-The Claude Code package should expose the same plugin name, description, skill guidance, and MCP facade entry point as the Codex package unless host-specific manifest fields require different names.
+`cargo xtask validate` checks source manifests, package inputs, and ignored runtime/build outputs.
 
-### VS Code
+`cargo xtask package --target <target-triple>` packages host plugins around an existing release binary for that target. It fails if the target binary is missing.
 
-VS Code packaging produces installable source output under `dist/visible-browser-lab/` and updates a root `marketplace.json` entry for source installation.
+`cargo xtask checksums` writes `SHA256SUMS` for generated release assets.
 
-The VS Code output must not become a hand-edited source tree. It is generated from repository source and checked by CI.
+The xtask may use only Rust dependencies. Do not add Node, pnpm, or JavaScript packaging scripts.
+
+## Package Contents
+
+Generated packages include only files required by the target host:
+
+- the appropriate plugin manifest;
+- `skills/`;
+- generated MCP configuration;
+- the target platform's `visible-browser-lab-mcp` binary;
+- minimal README or install notes if needed by the host.
+
+Generated packages must not include:
+
+- `.git/`;
+- `.exo/runtime/`;
+- Cargo `target/`;
+- local runtime logs;
+- local cache directories;
+- `.DS_Store`;
+- source files not needed by the installed plugin.
+
+## Trusted Publication
+
+GitHub Releases are the v1 publication source.
+
+The release workflow attaches:
+
+- platform-specific Codex plugin archives;
+- platform-specific Claude Code plugin archives;
+- platform-specific VS Code plugin archives;
+- individual binary archives;
+- `SHA256SUMS`;
+- GitHub artifact attestations for release artifacts.
+
+Real publication runs only from protected `v*` tags. Dry-run release builds may run manually without publishing a release.
+
+Repository protection is configured outside this repo: mandatory pull requests, required checks, resolved conversations, protected `main`, and protected `v*` tags.
 
 ## CI Shape
 
-Add workflows comparable to the `vscode-ai-plugin` publishing workflows:
+Add release-oriented workflows:
 
-- `publish-codex.yml` validates source, builds the Codex package, and publishes the generated marketplace branch.
-- `publish-cc.yml` validates source, builds the Claude Code package, and publishes the generated marketplace branch.
-- `publish-vscode.yml` validates source, builds the VS Code output, updates `dist/visible-browser-lab/` and `marketplace.json`, and commits the generated result when needed.
+- A PR validation workflow builds and tests the crate on native Linux, macOS, and Windows runners.
+- A release workflow builds every target binary, packages every host/target archive, writes checksums, generates artifact attestations, and publishes a GitHub Release for protected version tags.
 
-Workflows should run on pushes to `main`. They should be safe to rerun and should avoid creating commits when generated output is unchanged.
+Workflow permissions should be minimal:
 
-## Local Commands
+```yaml
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+```
 
-Add local package scripts so CI and developers use the same entry points:
-
-- `package-codex`
-- `publish-codex`
-- `package-cc`
-- `publish-cc`
-- `package-vscode`
-- `publish-vscode`
-- `validate`
-
-The exact runner can be chosen during implementation. If Node scripts are used, prefer the established local pattern from `vscode-ai-plugin`. If Rust or shell helpers are used, keep the command names stable and document any host-specific prerequisites.
-
-## Artifact Rules
-
-Generated publication outputs must include only files required by the target host.
-
-Generated outputs must not include local runtime state, Exo runtime files, Cargo `target/`, temporary logs, or machine-specific cache paths.
-
-The packaged MCP entry point should prefer a built release binary when available. Development launcher scripts may remain in source, but installed packages should not require a source checkout unless the target host explicitly expects source installation.
+Use GitHub-hosted runners for the supported OS/architecture matrix. If a public-preview runner label changes or is unavailable, the workflow should make that unsupported runner explicit rather than silently skipping the target.
 
 ## Non-Goals
 
-This RFC does not define browser tab isolation, the broker protocol, CDP action semantics, or MCP tool behavior.
+This RFC does not define browser tab isolation, CDP action semantics, or MCP tool behavior.
 
-This RFC does not require publishing before the MCP facade is functionally complete.
+This RFC does not publish generated plugin branches.
 
-This RFC does not require publishing secrets or marketplace credentials to be solved in the source tree. CI secret names and branch permissions can be finalized during implementation.
+This RFC does not add Node, pnpm, or JavaScript tooling.
+
+This RFC does not solve code signing or notarization. Unsigned binaries are acceptable for v1 unless host requirements force signing.
 
 ## Implementation Plan
 
-1. Inventory the packaging and workflow pattern in `/Users/wycats/Code/vscode-ai-plugin`.
-2. Add manifest/package shape for Claude Code and VS Code while preserving the existing Codex plugin manifest.
-3. Add local package scripts for Codex, Claude Code, and VS Code.
-4. Add validation that checks source manifests, generated package contents, and ignored runtime/build outputs.
-5. Add CI workflows for the three publication targets.
-6. Verify each package command locally.
-7. Verify CI leaves no source-tree changes outside expected generated outputs.
+1. Amend RFC 00001 so broker IPC is cross-platform local IPC instead of Unix sockets only.
+2. Add an Exo phase and goal for this publishing track.
+3. Replace direct Unix socket usage with a cross-platform IPC abstraction.
+4. Add the `xtask` crate and the `cargo xtask` command surface.
+5. Implement package generation for Codex, Claude Code, and VS Code.
+6. Add checksum generation and release asset validation.
+7. Add PR validation and release workflows.
+8. Verify all local commands and CI-facing package layouts.
 
 ## Test Plan
 
-- Run the shared validation command from a clean checkout.
-- Build the Codex package and inspect its generated marketplace root.
-- Build the Claude Code package and inspect its generated marketplace root.
-- Build the VS Code package and inspect `dist/visible-browser-lab/` plus root `marketplace.json`.
-- Verify generated artifacts do not include `.exo/runtime/`, Cargo `target/`, logs, or machine-local cache paths.
-- Verify workflow scripts can run idempotently without changing source files when outputs are current.
+Local validation:
+
+- `cargo test`
+- `cargo xtask validate`
+- `cargo xtask package --target <current-host-target>`
+- `cargo xtask checksums`
+- `git diff --check`
+
+CI validation:
+
+- Build all six Rust targets.
+- Run tests on native macOS, Linux, and Windows runners.
+- Verify each package contains exactly one target binary plus required plugin files.
+- Verify packages exclude `.git/`, `.exo/runtime/`, `target/`, logs, caches, and `.DS_Store`.
+- Verify generated checksums match release assets.
+
+Release validation:
+
+- Run release workflow in dry-run mode before publishing.
+- Verify GitHub Release assets, checksums, and attestations are generated from the same commit.
+- Verify Codex, Claude Code, and VS Code package archives can be unpacked and locate their packaged binary.
 
 ## Acceptance Criteria
 
-Codex, Claude Code, and VS Code plugin artifacts can be generated from source with stable local commands.
+Codex, Claude Code, and VS Code plugin archives can be generated from prebuilt Rust binaries with stable Rust-native commands.
 
-CI keeps the publication targets current on pushes to `main`.
+Release packages do not require Rust, Node, pnpm, or a source checkout on the installed machine.
 
-Installed or source-installed copies can be updated through the target host's expected plugin/update mechanism.
+CI builds macOS, Linux, and Windows binaries, including ARM targets.
 
-The tab-isolation RFC remains focused on the MCP facade and does not carry publishing requirements.
+GitHub Releases contain package archives, binary archives, checksums, and artifact attestations.
+
+No publication path relies on local force pushes or generated branch publishing.

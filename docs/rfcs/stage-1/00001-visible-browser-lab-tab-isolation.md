@@ -94,7 +94,7 @@ Use these implementation choices for v1:
 - Async runtime: `tokio`.
 - CDP transport: direct websocket JSON using `tokio-tungstenite` and `serde_json`.
 - ID generation: `rand` or `uuid` with at least 128 bits of CSPRNG entropy.
-- Internal broker protocol: newline-delimited JSON request/response over Unix domain sockets using `tokio::net::UnixListener` and `UnixStream`.
+- Internal broker protocol: newline-delimited JSON request/response over local IPC using a small cross-platform abstraction. Unix platforms use local sockets. Windows uses the corresponding Windows local IPC transport. The wire format remains the same across platforms.
 
 Do not add a browser automation dependency that reintroduces global page selection as the primary abstraction.
 
@@ -114,21 +114,21 @@ The broker mode owns CDP connections and lease state. It is a detached child pro
 State paths:
 
 ```text
-state_dir = $VISIBLE_BROWSER_LAB_STATE_DIR or /Users/wycats/.cache/visible-browser-lab
-socket = $state_dir/broker.sock
+state_dir = $VISIBLE_BROWSER_LAB_STATE_DIR or the platform cache directory for visible-browser-lab
+endpoint = a local IPC endpoint derived from $state_dir
 lock = $state_dir/broker.lock
 pid = $state_dir/broker.pid
 ```
 
 Broker startup rules:
 
-1. The facade tries to connect to `broker.sock`.
+1. The facade tries to connect to the derived broker IPC endpoint.
 2. If connect succeeds, it uses the existing broker.
 3. If connect fails, it takes `broker.lock`.
-4. After taking the lock, it retries the socket in case another process won the race.
-5. If the socket is still unavailable, it removes a stale socket only when no live `broker.pid` process exists.
+4. After taking the lock, it retries the broker IPC endpoint in case another process won the race.
+5. If the endpoint is still unavailable, it removes stale local IPC state only when no live `broker.pid` process exists.
 6. It starts `visible-browser-lab-mcp broker ...` as a detached child with stdio closed or redirected to broker log files under `state_dir/logs/`.
-7. It waits for the socket to accept connections before serving MCP calls.
+7. It waits for the broker IPC endpoint to accept connections before serving MCP calls.
 
 The broker keeps lease state in memory for v1. It does not persist leases across broker restarts. If the broker restarts, agents must call `start_session` again and claim or create tabs again. Chrome tabs and browser profile state survive because they are owned by Chrome, not by the broker.
 
@@ -444,13 +444,14 @@ This RFC does not require a new Chrome profile per agent.
 
 1. Add the root Rust package, `visible-browser-lab-mcp` binary, and wrapper script.
 2. Implement endpoint resolution and CDP availability checks.
-3. Implement detached broker startup, socket locking, stale socket cleanup, pid file handling, and newline-delimited broker RPC.
-4. Implement CDP target discovery, target creation, target activation, target close, target attachment, console buffering, and network buffering.
-5. Implement session and lease registries with CSPRNG bearer IDs and ownership checks shared by every action tool.
-6. Implement `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, and `close_tab` first.
-7. Add `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events` after the ownership boundary is tested.
-8. Replace `.mcp.json` and `.codex/config.toml` with the facade server and remove raw wrapper exposure from this plugin.
-9. Update the skill text to describe the explicit session-and-tab workflow.
+3. Implement detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
+4. Keep the broker IPC implementation cross-platform so release binaries can be built for macOS, Linux, and Windows.
+5. Implement CDP target discovery, target creation, target activation, target close, target attachment, console buffering, and network buffering.
+6. Implement session and lease registries with CSPRNG bearer IDs and ownership checks shared by every action tool.
+7. Implement `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, and `close_tab` first.
+8. Add `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events` after the ownership boundary is tested.
+9. Replace `.mcp.json` and `.codex/config.toml` with the facade server and remove raw wrapper exposure from this plugin.
+10. Update the skill text to describe the explicit session-and-tab workflow.
 
 ## Test Plan
 
@@ -466,7 +467,7 @@ Unit tests:
 Broker contract tests with a fake CDP transport:
 
 - Detached facade startup connects to an existing broker.
-- Stale socket cleanup only removes a socket when the pid file is absent or dead.
+- Stale endpoint cleanup only removes local IPC state when the pid file is absent or dead.
 - Concurrent claims for the same target serialize to one success and one `target_owned` error.
 - Broker restart clears leases without assuming Chrome tabs closed.
 - Navigation timeout, missing target, and Chrome unavailable errors return the expected `BrowserToolError` codes and recovery actions.
