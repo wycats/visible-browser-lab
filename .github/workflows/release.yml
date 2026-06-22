@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, package, checksum, and attest assets without publishing a GitHub Release.
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Native tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Validate release inputs
+        run: cargo xtask validate
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'unknown-linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target "${{ matrix.target }}" --bin visible-browser-lab-mcp
+
+      - name: Stage binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="visible-browser-lab-mcp"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          mkdir -p "dist/binaries/${target}"
+          cp "target/${target}/release/${binary}" "dist/binaries/${target}/${binary}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/binaries/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  package:
+    name: Package release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/binaries
+
+      - name: Build package archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-musl
+            aarch64-unknown-linux-musl
+            x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+          )
+
+          for target in "${targets[@]}"; do
+            binary="visible-browser-lab-mcp"
+            if [[ "$target" == *windows* ]]; then
+              binary="${binary}.exe"
+            fi
+            cargo xtask package \
+              --target "$target" \
+              --binary "dist/binaries/binary-${target}/${binary}"
+          done
+
+          cargo xtask checksums
+          cargo xtask validate
+
+      - name: Upload release assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: out/packages/*
+          if-no-files-found: error
+
+      - name: Generate artifact attestations
+        uses: actions/attest@v4
+        with:
+          subject-path: out/packages/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: out/packages
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" out/packages/* \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Trusted binary release for visible-browser-lab."
