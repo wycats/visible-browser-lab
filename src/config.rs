@@ -205,10 +205,15 @@ mod tests {
             config.socket_path,
             PathBuf::from("/tmp/visible-browser-lab-test/broker.sock")
         );
-        assert_eq!(
-            config.ipc_endpoint,
-            "/tmp/visible-browser-lab-test/broker.sock"
-        );
+        if cfg!(windows) {
+            assert!(config.ipc_endpoint.starts_with("visible-browser-lab-"));
+            assert!(!config.ipc_endpoint.contains('/'));
+        } else {
+            assert_eq!(
+                config.ipc_endpoint,
+                "/tmp/visible-browser-lab-test/broker.sock"
+            );
+        }
         assert_eq!(
             config.lock_path,
             PathBuf::from("/tmp/visible-browser-lab-test/broker.lock")
