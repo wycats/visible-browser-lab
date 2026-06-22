@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind},
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
@@ -10,12 +10,12 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     time::{Instant, sleep},
 };
 
 use crate::{
     config::RuntimeConfig,
+    ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::BrowserToolError,
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
@@ -28,18 +28,17 @@ const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 pub async fn run(config: RuntimeConfig) -> Result<()> {
     prepare_state(&config).await?;
 
-    let listener = UnixListener::bind(&config.socket_path).with_context(|| {
-        format!(
-            "failed to bind broker socket `{}`",
-            config.socket_path.display()
-        )
-    })?;
+    let endpoint = broker_endpoint(&config)?;
+    let listener = endpoint.listen()?;
     write_pid_file(&config).await?;
-    let _runtime_files = RuntimeFileGuard::new(config.pid_path.clone(), config.socket_path.clone());
+    let _runtime_files = RuntimeFileGuard::new(
+        config.pid_path.clone(),
+        endpoint.stale_path().map(Path::to_path_buf),
+    );
 
     tracing::info!(
         cdp_endpoint = %config.cdp_endpoint,
-        socket = %config.socket_path.display(),
+        ipc_endpoint = %endpoint.display(),
         state_dir = %config.state_dir.display(),
         "visible browser broker listening"
     );
@@ -62,7 +61,7 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
                 return Ok(client);
             }
 
-            cleanup_stale_socket(config)?;
+            cleanup_stale_endpoint(config)?;
             spawn_broker(config)?;
             return wait_for_broker(config, BROKER_START_TIMEOUT).await;
         }
@@ -88,40 +87,46 @@ pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn cleanup_stale_socket(config: &RuntimeConfig) -> Result<StaleSocketCleanup> {
-    if !config.socket_path.exists() {
-        return Ok(StaleSocketCleanup::NoSocket);
+pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCleanup> {
+    let endpoint = broker_endpoint(config)?;
+    let Some(stale_path) = endpoint.stale_path() else {
+        return Ok(StaleEndpointCleanup::NoFilesystemEndpoint);
+    };
+
+    if !stale_path.exists() {
+        return Ok(StaleEndpointCleanup::NoEndpoint);
     }
 
     match read_pid(&config.pid_path)? {
         Some(pid) if process_is_alive(pid) => bail!(
-            "broker socket `{}` is unavailable but pid `{pid}` is still alive",
-            config.socket_path.display()
+            "broker IPC `{}` is unavailable but pid `{pid}` is still alive",
+            endpoint.display()
         ),
         Some(_) => {
-            fs::remove_file(&config.socket_path).with_context(|| {
+            fs::remove_file(stale_path).with_context(|| {
                 format!(
-                    "failed to remove stale broker socket `{}`",
-                    config.socket_path.display()
+                    "failed to remove stale broker endpoint `{}`",
+                    endpoint.display()
                 )
             })?;
             let _ = fs::remove_file(&config.pid_path);
-            Ok(StaleSocketCleanup::RemovedDeadPid)
+            Ok(StaleEndpointCleanup::RemovedDeadPid)
         }
         None => {
-            fs::remove_file(&config.socket_path).with_context(|| {
+            fs::remove_file(stale_path).with_context(|| {
                 format!(
-                    "failed to remove stale broker socket `{}`",
-                    config.socket_path.display()
+                    "failed to remove stale broker endpoint `{}`",
+                    endpoint.display()
                 )
             })?;
-            Ok(StaleSocketCleanup::RemovedWithoutPid)
+            Ok(StaleEndpointCleanup::RemovedWithoutPid)
         }
     }
 }
 
 async fn connect_and_ping(config: &RuntimeConfig) -> Result<BrokerClient> {
-    let mut client = BrokerClient::connect(&config.socket_path).await?;
+    let endpoint = broker_endpoint(config)?;
+    let mut client = BrokerClient::connect(&endpoint).await?;
     client.ping().await?;
     Ok(client)
 }
@@ -136,7 +141,7 @@ async fn wait_for_broker(config: &RuntimeConfig, timeout: Duration) -> Result<Br
                 return Err(error).with_context(|| {
                     format!(
                         "timed out waiting for broker socket `{}`",
-                        config.socket_path.display()
+                        config.ipc_endpoint
                     )
                 });
             }
@@ -155,7 +160,7 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
     let child = Command::new(current_exe)
         .arg("broker")
         .arg("--socket")
-        .arg(&config.socket_path)
+        .arg(&config.ipc_endpoint)
         .arg("--cdp-endpoint")
         .arg(&config.cdp_endpoint)
         .arg("--state-dir")
@@ -168,7 +173,7 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
 
     tracing::info!(
         pid = child.id(),
-        socket = %config.socket_path.display(),
+        ipc_endpoint = %config.ipc_endpoint,
         "spawned visible browser broker"
     );
 
@@ -184,9 +189,9 @@ async fn write_pid_file(config: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-async fn serve(config: RuntimeConfig, listener: UnixListener) -> Result<()> {
+async fn serve(config: RuntimeConfig, listener: BrokerListener) -> Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = ipc::accept(&listener).await?;
         let connection_config = config.clone();
 
         tokio::spawn(async move {
@@ -197,11 +202,17 @@ async fn serve(config: RuntimeConfig, listener: UnixListener) -> Result<()> {
     }
 }
 
-async fn handle_connection(config: RuntimeConfig, stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+async fn handle_connection(config: RuntimeConfig, stream: BrokerStream) -> Result<()> {
+    let mut stream = BufReader::new(stream);
 
-    while let Some(line) = lines.next_line().await? {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = stream.read_line(&mut line).await?;
+        if bytes == 0 {
+            break;
+        }
+
         let response = match serde_json::from_str::<BrokerRequest>(&line) {
             Ok(request) => dispatch_request(&config, request),
             Err(error) => BrokerResponse::invalid_input(
@@ -211,9 +222,9 @@ async fn handle_connection(config: RuntimeConfig, stream: UnixStream) -> Result<
         };
         let encoded = serde_json::to_string(&response)?;
 
-        writer.write_all(encoded.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        stream.get_mut().write_all(encoded.as_bytes()).await?;
+        stream.get_mut().write_all(b"\n").await?;
+        stream.get_mut().flush().await?;
     }
 
     Ok(())
@@ -242,8 +253,13 @@ fn broker_status(config: &RuntimeConfig) -> BrokerStatus {
         protocol_version: BROKER_PROTOCOL_VERSION,
         pid: std::process::id(),
         cdp_endpoint: config.cdp_endpoint.clone(),
+        ipc_endpoint: config.ipc_endpoint.clone(),
         socket_path: config.socket_path.clone(),
     }
+}
+
+fn broker_endpoint(config: &RuntimeConfig) -> Result<BrokerEndpoint> {
+    BrokerEndpoint::from_state(&config.state_dir, Some(&config.ipc_endpoint))
 }
 
 fn read_pid(path: &Path) -> Result<Option<u32>> {
@@ -259,17 +275,38 @@ fn process_is_alive(pid: u32) -> bool {
         return false;
     }
 
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return true;
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
 
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        let Ok(output) = Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+
+        if !output.status.success() {
+            return false;
+        }
+
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaleSocketCleanup {
-    NoSocket,
+pub enum StaleEndpointCleanup {
+    NoEndpoint,
+    NoFilesystemEndpoint,
     RemovedWithoutPid,
     RemovedDeadPid,
 }
@@ -305,14 +342,14 @@ impl Drop for BrokerStartLock {
 
 struct RuntimeFileGuard {
     pid_path: PathBuf,
-    socket_path: PathBuf,
+    stale_path: Option<PathBuf>,
 }
 
 impl RuntimeFileGuard {
-    fn new(pid_path: PathBuf, socket_path: PathBuf) -> Self {
+    fn new(pid_path: PathBuf, stale_path: Option<PathBuf>) -> Self {
         Self {
             pid_path,
-            socket_path,
+            stale_path,
         }
     }
 }
@@ -320,7 +357,9 @@ impl RuntimeFileGuard {
 impl Drop for RuntimeFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.pid_path);
-        let _ = fs::remove_file(&self.socket_path);
+        if let Some(stale_path) = &self.stale_path {
+            let _ = fs::remove_file(stale_path);
+        }
     }
 }
 
@@ -350,15 +389,16 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let listener = UnixListener::bind(&config.socket_path).unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
         let server = tokio::spawn(serve(config.clone(), listener));
 
-        let mut client = BrokerClient::connect(&config.socket_path).await.unwrap();
+        let mut client = BrokerClient::connect(&endpoint).await.unwrap();
         let status = client.ping().await.unwrap();
 
         assert_eq!(status.protocol_version, BROKER_PROTOCOL_VERSION);
         assert_eq!(status.cdp_endpoint, "http://127.0.0.1:9222");
-        assert_eq!(status.socket_path, config.socket_path);
+        assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
     }
@@ -368,39 +408,48 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let listener = UnixListener::bind(&config.socket_path).unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
         let server = tokio::spawn(serve(config.clone(), listener));
 
         let mut client = ensure_running(&config).await.unwrap();
         let status = client.ping().await.unwrap();
 
-        assert_eq!(status.socket_path, config.socket_path);
+        assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
     }
 
     #[test]
     fn stale_socket_cleanup_removes_socket_when_pid_is_missing() {
+        if cfg!(windows) {
+            return;
+        }
+
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         fs::create_dir_all(&config.state_dir).unwrap();
         File::create(&config.socket_path).unwrap();
 
-        let result = cleanup_stale_socket(&config).unwrap();
+        let result = cleanup_stale_endpoint(&config).unwrap();
 
-        assert_eq!(result, StaleSocketCleanup::RemovedWithoutPid);
+        assert_eq!(result, StaleEndpointCleanup::RemovedWithoutPid);
         assert!(!config.socket_path.exists());
     }
 
     #[test]
     fn stale_socket_cleanup_preserves_socket_when_pid_is_alive() {
+        if cfg!(windows) {
+            return;
+        }
+
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         fs::create_dir_all(&config.state_dir).unwrap();
         File::create(&config.socket_path).unwrap();
         fs::write(&config.pid_path, std::process::id().to_string()).unwrap();
 
-        let error = cleanup_stale_socket(&config).unwrap_err();
+        let error = cleanup_stale_endpoint(&config).unwrap_err();
 
         assert!(error.to_string().contains("still alive"));
         assert!(config.socket_path.exists());

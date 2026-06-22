@@ -1,18 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{
-        UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
-};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
-use crate::leases::{BrowserToolError, BrowserToolErrorCode};
+use crate::{
+    ipc::{BrokerEndpoint, BrokerStream},
+    leases::{BrowserToolError, BrowserToolErrorCode},
+};
 
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 
@@ -21,6 +18,7 @@ pub struct BrokerStatus {
     pub protocol_version: u32,
     pub pid: u32,
     pub cdp_endpoint: String,
+    pub ipc_endpoint: String,
     pub socket_path: PathBuf,
 }
 
@@ -67,27 +65,18 @@ impl BrokerResponse {
 }
 
 pub struct BrokerClient {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    stream: BufReader<BrokerStream>,
 }
 
 impl BrokerClient {
-    pub async fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path).await.with_context(|| {
-            format!(
-                "failed to connect to broker socket `{}`",
-                socket_path.display()
-            )
-        })?;
+    pub async fn connect(endpoint: &BrokerEndpoint) -> Result<Self> {
+        let stream = endpoint.connect().await?;
         Ok(Self::new(stream))
     }
 
-    pub fn new(stream: UnixStream) -> Self {
-        let (reader, writer) = stream.into_split();
-
+    pub fn new(stream: BrokerStream) -> Self {
         Self {
-            reader: BufReader::new(reader),
-            writer,
+            stream: BufReader::new(stream),
         }
     }
 
@@ -108,12 +97,12 @@ impl BrokerClient {
         };
         let encoded = serde_json::to_string(&request)?;
 
-        self.writer.write_all(encoded.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
+        self.stream.get_mut().write_all(encoded.as_bytes()).await?;
+        self.stream.get_mut().write_all(b"\n").await?;
+        self.stream.get_mut().flush().await?;
 
         let mut line = String::new();
-        let bytes = self.reader.read_line(&mut line).await?;
+        let bytes = self.stream.read_line(&mut line).await?;
         if bytes == 0 {
             bail!("broker closed the socket before responding to `{method}`");
         }
