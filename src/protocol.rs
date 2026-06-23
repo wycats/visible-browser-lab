@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -8,7 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     ipc::{BrokerEndpoint, BrokerStream},
-    leases::{BrowserToolError, BrowserToolErrorCode},
+    leases::{
+        AgentSessionId, BrowserToolError, BrowserToolErrorCode, GlobalTabGroup, OwnedTabSummary,
+        TabId,
+    },
 };
 
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
@@ -20,6 +24,109 @@ pub struct BrokerStatus {
     pub cdp_endpoint: String,
     pub ipc_endpoint: String,
     pub socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StartSessionParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSessionResult {
+    pub agent_session_id: AgentSessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab: Option<OwnedTabSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ListTabsScope {
+    Owned,
+    GlobalReadonly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ListTabsParams {
+    pub agent_session_id: AgentSessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ListTabsScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ListTabsResult {
+    Owned { tabs: Vec<OwnedTabSummary> },
+    GlobalReadonly { groups: Vec<GlobalTabGroup> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NewTabParams {
+    pub agent_session_id: AgentSessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabResult {
+    pub tab: OwnedTabSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimTabParams {
+    pub agent_session_id: AgentSessionId,
+    pub target_id: String,
+    #[serde(default)]
+    pub takeover: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_instruction: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TabActionParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NavigateParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenshotParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    #[serde(default)]
+    pub full_page: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotResult {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseTabResult {
+    pub released: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseTabResult {
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,10 +191,9 @@ impl BrokerClient {
         self.request("ping", Value::Null).await
     }
 
-    pub async fn request<P, R>(&mut self, method: &str, params: P) -> Result<R>
+    pub async fn request_response<P>(&mut self, method: &str, params: P) -> Result<BrokerResponse>
     where
         P: Serialize,
-        R: DeserializeOwned,
     {
         let request_id = Uuid::new_v4().to_string();
         let request = BrokerRequest {
@@ -116,6 +222,16 @@ impl BrokerClient {
                 response.id
             );
         }
+
+        Ok(response)
+    }
+
+    pub async fn request<P, R>(&mut self, method: &str, params: P) -> Result<R>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = self.request_response(method, params).await?;
 
         if response.ok {
             let result = response

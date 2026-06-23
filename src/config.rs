@@ -138,8 +138,8 @@ fn normalize_cdp_endpoint(endpoint: &str) -> Result<String> {
         Url::parse(trimmed).with_context(|| format!("invalid CDP endpoint `{endpoint}`"))?;
 
     match parsed.scheme() {
-        "http" | "https" => Ok(trimmed.to_string()),
-        scheme => bail!("CDP endpoint must use http or https, not `{scheme}`"),
+        "http" => Ok(trimmed.to_string()),
+        scheme => bail!("CDP endpoint must use http, not `{scheme}`"),
     }
 }
 
@@ -190,7 +190,7 @@ mod tests {
     fn rejects_websocket_endpoints_at_runtime_boundary() {
         let err = resolve_cdp_endpoint(Some("ws://127.0.0.1:9222"), None, None).unwrap_err();
 
-        assert!(err.to_string().contains("http or https"));
+        assert!(err.to_string().contains("must use http"));
     }
 
     #[test]

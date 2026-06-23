@@ -1,20 +1,21 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AgentSessionId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct TabId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct OwnerDisplayId(pub String);
 
@@ -211,10 +212,26 @@ impl BrowserToolError {
         }
     }
 
+    pub fn target_missing_for_target(target_id: &str) -> Self {
+        Self {
+            code: BrowserToolErrorCode::TargetMissing,
+            message: format!("Chrome target `{target_id}` is not a visible page target"),
+            recovery: Some(RecoveryAction::ListTabs),
+        }
+    }
+
     pub fn target_owned(target_id: &str) -> Self {
         Self {
             code: BrowserToolErrorCode::TargetOwned,
             message: format!("Chrome target `{target_id}` is already leased"),
+            recovery: Some(RecoveryAction::ListTabs),
+        }
+    }
+
+    pub fn operation_timeout(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::OperationTimeout,
+            message: message.into(),
             recovery: Some(RecoveryAction::ListTabs),
         }
     }
@@ -250,6 +267,11 @@ impl LeaseRegistry {
 
     pub fn session(&self, session_id: &AgentSessionId) -> Option<&BrowserSession> {
         self.sessions.get(session_id)
+    }
+
+    pub fn ensure_session(&self, session_id: &AgentSessionId) -> Result<(), BrowserToolError> {
+        self.require_session(session_id)?;
+        Ok(())
     }
 
     pub fn lease_tab(
@@ -358,6 +380,48 @@ impl LeaseRegistry {
             .clone())
     }
 
+    pub fn owned_lease(
+        &self,
+        session_id: &AgentSessionId,
+        tab_id: &TabId,
+    ) -> Result<TabLease, BrowserToolError> {
+        self.require_owned_tab(session_id, tab_id)?;
+        Ok(self
+            .leases
+            .get(tab_id)
+            .expect("owned tab should exist")
+            .clone())
+    }
+
+    pub fn update_tab_snapshot(
+        &mut self,
+        tab_id: &TabId,
+        target: TabSnapshot,
+    ) -> Result<TabLease, BrowserToolError> {
+        let now = now_ms();
+        let owner_session_id;
+
+        {
+            let lease = self
+                .leases
+                .get_mut(tab_id)
+                .ok_or_else(|| BrowserToolError::unknown_tab(tab_id))?;
+            owner_session_id = lease.owner_session_id.clone();
+            lease.target_id = target.target_id;
+            lease.title = Some(target.title);
+            lease.url = Some(target.url);
+            lease.updated_at_ms = now;
+        }
+
+        self.touch_session(&owner_session_id, now);
+
+        Ok(self
+            .leases
+            .get(tab_id)
+            .expect("updated tab should still be tracked")
+            .clone())
+    }
+
     pub fn release_tab(
         &mut self,
         session_id: &AgentSessionId,
@@ -410,6 +474,24 @@ impl LeaseRegistry {
     pub fn mark_missing_by_target(&mut self, target_id: &str) -> Option<TabLease> {
         let tab_id = self.active_target_owners.get(target_id)?.clone();
         self.mark_missing(&tab_id).ok()
+    }
+
+    pub fn mark_missing_targets_not_in<I>(&mut self, visible_target_ids: I) -> Vec<TabLease>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let visible_target_ids = visible_target_ids.into_iter().collect::<HashSet<_>>();
+        let missing_tab_ids = self
+            .active_target_owners
+            .iter()
+            .filter(|(target_id, _)| !visible_target_ids.contains(*target_id))
+            .map(|(_, tab_id)| tab_id.clone())
+            .collect::<Vec<_>>();
+
+        missing_tab_ids
+            .into_iter()
+            .filter_map(|tab_id| self.mark_missing(&tab_id).ok())
+            .collect()
     }
 
     pub fn global_inventory<I>(

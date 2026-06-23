@@ -9,37 +9,227 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::{Instant, sleep},
 };
 
 use crate::{
+    cdp::{CdpClient, CdpTarget},
     config::RuntimeConfig,
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
-    leases::{BrowserToolError, LeaseRegistry},
+    leases::{
+        AgentSessionId, BrowserToolError, LeaseRegistry, LeaseState, OwnedTabSummary, TabId,
+        TabLease, TabSnapshot,
+    },
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
+        ClaimTabParams, CloseTabResult, ListTabsParams, ListTabsResult, ListTabsScope,
+        NavigateParams, NewTabParams, ReleaseTabResult, ScreenshotParams, ScreenshotResult,
+        StartSessionParams, StartSessionResult, TabActionParams, TabResult,
     },
 };
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
+const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Clone)]
 struct BrokerState {
     registry: Arc<Mutex<LeaseRegistry>>,
+    browser: BrowserBackend,
 }
 
 impl BrokerState {
-    fn new() -> Self {
+    fn new(config: &RuntimeConfig) -> Result<Self> {
+        Ok(Self {
+            registry: Arc::new(Mutex::new(LeaseRegistry::new())),
+            browser: BrowserBackend::new(&config.cdp_endpoint)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_browser(browser: BrowserBackend) -> Self {
         Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
+            browser,
         }
     }
 
     fn registry(&self) -> &Mutex<LeaseRegistry> {
         &self.registry
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FakeBrowser {
+    targets: Vec<CdpTarget>,
+    next_target: u64,
+    focused_target_id: Option<String>,
+    closed_targets: Vec<String>,
+}
+
+#[cfg(test)]
+impl FakeBrowser {
+    fn with_targets(targets: Vec<CdpTarget>) -> Self {
+        Self {
+            targets,
+            next_target: 1,
+            focused_target_id: None,
+            closed_targets: Vec::new(),
+        }
+    }
+
+    fn page_targets(&self) -> Vec<CdpTarget> {
+        self.targets.clone()
+    }
+
+    fn create_page(&mut self, url: Option<&str>, focus: bool) -> CdpTarget {
+        let id = format!("target-new-{}", self.next_target);
+        self.next_target += 1;
+        let target = CdpTarget {
+            id: id.clone(),
+            target_type: "page".to_string(),
+            title: url.unwrap_or("about:blank").to_string(),
+            url: url.unwrap_or("about:blank").to_string(),
+            web_socket_debugger_url: Some(format!("ws://fake/{id}")),
+        };
+        self.targets.push(target.clone());
+        if focus {
+            self.focused_target_id = Some(id);
+        }
+        target
+    }
+
+    fn activate_target(&mut self, target_id: &str) -> Result<(), BrowserToolError> {
+        if self.targets.iter().any(|target| target.id == target_id) {
+            self.focused_target_id = Some(target_id.to_string());
+            return Ok(());
+        }
+
+        Err(BrowserToolError::target_missing_for_target(target_id))
+    }
+
+    fn close_target(&mut self, target_id: &str) -> Result<(), BrowserToolError> {
+        let original_len = self.targets.len();
+        self.targets.retain(|target| target.id != target_id);
+        if self.targets.len() == original_len {
+            return Err(BrowserToolError::target_missing_for_target(target_id));
+        }
+
+        self.closed_targets.push(target_id.to_string());
+        Ok(())
+    }
+
+    fn navigate(&mut self, target: &CdpTarget, url: &str) -> Result<CdpTarget, BrowserToolError> {
+        let target = self
+            .targets
+            .iter_mut()
+            .find(|candidate| candidate.id == target.id)
+            .ok_or_else(|| BrowserToolError::target_missing_for_target(&target.id))?;
+        target.url = url.to_string();
+        target.title = url.to_string();
+        Ok(target.clone())
+    }
+
+    fn screenshot(&self, target: &CdpTarget, _full_page: bool) -> Result<String, BrowserToolError> {
+        if self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Ok("ZmFrZS1wbmc=".to_string());
+        }
+
+        Err(BrowserToolError::target_missing_for_target(&target.id))
+    }
+
+    fn remove_target(&mut self, target_id: &str) {
+        self.targets.retain(|target| target.id != target_id);
+    }
+
+    fn was_closed(&self, target_id: &str) -> bool {
+        self.closed_targets.iter().any(|closed| closed == target_id)
+    }
+}
+
+#[derive(Clone)]
+enum BrowserBackend {
+    Cdp(CdpClient),
+    #[cfg(test)]
+    Fake(Arc<Mutex<FakeBrowser>>),
+}
+
+impl BrowserBackend {
+    fn new(cdp_endpoint: &str) -> Result<Self> {
+        Ok(Self::Cdp(CdpClient::new(cdp_endpoint)?))
+    }
+
+    async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.page_targets().await,
+            #[cfg(test)]
+            Self::Fake(browser) => Ok(browser.lock().unwrap().page_targets()),
+        }
+    }
+
+    async fn create_page(
+        &self,
+        url: Option<&str>,
+        focus: bool,
+    ) -> Result<CdpTarget, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.create_page(url, focus).await,
+            #[cfg(test)]
+            Self::Fake(browser) => Ok(browser.lock().unwrap().create_page(url, focus)),
+        }
+    }
+
+    async fn activate_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.activate_target(target_id).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().activate_target(target_id),
+        }
+    }
+
+    async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.close_target(target_id).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().close_target(target_id),
+        }
+    }
+
+    async fn navigate(
+        &self,
+        target: &CdpTarget,
+        url: &str,
+        wait_until: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<CdpTarget, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => {
+                client.navigate(target, url, wait_until, timeout_ms).await?;
+                client.page_target(&target.id).await
+            }
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().navigate(target, url),
+        }
+    }
+
+    async fn screenshot(
+        &self,
+        target: &CdpTarget,
+        full_page: bool,
+    ) -> Result<String, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.screenshot(target, full_page).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().screenshot(target, full_page),
+        }
     }
 }
 
@@ -208,7 +398,7 @@ async fn write_pid_file(config: &RuntimeConfig) -> Result<()> {
 }
 
 async fn serve(config: RuntimeConfig, listener: BrokerListener) -> Result<()> {
-    let state = BrokerState::new();
+    let state = BrokerState::new(&config)?;
 
     loop {
         let stream = ipc::accept(&listener).await?;
@@ -240,7 +430,7 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<BrokerRequest>(&line) {
-            Ok(request) => dispatch_request(&config, &state, request),
+            Ok(request) => dispatch_request(&config, &state, request).await,
             Err(error) => BrokerResponse::invalid_input(
                 String::new(),
                 format!("invalid broker request JSON: {error}"),
@@ -256,13 +446,11 @@ async fn handle_connection(
     Ok(())
 }
 
-fn dispatch_request(
+async fn dispatch_request(
     config: &RuntimeConfig,
     state: &BrokerState,
     request: BrokerRequest,
 ) -> BrokerResponse {
-    let _shared_registry = state.registry();
-
     match request.method.as_str() {
         "ping" => {
             BrokerResponse::success(request.id, broker_status(config)).unwrap_or_else(|error| {
@@ -274,9 +462,327 @@ fn dispatch_request(
                 )
             })
         }
+        "start_session" => broker_response(
+            request.id,
+            broker_start_session(state, parse_params(request.params)).await,
+        ),
+        "list_tabs" => broker_response(
+            request.id,
+            broker_list_tabs(state, parse_params(request.params)).await,
+        ),
+        "new_tab" => broker_response(
+            request.id,
+            broker_new_tab(state, parse_params(request.params)).await,
+        ),
+        "claim_tab" => broker_response(
+            request.id,
+            broker_claim_tab(state, parse_params(request.params)).await,
+        ),
+        "release_tab" => broker_response(
+            request.id,
+            broker_release_tab(state, parse_params(request.params)).await,
+        ),
+        "focus_tab" => broker_response(
+            request.id,
+            broker_focus_tab(state, parse_params(request.params)).await,
+        ),
+        "navigate" => broker_response(
+            request.id,
+            broker_navigate(state, parse_params(request.params)).await,
+        ),
+        "screenshot" => broker_response(
+            request.id,
+            broker_screenshot(state, parse_params(request.params)).await,
+        ),
+        "close_tab" => broker_response(
+            request.id,
+            broker_close_tab(state, parse_params(request.params)).await,
+        ),
         method => {
             BrokerResponse::invalid_input(request.id, format!("unknown broker method `{method}`"))
         }
+    }
+}
+
+fn parse_params<T>(params: serde_json::Value) -> Result<T, BrowserToolError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(params)
+        .map_err(|error| BrowserToolError::invalid_input(format!("invalid parameters: {error}")))
+}
+
+fn broker_response<T>(id: String, result: Result<T, BrowserToolError>) -> BrokerResponse
+where
+    T: Serialize,
+{
+    match result {
+        Ok(result) => BrokerResponse::success(id, result).unwrap_or_else(|error| {
+            BrokerResponse::error(
+                String::new(),
+                BrowserToolError::invalid_input(format!(
+                    "failed to serialize broker response: {error}"
+                )),
+            )
+        }),
+        Err(error) => BrokerResponse::error(id, error),
+    }
+}
+
+async fn broker_start_session(
+    state: &BrokerState,
+    params: Result<StartSessionParams, BrowserToolError>,
+) -> Result<StartSessionResult, BrowserToolError> {
+    let params = params?;
+    let session = {
+        let mut registry = state.registry().lock().unwrap();
+        registry.start_session(params.label)
+    };
+
+    let tab = match params.start_url {
+        Some(url) => Some(
+            create_and_lease_tab(state, &session.agent_session_id, Some(url), params.focus).await?,
+        ),
+        None => None,
+    };
+
+    Ok(StartSessionResult {
+        agent_session_id: session.agent_session_id,
+        tab,
+    })
+}
+
+async fn broker_list_tabs(
+    state: &BrokerState,
+    params: Result<ListTabsParams, BrowserToolError>,
+) -> Result<ListTabsResult, BrowserToolError> {
+    let params = params?;
+    let targets = state.browser.page_targets().await?;
+    reconcile_missing_targets(state, &targets);
+
+    match params.scope.unwrap_or(ListTabsScope::Owned) {
+        ListTabsScope::Owned => {
+            let tabs = state
+                .registry()
+                .lock()
+                .unwrap()
+                .list_owned_tabs(&params.agent_session_id, None)?;
+            Ok(ListTabsResult::Owned { tabs })
+        }
+        ListTabsScope::GlobalReadonly => {
+            let snapshots = targets.iter().map(TabSnapshot::from).collect::<Vec<_>>();
+            let inventory = state
+                .registry()
+                .lock()
+                .unwrap()
+                .global_inventory(&params.agent_session_id, snapshots)?;
+            Ok(ListTabsResult::GlobalReadonly {
+                groups: inventory.groups,
+            })
+        }
+    }
+}
+
+async fn broker_new_tab(
+    state: &BrokerState,
+    params: Result<NewTabParams, BrowserToolError>,
+) -> Result<TabResult, BrowserToolError> {
+    let params = params?;
+    let tab =
+        create_and_lease_tab(state, &params.agent_session_id, params.url, params.focus).await?;
+    Ok(TabResult { tab })
+}
+
+async fn broker_claim_tab(
+    state: &BrokerState,
+    params: Result<ClaimTabParams, BrowserToolError>,
+) -> Result<TabResult, BrowserToolError> {
+    let params = params?;
+    let target = target_by_id(state, &params.target_id).await?;
+    let tab = state.registry().lock().unwrap().claim_tab(
+        &params.agent_session_id,
+        TabSnapshot::from(&target),
+        params.takeover,
+        params.user_instruction.as_deref(),
+    )?;
+
+    Ok(TabResult { tab })
+}
+
+async fn broker_release_tab(
+    state: &BrokerState,
+    params: Result<TabActionParams, BrowserToolError>,
+) -> Result<ReleaseTabResult, BrowserToolError> {
+    let params = params?;
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .release_tab(&params.agent_session_id, &params.tab_id)?;
+    Ok(ReleaseTabResult { released: true })
+}
+
+async fn broker_focus_tab(
+    state: &BrokerState,
+    params: Result<TabActionParams, BrowserToolError>,
+) -> Result<TabResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    state.browser.activate_target(&target.id).await?;
+    let lease = state
+        .registry()
+        .lock()
+        .unwrap()
+        .update_tab_snapshot(&params.tab_id, TabSnapshot::from(&target))?;
+
+    Ok(TabResult {
+        tab: owned_summary(&lease, true),
+    })
+}
+
+async fn broker_navigate(
+    state: &BrokerState,
+    params: Result<NavigateParams, BrowserToolError>,
+) -> Result<TabResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    state.browser.activate_target(&target.id).await?;
+    let target = state
+        .browser
+        .navigate(
+            &target,
+            &params.url,
+            params.wait_until.as_deref(),
+            params.timeout_ms.unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS),
+        )
+        .await?;
+    let lease = state
+        .registry()
+        .lock()
+        .unwrap()
+        .update_tab_snapshot(&params.tab_id, TabSnapshot::from(&target))?;
+
+    Ok(TabResult {
+        tab: owned_summary(&lease, true),
+    })
+}
+
+async fn broker_screenshot(
+    state: &BrokerState,
+    params: Result<ScreenshotParams, BrowserToolError>,
+) -> Result<ScreenshotResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    state.browser.activate_target(&target.id).await?;
+    let data_base64 = state.browser.screenshot(&target, params.full_page).await?;
+
+    Ok(ScreenshotResult {
+        mime_type: "image/png".to_string(),
+        data_base64,
+    })
+}
+
+async fn broker_close_tab(
+    state: &BrokerState,
+    params: Result<TabActionParams, BrowserToolError>,
+) -> Result<CloseTabResult, BrowserToolError> {
+    let params = params?;
+    let lease = state
+        .registry()
+        .lock()
+        .unwrap()
+        .owned_lease(&params.agent_session_id, &params.tab_id)?;
+
+    if matches!(lease.state, LeaseState::Active) {
+        match target_by_id(state, &lease.target_id).await {
+            Ok(_) => state.browser.close_target(&lease.target_id).await?,
+            Err(error) if error.code == crate::leases::BrowserToolErrorCode::TargetMissing => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .close_tab_mark(&params.agent_session_id, &params.tab_id)?;
+
+    Ok(CloseTabResult { closed: true })
+}
+
+async fn create_and_lease_tab(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    url: Option<String>,
+    focus: bool,
+) -> Result<OwnedTabSummary, BrowserToolError> {
+    {
+        let registry = state.registry().lock().unwrap();
+        registry.ensure_session(session_id)?;
+    }
+
+    let target = state.browser.create_page(url.as_deref(), focus).await?;
+    let mut snapshot = TabSnapshot::from(&target);
+    snapshot.focused = focus;
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .lease_tab(session_id, snapshot)
+}
+
+async fn active_owned_target(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    tab_id: &TabId,
+) -> Result<CdpTarget, BrowserToolError> {
+    let targets = state.browser.page_targets().await?;
+    reconcile_missing_targets(state, &targets);
+    let lease = {
+        let target_exists = |target_id: &str| targets.iter().any(|target| target.id == target_id);
+        let mut registry = state.registry().lock().unwrap();
+        let lease = registry.owned_lease(session_id, tab_id)?;
+        registry.require_active_owned(session_id, tab_id, target_exists(&lease.target_id))?
+    };
+
+    targets
+        .into_iter()
+        .find(|target| target.id == lease.target_id)
+        .ok_or_else(|| BrowserToolError::target_missing(tab_id))
+}
+
+async fn target_by_id(state: &BrokerState, target_id: &str) -> Result<CdpTarget, BrowserToolError> {
+    state
+        .browser
+        .page_targets()
+        .await?
+        .into_iter()
+        .find(|target| target.id == target_id)
+        .ok_or_else(|| BrowserToolError::target_missing_for_target(target_id))
+}
+
+fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
+    let visible_ids = targets
+        .iter()
+        .map(|target| target.id.clone())
+        .collect::<Vec<_>>();
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .mark_missing_targets_not_in(visible_ids);
+}
+
+fn owned_summary(lease: &TabLease, focused: bool) -> OwnedTabSummary {
+    OwnedTabSummary {
+        tab_id: lease.tab_id.clone(),
+        target_id: lease.target_id.clone(),
+        title: lease.title.clone().unwrap_or_default(),
+        url: lease.url.clone().unwrap_or_default(),
+        state: lease.state.clone(),
+        focused,
+        created_at_ms: lease.created_at_ms,
+        updated_at_ms: lease.updated_at_ms,
     }
 }
 
@@ -404,6 +910,22 @@ mod tests {
         RuntimeConfig::from_parts("http://127.0.0.1:9222".to_string(), state_dir).unwrap()
     }
 
+    fn fake_target(id: &str) -> CdpTarget {
+        CdpTarget {
+            id: id.to_string(),
+            target_type: "page".to_string(),
+            title: format!("Title {id}"),
+            url: format!("https://example.com/{id}"),
+            web_socket_debugger_url: Some(format!("ws://fake/{id}")),
+        }
+    }
+
+    fn fake_state(targets: Vec<CdpTarget>) -> BrokerState {
+        BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(
+            FakeBrowser::with_targets(targets),
+        ))))
+    }
+
     #[tokio::test]
     async fn prepare_state_creates_state_and_log_directories() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -437,7 +959,7 @@ mod tests {
 
     #[test]
     fn broker_state_carries_shared_lease_registry() {
-        let state = BrokerState::new();
+        let state = fake_state(Vec::new());
         let mut registry = state.registry.lock().unwrap();
 
         let session = registry.start_session(Some("agent".to_string()));
@@ -449,6 +971,321 @@ mod tests {
             .unwrap();
 
         assert!(leased.tab_id.0.starts_with("tab_"));
+    }
+
+    #[tokio::test]
+    async fn start_session_can_create_initial_leased_tab() {
+        let state = fake_state(Vec::new());
+
+        let result = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("agent".to_string()),
+                start_url: Some("https://example.com/start".to_string()),
+                focus: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tab = result.tab.unwrap();
+        assert!(result.agent_session_id.0.starts_with("session_"));
+        assert_eq!(tab.url, "https://example.com/start");
+        assert!(tab.focused);
+    }
+
+    #[tokio::test]
+    async fn list_tabs_defaults_to_owned_and_global_readonly_withholds_foreign_handles() {
+        let state = fake_state(vec![fake_target("target-a"), fake_target("target-b")]);
+        let first = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("first".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let second = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("second".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let first_tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: first.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: second.agent_session_id.clone(),
+                target_id: "target-b".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let owned = broker_list_tabs(
+            &state,
+            Ok(ListTabsParams {
+                agent_session_id: first.agent_session_id.clone(),
+                scope: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let global = broker_list_tabs(
+            &state,
+            Ok(ListTabsParams {
+                agent_session_id: first.agent_session_id,
+                scope: Some(ListTabsScope::GlobalReadonly),
+            }),
+        )
+        .await
+        .unwrap();
+
+        match owned {
+            ListTabsResult::Owned { tabs } => {
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs[0].tab_id, first_tab.tab_id);
+            }
+            ListTabsResult::GlobalReadonly { .. } => panic!("expected owned tab listing"),
+        }
+
+        match global {
+            ListTabsResult::GlobalReadonly { groups } => {
+                let tabs = groups
+                    .iter()
+                    .flat_map(|group| group.tabs.iter())
+                    .collect::<Vec<_>>();
+                let first_summary = tabs
+                    .iter()
+                    .find(|summary| summary.target_id == "target-a")
+                    .unwrap();
+                let second_summary = tabs
+                    .iter()
+                    .find(|summary| summary.target_id == "target-b")
+                    .unwrap();
+
+                assert_eq!(first_summary.caller_tab_id, Some(first_tab.tab_id));
+                assert!(first_summary.owned_by_caller);
+                assert_eq!(second_summary.caller_tab_id, None);
+                assert!(!second_summary.owned_by_caller);
+            }
+            ListTabsResult::Owned { .. } => panic!("expected global tab listing"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_is_enforced_before_core_tab_actions() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let owner = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("owner".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let foreign = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("foreign".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+
+        let focus_error = broker_focus_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: foreign.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let navigate_error = broker_navigate(
+            &state,
+            Ok(NavigateParams {
+                agent_session_id: foreign.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                url: "https://example.com/new".to_string(),
+                wait_until: None,
+                timeout_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let screenshot_error = broker_screenshot(
+            &state,
+            Ok(ScreenshotParams {
+                agent_session_id: foreign.agent_session_id,
+                tab_id: tab.tab_id,
+                full_page: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            focus_error.code,
+            crate::leases::BrowserToolErrorCode::TabNotOwned
+        );
+        assert_eq!(
+            navigate_error.code,
+            crate::leases::BrowserToolErrorCode::TabNotOwned
+        );
+        assert_eq!(
+            screenshot_error.code,
+            crate::leases::BrowserToolErrorCode::TabNotOwned
+        );
+    }
+
+    #[tokio::test]
+    async fn navigate_release_close_and_missing_target_paths_update_leases() {
+        let fake = Arc::new(Mutex::new(FakeBrowser::with_targets(vec![fake_target(
+            "target-a",
+        )])));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake.clone()));
+        let session = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("owner".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+
+        let navigated = broker_navigate(
+            &state,
+            Ok(NavigateParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                url: "https://example.com/after".to_string(),
+                wait_until: None,
+                timeout_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        assert_eq!(navigated.url, "https://example.com/after");
+
+        broker_release_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let released_owned = broker_list_tabs(
+            &state,
+            Ok(ListTabsParams {
+                agent_session_id: session.agent_session_id.clone(),
+                scope: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(released_owned, ListTabsResult::Owned { tabs } if tabs.is_empty()));
+
+        let reclaimed = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        broker_close_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: reclaimed.tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(fake.lock().unwrap().was_closed("target-a"));
+
+        let missing = broker_new_tab(
+            &state,
+            Ok(NewTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                url: Some("https://example.com/missing".to_string()),
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        fake.lock().unwrap().remove_target(&missing.target_id);
+        let missing_error = broker_focus_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session.agent_session_id,
+                tab_id: missing.tab_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            missing_error.code,
+            crate::leases::BrowserToolErrorCode::TargetMissing
+        );
     }
 
     #[tokio::test]
