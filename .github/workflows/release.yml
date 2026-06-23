@@ -44,15 +44,43 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Test workspace
-        run: cargo test --workspace
+      - name: Test workspace unit layers
+        run: cargo test --workspace --lib --bins
 
       - name: Validate release inputs
         run: cargo xtask validate
 
+  real-browser:
+    name: Real-browser MCP tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Chrome for Testing
+        uses: actions/cache@v4
+        with:
+          path: target/chrome-for-testing
+          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Test real-browser MCP facade
+        env:
+          VISIBLE_BROWSER_LAB_CFT_CACHE_DIR: target/chrome-for-testing
+        run: cargo test --test headless_mcp
+
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs:
+      - test
+      - real-browser
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

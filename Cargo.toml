@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "test-support", "xtask"]
 resolver = "3"
 
 [package]
@@ -33,3 +33,6 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3.23"
+visible-browser-lab-test-support = { path = "test-support" }
+proptest = "1"
+proptest-state-machine = "0.8"

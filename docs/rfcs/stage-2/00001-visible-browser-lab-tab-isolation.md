@@ -42,9 +42,9 @@ The `cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222` smoke test lau
 
 ### Stage 3 Criteria
 
-Stage 3 promotion requires the RFC, plugin configuration, broker implementation, skill text, and `cargo xtask live-smoke` checks to describe the same tool contract.
+Stage 3 promotion requires the RFC, plugin configuration, broker implementation, skill text, `cargo xtask live-smoke`, and `cargo test --test headless_mcp` checks to describe the same tool contract.
 
-The Stage 3 tool contract includes the session and tab lifecycle tools, owned-tab navigation and screenshot tools, owned-tab page actions, and owned-tab diagnostics. The Stage 3 validation set checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, screenshots, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, `network_events`, ownership refusal for every owned-tab action class, release and claim transfer, close, and missing-target recovery.
+The Stage 3 tool contract includes the session and tab lifecycle tools, owned-tab navigation and screenshot tools, owned-tab page actions, and owned-tab diagnostics. The Stage 3 validation set checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, screenshots, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, `network_events`, ownership refusal for every owned-tab action class, release and claim transfer, explicit takeover, close, and missing-target recovery.
 
 ## Isolation Model
 
@@ -484,6 +484,7 @@ Available components:
 8. Plugin-facing MCP surfaces for the `visible-browser-lab` facade.
 9. Skill text for the explicit session, owned-tab action, and diagnostics workflow.
 10. Live MCP smoke test through `cargo xtask live-smoke`.
+11. Real-browser MCP regression test through `cargo test --test headless_mcp`.
 
 ## Test Plan
 
