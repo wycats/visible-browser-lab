@@ -3,6 +3,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,7 +17,7 @@ use tokio::{
 use crate::{
     config::RuntimeConfig,
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
-    leases::BrowserToolError,
+    leases::{BrowserToolError, LeaseRegistry},
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
     },
@@ -24,6 +25,23 @@ use crate::{
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
+
+#[derive(Clone)]
+struct BrokerState {
+    registry: Arc<Mutex<LeaseRegistry>>,
+}
+
+impl BrokerState {
+    fn new() -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(LeaseRegistry::new())),
+        }
+    }
+
+    fn registry(&self) -> &Mutex<LeaseRegistry> {
+        &self.registry
+    }
+}
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
     prepare_state(&config).await?;
@@ -190,19 +208,27 @@ async fn write_pid_file(config: &RuntimeConfig) -> Result<()> {
 }
 
 async fn serve(config: RuntimeConfig, listener: BrokerListener) -> Result<()> {
+    let state = BrokerState::new();
+
     loop {
         let stream = ipc::accept(&listener).await?;
         let connection_config = config.clone();
+        let connection_state = state.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(connection_config, stream).await {
+            if let Err(error) = handle_connection(connection_config, connection_state, stream).await
+            {
                 tracing::warn!(error = %error, "broker connection failed");
             }
         });
     }
 }
 
-async fn handle_connection(config: RuntimeConfig, stream: BrokerStream) -> Result<()> {
+async fn handle_connection(
+    config: RuntimeConfig,
+    state: BrokerState,
+    stream: BrokerStream,
+) -> Result<()> {
     let mut stream = BufReader::new(stream);
 
     let mut line = String::new();
@@ -214,7 +240,7 @@ async fn handle_connection(config: RuntimeConfig, stream: BrokerStream) -> Resul
         }
 
         let response = match serde_json::from_str::<BrokerRequest>(&line) {
-            Ok(request) => dispatch_request(&config, request),
+            Ok(request) => dispatch_request(&config, &state, request),
             Err(error) => BrokerResponse::invalid_input(
                 String::new(),
                 format!("invalid broker request JSON: {error}"),
@@ -230,7 +256,13 @@ async fn handle_connection(config: RuntimeConfig, stream: BrokerStream) -> Resul
     Ok(())
 }
 
-fn dispatch_request(config: &RuntimeConfig, request: BrokerRequest) -> BrokerResponse {
+fn dispatch_request(
+    config: &RuntimeConfig,
+    state: &BrokerState,
+    request: BrokerRequest,
+) -> BrokerResponse {
+    let _shared_registry = state.registry();
+
     match request.method.as_str() {
         "ping" => {
             BrokerResponse::success(request.id, broker_status(config)).unwrap_or_else(|error| {
@@ -366,7 +398,7 @@ impl Drop for RuntimeFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RuntimeConfig;
+    use crate::{config::RuntimeConfig, leases::TabSnapshot};
 
     fn test_config(state_dir: PathBuf) -> RuntimeConfig {
         RuntimeConfig::from_parts("http://127.0.0.1:9222".to_string(), state_dir).unwrap()
@@ -401,6 +433,22 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[test]
+    fn broker_state_carries_shared_lease_registry() {
+        let state = BrokerState::new();
+        let mut registry = state.registry.lock().unwrap();
+
+        let session = registry.start_session(Some("agent".to_string()));
+        let leased = registry
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-1", "Target", "https://example.com", false),
+            )
+            .unwrap();
+
+        assert!(leased.tab_id.0.starts_with("tab_"));
     }
 
     #[tokio::test]
