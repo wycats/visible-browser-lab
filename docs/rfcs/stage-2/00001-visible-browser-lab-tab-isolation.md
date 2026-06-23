@@ -4,7 +4,7 @@
 
 ## Summary
 
-Visible Browser Lab currently exposes two raw MCP wrappers, `visible-playwright` and `visible-devtools`, that both connect to the same visible Chrome DevTools Protocol endpoint. That gives agents a shared browser the user can watch, but it also gives every agent access to the same global tab set. The current safety rule lives in the skill text: an agent should remember the tab or page id it is using. That rule helps, but it is advisory. The tools still allow an agent to select or mutate the wrong tab.
+Before this RFC work, Visible Browser Lab exposed two raw MCP wrappers, `visible-playwright` and `visible-devtools`, that both connected to the same visible Chrome DevTools Protocol endpoint. That gave agents a shared browser the user can watch, but it also gave every agent access to the same global tab set. The safety rule lived in the skill text: an agent should remember the tab or page id it was using. That rule helped, but it was advisory. The tools still allowed an agent to select or mutate the wrong tab.
 
 This RFC replaces the raw wrapper surface with one `visible-browser-lab` MCP facade. The facade keeps the shared visible Chrome profile, but it makes tab ownership explicit. An agent starts a browser session, receives an opaque `agent_session_id`, and then acts only through server-issued `tab_id`s that belong to that session. Listing tabs is scoped by default. A global tab inventory remains available for diagnosis and handoff, but it does not grant control over another agent's tabs.
 
@@ -12,7 +12,9 @@ The boundary is tab-level isolation inside one visible Chrome profile. Cookies, 
 
 ## Current State
 
-The plugin currently starts Chrome with `scripts/start-visible-browser.sh` and exposes raw MCP servers in `.mcp.json`:
+### Pre-RFC Plugin Behavior
+
+Before this RFC work, the plugin started Chrome with `scripts/start-visible-browser.sh` and exposed raw MCP servers in `.mcp.json`:
 
 ```json
 {
@@ -41,6 +43,37 @@ The plugin currently starts Chrome with `scripts/start-visible-browser.sh` and e
 
 The plugin manifest points at that `.mcp.json`, and the development `.codex/config.toml` also exposes the same raw servers. Both wrappers can see the same Chrome targets. Any agent with access to the raw tools can enumerate, focus, navigate, inspect, or close another agent's tab.
 
+### Current Branch Implementation
+
+The current implementation exposes one MCP server, `visible-browser-lab`, from the plugin-facing MCP configuration. The facade starts or reuses one local broker process. The broker owns the in-memory session and tab lease registry, translates owned browser actions to Chrome DevTools Protocol calls, and validates tab ownership before each implemented Chrome action.
+
+Implemented broker-backed MCP tools:
+
+- `start_session`
+- `list_tabs`
+- `new_tab`
+- `claim_tab`
+- `release_tab`
+- `focus_tab`
+- `navigate`
+- `screenshot`
+- `close_tab`
+
+The implemented live smoke test, `cargo xtask live-smoke`, drives the actual stdio MCP server against a visible Chrome CDP endpoint. It verifies session creation, owned default listings, global readonly inventory, new tab creation, navigation, PNG screenshot capture, ownership refusal, owned-target claim refusal, release and claim transfer, close, and missing-target recovery after an external Chrome tab close.
+
+### Remaining Stage 3 Work
+
+Stage 3 requires the RFC to match the implemented behavior and the validation evidence. Before promotion, owned-tab page actions and diagnostics must either be implemented and tested, or explicitly moved into a follow-up RFC or Exo task.
+
+Owned-tab page actions and diagnostics are:
+
+- `evaluate`
+- `click`
+- `type_text`
+- `press_key`
+- `console_messages`
+- `network_events`
+
 ## Isolation Model
 
 The v1 isolation model is non-adversarial lease isolation for same-user agents. It prevents accidental cross-tab actions by agents that follow the exposed MCP tool contract. It does not protect against a malicious local process, a caller that intentionally copies another session's bearer tokens, or a separate manually configured raw CDP client.
@@ -49,7 +82,19 @@ The v1 isolation model is non-adversarial lease isolation for same-user agents. 
 
 Bearer values must never appear in global readonly tab listings, logs intended for normal agent consumption, or owner labels. Global listings use non-authorizing display identifiers so another agent can identify a tab for handoff without receiving the bearer values needed to act as the owner.
 
-Chrome `targetId` is not an action capability. It may appear in readonly global inventory so an agent can ask to claim a tab, but browser action tools must reject raw `target_id` inputs.
+Chrome `targetId` is not an action capability. It may appear in readonly global inventory so an agent can ask to claim a tab, but owned-tab action tools must reject raw `target_id` inputs.
+
+## Terminology
+
+A **browser session** is a broker record for one agent workflow. It has an opaque `agent_session_id`, a non-authorizing `owner_display_id`, an optional label, and timestamps.
+
+A **tab lease** is the broker's ownership record for one Chrome page target. It binds an opaque `tab_id` to a Chrome `targetId`, an owning browser session, the last observed title and URL, timestamps, and a lease state.
+
+An **owned-tab action tool** is an MCP tool that requires both `agent_session_id` and `tab_id`, then asks the broker to verify that the tab is active and owned by that session before touching Chrome.
+
+The **global readonly inventory** is the diagnostic tab listing that shows visible Chrome page targets grouped by owner display ID. It includes caller-owned action handles, withholds action handles for other sessions' tabs, and never exposes another session's `agent_session_id`.
+
+An **owner display ID** is a non-authorizing identifier used for grouping and coordination in global readonly inventory. It is not accepted by owned listing or owned-tab action tools.
 
 ## Proposal
 
@@ -70,7 +115,7 @@ The command is a repo-local wrapper script. In development it runs the Rust bina
 
 The MCP server is a Rust facade over the visible Chrome CDP endpoint. It provides a browser-workspace API instead of a global browser API. The facade owns the mapping between browser sessions, leased tabs, and Chrome `targetId`s. Browser tools validate ownership before touching a Chrome target.
 
-The first implementation uses direct CDP for the broker and tab actions. It must not expose arbitrary raw Playwright or DevTools pass-through calls, because pass-through calls bypass the lease boundary.
+The first implementation uses direct CDP for the broker and tab actions. The facade exposes broker-mediated tools so every Chrome action carries ownership validation.
 
 ## Build Shape
 
@@ -221,7 +266,7 @@ type GlobalTabGroup = {
 
 For caller-owned tabs, `caller_tab_id` may be present in global readonly results. For tabs owned by another session, `caller_tab_id` must be absent.
 
-`owner_display_id` is not an `agent_session_id`. It is a stable, non-authorizing display handle generated for grouping and coordination only. It cannot be passed to owned listing or browser action tools.
+`owner_display_id` is not an `agent_session_id`. It is a stable, non-authorizing display handle generated for grouping and coordination only. It cannot be passed to owned listing or owned-tab action tools.
 
 Structured tool errors use this payload shape, either as MCP tool errors or as an error object in the broker protocol:
 
@@ -320,28 +365,41 @@ If the target is owned by another session, the broker refuses the claim unless `
 
 Successful takeover is a transfer, not a shared lease. The broker must invalidate the previous owner's lease before returning the new lease. The previous `tab_id` must not remain active, and the takeover session receives a new `tab_id`.
 
-### Browser Actions
+### Implemented Owned-Tab Action Tools
 
-These tools require an owned `tab_id`:
+These tools are implemented on the current branch and require an owned `tab_id`:
 
 ```ts
 focus_tab({ agent_session_id, tab_id }) -> { tab: OwnedTabSummary }
 navigate({ agent_session_id, tab_id, url, wait_until?, timeout_ms? }) -> { tab: OwnedTabSummary }
 screenshot({ agent_session_id, tab_id, full_page? }) -> { mime_type: "image/png", data_base64: string }
+release_tab({ agent_session_id, tab_id }) -> { released: true }
+close_tab({ agent_session_id, tab_id }) -> { closed: true }
+```
+
+Implemented action semantics:
+
+- `navigate` defaults to `wait_until: "load"` and `timeout_ms: 15000`. It returns `operation_timeout` if the load event does not arrive before the timeout.
+- `screenshot` returns PNG bytes as base64. `full_page: false` captures the viewport. `full_page: true` uses CDP layout metrics and screenshot clipping for the main frame page bounds.
+- `release_tab` releases the broker lease and leaves the Chrome target open when it still exists.
+- `close_tab` closes the owned Chrome target when it exists and marks the lease `closed`.
+- `focus_tab`, `navigate`, `screenshot`, `release_tab`, and `close_tab` all validate ownership before touching Chrome or changing lease state.
+
+### Remaining Owned-Tab Page Actions and Diagnostics
+
+These tools are part of the RFC tool contract and remain Stage 3 work unless moved into a follow-up RFC or Exo task before promotion:
+
+```ts
 evaluate({ agent_session_id, tab_id, expression }) -> { value?: unknown, preview?: string }
 click({ agent_session_id, tab_id, selector, timeout_ms? }) -> { clicked: true }
 type_text({ agent_session_id, tab_id, text }) -> { typed: true }
 press_key({ agent_session_id, tab_id, key, modifiers? }) -> { pressed: true }
 console_messages({ agent_session_id, tab_id, since? }) -> { messages: ConsoleMessage[] }
 network_events({ agent_session_id, tab_id, since? }) -> { events: NetworkEvent[] }
-release_tab({ agent_session_id, tab_id }) -> { released: true }
-close_tab({ agent_session_id, tab_id }) -> { closed: true }
 ```
 
-Action semantics for v1:
+Remaining action semantics:
 
-- `navigate` defaults to `wait_until: "load"` and `timeout_ms: 15000`. It returns `operation_timeout` if the load event does not arrive before the timeout.
-- `screenshot` returns PNG bytes as base64. `full_page: false` captures the viewport. `full_page: true` uses CDP layout metrics and screenshot clipping for the main frame page bounds.
 - `evaluate` runs in the main frame execution context. If the result is JSON-serializable, return it in `value`; otherwise return a string preview.
 - `click` accepts only a CSS selector in the main frame. It clicks the center of the first matching visible element. Iframe traversal, role selectors, text selectors, and Playwright locator semantics are out of scope for v1.
 - `type_text` sends text to the currently focused element after activating the owned tab.
@@ -442,16 +500,24 @@ This RFC does not require a new Chrome profile per agent.
 
 ## Implementation Plan
 
-1. Add the root Rust package, `visible-browser-lab-mcp` binary, and wrapper script.
-2. Implement endpoint resolution and CDP availability checks.
-3. Implement detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
-4. Keep the broker IPC implementation cross-platform so release binaries can be built for macOS, Linux, and Windows.
-5. Implement CDP target discovery, target creation, target activation, target close, target attachment, console buffering, and network buffering.
-6. Implement session and lease registries with CSPRNG bearer IDs and ownership checks shared by every action tool.
-7. Implement `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, and `close_tab` first.
-8. Add `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events` after the ownership boundary is tested.
-9. Replace `.mcp.json` and `.codex/config.toml` with the facade server and remove raw wrapper exposure from this plugin.
-10. Update the skill text to describe the explicit session-and-tab workflow.
+Completed implementation groups:
+
+1. Root Rust package, `visible-browser-lab-mcp` binary, and repo wrapper script.
+2. Endpoint resolution and CDP availability checks.
+3. Detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
+4. Cross-platform broker IPC using local IPC transport so release binaries can be built for macOS, Linux, and Windows.
+5. Session and lease registries with opaque bearer IDs and ownership checks shared by implemented owned-tab action tools.
+6. CDP target discovery, target creation, target activation, navigation, screenshot capture, and target close.
+7. Implemented MCP tools: `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, and `close_tab`.
+8. Plugin-facing MCP surfaces migrated to the `visible-browser-lab` facade.
+9. Skill text updated to describe the explicit session and owned-tab workflow.
+10. Live MCP smoke test added through `cargo xtask live-smoke`.
+
+Remaining implementation group:
+
+1. Owned-tab page actions and diagnostics: `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events`.
+2. CDP target attachment, console buffering, and network buffering required by the diagnostic tools.
+3. Skill wording update after owned-tab page actions and diagnostics exist.
 
 ## Test Plan
 
@@ -477,17 +543,27 @@ Live Chrome smoke tests:
 - Bootstrap a visible Chrome instance through `scripts/start-visible-browser.sh` and verify endpoint precedence respects CLI and environment overrides.
 - Start two sessions, create one tab in each, and verify default `list_tabs` returns only the caller's tab.
 - Verify `global_readonly` lists both tabs, groups them by owner, and withholds usable `tab_id`s for tabs owned by another session.
-- Verify one session cannot focus, navigate, inspect, type into, click in, screenshot, release, or close another session's tab.
+- Verify one session cannot focus, navigate, screenshot, release, or close another session's tab.
 - Verify `claim_tab` succeeds for an unowned target and refuses an owned target without takeover.
 - Verify closing a Chrome tab outside the broker marks the lease `missing` and produces `target_missing` on the next action.
 - Verify the plugin exposes only `visible-browser-lab` and no raw `visible-playwright` or `visible-devtools` tools.
+- When owned-tab page actions and diagnostics are implemented, extend the smoke test to verify `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events` on owned tabs and ownership refusal for those tools on foreign tabs.
 
 ## Acceptance Criteria
 
-An agent using the visible-browser-lab skill can open, list, inspect, and navigate its own visible tabs without seeing another agent's tabs in the default listing.
+For the current Stage 2 implementation:
+
+- The plugin exposes the facade MCP server as `visible-browser-lab`.
+- The broker validates ownership for every implemented owned-tab action tool.
+- Default tab listing returns the caller's owned working set.
+- Global readonly inventory shows visible Chrome targets for coordination without exposing foreign action handles.
+- Live smoke verifies session creation, owned/default listing, global readonly inventory, navigation, screenshots, ownership refusal, release and claim transfer, close, and missing-target recovery.
+
+For Stage 3 promotion:
+
+- Owned-tab page actions and diagnostics are implemented and tested, or they are explicitly moved into a follow-up RFC or Exo task before promotion.
+- The RFC states the implemented behavior, remaining requirements, and validation evidence clearly.
 
 An agent cannot mutate another agent's tab unless it performs a takeover call that records user instruction text.
 
-The raw wrapper MCP servers are no longer exposed by `.mcp.json`, `.codex/config.toml`, or the visible-browser-lab skill.
-
-The RFC's implementation can start without deciding identity model, crate layout, broker lifecycle, broker socket protocol, tab listing shape, tab state transitions, direct CDP action semantics, endpoint precedence, or test layers.
+The plugin-facing MCP surfaces and visible-browser-lab skill use the facade workflow.
