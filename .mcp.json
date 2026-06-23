@@ -1,21 +1,10 @@
 {
   "mcpServers": {
-    "visible-playwright": {
-      "command": "npx",
+    "visible-browser-lab": {
+      "command": "/Users/wycats/plugins/visible-browser-lab/scripts/visible-browser-lab-mcp.sh",
       "args": [
-        "-y",
-        "@playwright/mcp@latest",
-        "--cdp-endpoint=http://127.0.0.1:9222",
-        "--browser=chrome"
-      ]
-    },
-    "visible-devtools": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "chrome-devtools-mcp@latest",
-        "--browserUrl=http://127.0.0.1:9222",
-        "--no-usage-statistics"
+        "--cdp-endpoint",
+        "http://127.0.0.1:9222"
       ]
     }
   }
