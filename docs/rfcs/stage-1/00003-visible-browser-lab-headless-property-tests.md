@@ -1,0 +1,202 @@
+<!-- exo:3 ulid:01kvtxcp8a0592mpeaggnjke98 -->
+
+# RFC 3: Visible Browser Lab Headless Property Tests
+
+## Summary
+
+Visible Browser Lab needs a CI-safe real-browser validation layer for the tab ownership facade. Unit tests and fake-CDP broker tests validate isolated Rust behavior. The visible smoke test validates the installed workflow against a user-watchable Chrome profile. This RFC adds a Cargo integration test layer that provisions Chrome for Testing, launches an isolated headless browser, drives the real `visible-browser-lab-mcp` stdio server, and checks the broker-enforced tab ownership contract through generated command sequences.
+
+The new test target is `cargo test --test headless_mcp`. It runs against a temporary Chrome profile, a temporary broker state directory, and a local HTTP fixture. It uses this repository's MCP facade and CDP implementation directly.
+
+## Validation Contract
+
+The headless test target validates the same system boundary as RFC 00001: the broker issues `agent_session_id` and `tab_id` bearer identifiers, then validates tab ownership before Chrome actions.
+
+The generated test sequences exercise:
+
+- browser session creation;
+- owned and read-only tab listing;
+- tab creation;
+- tab claim;
+- explicit takeover;
+- tab release;
+- tab close;
+- externally missing Chrome targets;
+- navigation;
+- screenshots;
+- page evaluation;
+- CSS selector click;
+- text input;
+- key press;
+- console diagnostics;
+- network diagnostics.
+
+The invariant set is:
+
+- default `list_tabs` returns only caller-owned leases;
+- `global_readonly` returns action handles only for caller-owned tabs;
+- owned-tab action tools reject foreign `tab_id` values;
+- `release_tab` clears ownership and leaves the Chrome target claimable;
+- `close_tab` closes the target and closes the lease;
+- an externally closed target marks the lease `missing` on the next owned action;
+- takeover invalidates the old `tab_id` and returns a new owned lease;
+- diagnostics buffers reset at release, close, takeover, and missing-target boundaries.
+
+## Test Interface
+
+Add a dedicated Cargo integration test target:
+
+```text
+cargo test --test headless_mcp
+```
+
+Keep the existing test layers in their current roles:
+
+```text
+cargo test --workspace
+cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222
+```
+
+`cargo test --workspace` remains the fast unit and fake-CDP layer. `cargo xtask live-smoke` remains the local visible Chrome validation path. `cargo test --test headless_mcp` is the CI real-browser regression layer.
+
+The headless target supports normal Proptest controls. CI uses a modest default case count. Local deep runs can set `PROPTEST_CASES` to increase generated sequence coverage. Proptest failure persistence records replayable failing cases.
+
+## Browser Provisioning
+
+Use Chrome for Testing as the browser source for CI and local headless runs. Chrome for Testing is Google's versioned Chrome flavor for browser automation and is released through machine-readable metadata.
+
+Add this dev dependency:
+
+```toml
+chrome-for-testing-manager = { version = "0.12", default-features = false }
+```
+
+Use `chrome-for-testing-manager` to resolve and cache a regular Chrome for Testing package. The test harness launches the downloaded Chrome executable directly, then connects `visible-browser-lab-mcp` to Chrome through the selected CDP endpoint.
+
+The Chrome for Testing cache path is `VISIBLE_BROWSER_LAB_CFT_CACHE_DIR` when set, otherwise `${CARGO_TARGET_DIR:-target}/chrome-for-testing`.
+
+Launch Chrome with:
+
+```text
+--headless
+--remote-debugging-port=0
+--user-data-dir=<temp-profile-dir>
+```
+
+The harness discovers the selected CDP endpoint from Chrome's `DevToolsActivePort` file in the temporary profile directory. It then starts `visible-browser-lab-mcp` with that endpoint and an isolated broker state directory.
+
+## Property Model
+
+Add these dev dependencies:
+
+```toml
+proptest = "1"
+proptest-state-machine = "0.8"
+```
+
+Use `proptest-state-machine` for sequential model-based tests. The reference model tracks sessions, owned leases, released targets, closed targets, missing targets, and diagnostic buffer epochs. The system under test is the real MCP facade connected to the isolated headless Chrome process.
+
+Generated transitions cover the public MCP tools from RFC 00001. Each transition updates the reference model and checks the resulting MCP response, tab inventory, target ownership, and diagnostic state against the model.
+
+## Test Harness
+
+Add a publish-disabled workspace crate named `visible-browser-lab-test-support`. Both `xtask` and `tests/headless_mcp.rs` use this crate for shared protocol and fixture helpers:
+
+- stdio MCP client;
+- local HTTP fixture;
+- tool discovery checks;
+- broker shutdown;
+- tab cleanup;
+- target close through Chrome HTTP endpoints;
+- response helpers for tab summaries and browser tool errors.
+
+Add a headless browser harness that owns:
+
+- Chrome for Testing cache directory selection;
+- version resolution and download;
+- temporary Chrome profile creation;
+- Chrome process startup;
+- `DevToolsActivePort` endpoint discovery;
+- process shutdown;
+- temporary directory cleanup.
+
+## CI Shape
+
+Add a Linux headless browser job to CI. The job runs:
+
+```text
+cargo test --test headless_mcp
+```
+
+The job caches the Chrome for Testing artifact directory. The existing OS matrix continues to run `cargo test --workspace`, formatting checks, and `cargo xtask validate`.
+
+Release PR dry-runs include the headless test before package generation. The headless test becomes part of the evidence for promoting RFC 00001 to Stage 3 because it exercises the implemented facade contract through a real browser in CI.
+
+## References
+
+- Chrome for Testing: https://developer.chrome.com/blog/chrome-for-testing
+- Chrome Headless mode: https://developer.chrome.com/docs/chromium/headless
+- Chrome DevTools Protocol endpoint discovery: https://chromedevtools.github.io/devtools-protocol/
+- `chrome-for-testing-manager`: https://docs.rs/chrome-for-testing-manager
+- Proptest state-machine testing: https://proptest-rs.github.io/proptest/proptest/state-machine.html
+
+## Implementation Plan
+
+1. Add the test-only dependencies for Chrome for Testing provisioning and property testing.
+2. Add the `visible-browser-lab-test-support` workspace crate and move shared MCP smoke-test helpers from `xtask` into it.
+3. Add the headless Chrome harness around Chrome for Testing.
+4. Add `tests/headless_mcp.rs` with a deterministic smoke case that proves the harness, MCP facade, and headless Chrome wiring.
+5. Add sequential state-machine property tests for the tab ownership invariants.
+6. Add the Linux CI job with Chrome for Testing cache support.
+7. Include the headless test in release PR dry-runs before package generation.
+8. Update RFC 00001's Stage 3 validation language to reference the headless CI validation layer.
+
+## Test Plan
+
+RFC verification:
+
+```text
+git diff --check
+exo rfc show <created-rfc-id>
+```
+
+Implementation verification:
+
+```text
+cargo fmt --check
+cargo test --workspace
+cargo test --test headless_mcp
+cargo check --target x86_64-pc-windows-msvc
+cargo xtask validate
+cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222
+git diff --check
+```
+
+CI verification:
+
+- existing Rust matrix runs `cargo test --workspace`;
+- Linux headless job provisions Chrome for Testing and runs `cargo test --test headless_mcp`;
+- release PR dry-run runs the headless test before package generation;
+- Proptest failure artifacts remain available for replay.
+
+## Acceptance Criteria
+
+`cargo test --test headless_mcp` provisions Chrome for Testing through Rust, launches an isolated headless Chrome process, starts `visible-browser-lab-mcp`, and validates the facade through real CDP connections.
+
+The headless target covers the broker-enforced tab ownership invariants with generated command sequences and replayable failures.
+
+CI runs the headless test on Linux with a cached Chrome for Testing artifact directory.
+
+The implementation exercises this repository's MCP facade and CDP code directly.
+
+RFC 00001 can cite the headless CI validation layer as Stage 3 evidence for the implemented facade contract.
+
+## Assumptions
+
+This RFC defines a validation layer for the tab ownership facade. RFC 00001 remains the source of truth for the facade's MCP tool contract.
+
+The first CI browser job targets Linux. macOS and Windows headless browser jobs can be added after the Linux job is stable.
+
+Chrome for Testing is the primary browser source for headless validation.
+
+The implementation uses direct CDP through the facade. WebDriver crates are ecosystem context for browser testing. This validation layer exercises the repository's own CDP implementation.
