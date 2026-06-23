@@ -996,10 +996,7 @@ fn runtime_console_event(value: &Value) -> Option<CdpDiagnosticEvent> {
     Some(CdpDiagnosticEvent::Console {
         level,
         text,
-        timestamp_ms: params
-            .get("timestamp")
-            .and_then(Value::as_f64)
-            .map(|ms| ms as u64),
+        timestamp_ms: wall_timestamp_ms(params.get("timestamp")),
     })
 }
 
@@ -1016,10 +1013,7 @@ fn log_entry_event(value: &Value) -> Option<CdpDiagnosticEvent> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        timestamp_ms: entry
-            .get("timestamp")
-            .and_then(Value::as_f64)
-            .map(|ms| ms as u64),
+        timestamp_ms: wall_timestamp_ms(entry.get("timestamp")),
     })
 }
 
@@ -1051,6 +1045,16 @@ fn monotonic_timestamp_ms(value: Option<&Value>) -> Option<u64> {
             seconds as u64
         } else {
             (seconds * 1000.0) as u64
+        }
+    })
+}
+
+fn wall_timestamp_ms(value: Option<&Value>) -> Option<u64> {
+    value.and_then(Value::as_f64).map(|timestamp| {
+        if timestamp > 1_000_000_000_000.0 {
+            timestamp as u64
+        } else {
+            (timestamp * 1000.0) as u64
         }
     })
 }
@@ -1205,7 +1209,31 @@ mod tests {
             CdpDiagnosticEvent::Console {
                 level: "log".to_string(),
                 text: "hello 42".to_string(),
-                timestamp_ms: Some(1234)
+                timestamp_ms: Some(1_234_000)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_log_entry_timestamp_as_milliseconds() {
+        let event = diagnostic_event(&json!({
+            "method": "Log.entryAdded",
+            "params": {
+                "entry": {
+                    "level": "warning",
+                    "text": "careful",
+                    "timestamp": 1234.5
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            event,
+            CdpDiagnosticEvent::Console {
+                level: "warning".to_string(),
+                text: "careful".to_string(),
+                timestamp_ms: Some(1_234_500)
             }
         );
     }

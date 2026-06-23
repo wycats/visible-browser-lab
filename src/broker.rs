@@ -45,6 +45,7 @@ const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
 struct BrokerState {
     registry: Arc<Mutex<LeaseRegistry>>,
     diagnostics: Arc<Mutex<DiagnosticsRegistry>>,
+    focused_target_id: Arc<Mutex<Option<String>>>,
     browser: BrowserBackend,
 }
 
@@ -53,6 +54,7 @@ impl BrokerState {
         Ok(Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
             diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
+            focused_target_id: Arc::new(Mutex::new(None)),
             browser: BrowserBackend::new(&config.cdp_endpoint)?,
         })
     }
@@ -62,6 +64,7 @@ impl BrokerState {
         Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
             diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
+            focused_target_id: Arc::new(Mutex::new(None)),
             browser,
         }
     }
@@ -72,6 +75,32 @@ impl BrokerState {
 
     fn diagnostics(&self) -> &Mutex<DiagnosticsRegistry> {
         &self.diagnostics
+    }
+
+    fn mark_focused_target(&self, target_id: &str) {
+        *self.focused_target_id.lock().unwrap() = Some(target_id.to_string());
+    }
+
+    fn clear_focused_target(&self, target_id: &str) {
+        let mut focused_target_id = self.focused_target_id.lock().unwrap();
+        if focused_target_id.as_deref() == Some(target_id) {
+            *focused_target_id = None;
+        }
+    }
+
+    fn is_focused_target(&self, target_id: &str) -> bool {
+        self.focused_target_id.lock().unwrap().as_deref() == Some(target_id)
+    }
+
+    fn focused_target_id_for_targets(&self, targets: &[CdpTarget]) -> Option<String> {
+        let mut focused_target_id = self.focused_target_id.lock().unwrap();
+        let focused = focused_target_id.clone()?;
+        if targets.iter().any(|target| target.id == focused) {
+            Some(focused)
+        } else {
+            *focused_target_id = None;
+            None
+        }
     }
 }
 
@@ -734,16 +763,15 @@ async fn dispatch_request(
     request: BrokerRequest,
 ) -> BrokerResponse {
     match request.method.as_str() {
-        "ping" => {
-            BrokerResponse::success(request.id, broker_status(config)).unwrap_or_else(|error| {
+        "ping" => BrokerResponse::success(request.id.clone(), broker_status(config))
+            .unwrap_or_else(|error| {
                 BrokerResponse::error(
-                    String::new(),
+                    request.id,
                     BrowserToolError::invalid_input(format!(
                         "failed to serialize broker status: {error}"
                     )),
                 )
-            })
-        }
+            }),
         "start_session" => broker_response(
             request.id,
             broker_start_session(state, parse_params(request.params)).await,
@@ -823,9 +851,9 @@ where
     T: Serialize,
 {
     match result {
-        Ok(result) => BrokerResponse::success(id, result).unwrap_or_else(|error| {
+        Ok(result) => BrokerResponse::success(id.clone(), result).unwrap_or_else(|error| {
             BrokerResponse::error(
-                String::new(),
+                id,
                 BrowserToolError::invalid_input(format!(
                     "failed to serialize broker response: {error}"
                 )),
@@ -865,6 +893,7 @@ async fn broker_list_tabs(
     let params = params?;
     let targets = state.browser.page_targets().await?;
     reconcile_missing_targets(state, &targets);
+    let focused_target_id = state.focused_target_id_for_targets(&targets);
 
     match params.scope.unwrap_or(ListTabsScope::Owned) {
         ListTabsScope::Owned => {
@@ -872,11 +901,14 @@ async fn broker_list_tabs(
                 .registry()
                 .lock()
                 .unwrap()
-                .list_owned_tabs(&params.agent_session_id, None)?;
+                .list_owned_tabs(&params.agent_session_id, focused_target_id.as_deref())?;
             Ok(ListTabsResult::Owned { tabs })
         }
         ListTabsScope::GlobalReadonly => {
-            let snapshots = targets.iter().map(TabSnapshot::from).collect::<Vec<_>>();
+            let snapshots = targets
+                .iter()
+                .map(|target| tab_snapshot(target, focused_target_id.as_deref()))
+                .collect::<Vec<_>>();
             let inventory = state
                 .registry()
                 .lock()
@@ -907,7 +939,12 @@ async fn broker_claim_tab(
     let target = target_by_id(state, &params.target_id).await?;
     let tab = state.registry().lock().unwrap().claim_tab(
         &params.agent_session_id,
-        TabSnapshot::from(&target),
+        tab_snapshot(
+            &target,
+            state
+                .is_focused_target(&target.id)
+                .then_some(target.id.as_str()),
+        ),
         params.takeover,
         params.user_instruction.as_deref(),
     )?;
@@ -943,11 +980,12 @@ async fn broker_focus_tab(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     let lease = state
         .registry()
         .lock()
         .unwrap()
-        .update_tab_snapshot(&params.tab_id, TabSnapshot::from(&target))?;
+        .update_tab_snapshot(&params.tab_id, tab_snapshot(&target, Some(&target.id)))?;
 
     Ok(TabResult {
         tab: owned_summary(&lease, true),
@@ -962,6 +1000,7 @@ async fn broker_navigate(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     let target = state
         .browser
         .navigate(
@@ -975,7 +1014,7 @@ async fn broker_navigate(
         .registry()
         .lock()
         .unwrap()
-        .update_tab_snapshot(&params.tab_id, TabSnapshot::from(&target))?;
+        .update_tab_snapshot(&params.tab_id, tab_snapshot(&target, Some(&target.id)))?;
 
     Ok(TabResult {
         tab: owned_summary(&lease, true),
@@ -990,6 +1029,7 @@ async fn broker_screenshot(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     let data_base64 = state.browser.screenshot(&target, params.full_page).await?;
 
     Ok(ScreenshotResult {
@@ -1016,6 +1056,7 @@ async fn broker_click(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     state
         .browser
         .click(
@@ -1035,6 +1076,7 @@ async fn broker_type_text(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     state.browser.type_text(&target, &params.text).await?;
     Ok(TypeTextResult { typed: true })
 }
@@ -1047,6 +1089,7 @@ async fn broker_press_key(
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
+    state.mark_focused_target(&target.id);
     state
         .browser
         .press_key(&target, &params.key, &params.modifiers)
@@ -1108,6 +1151,7 @@ async fn broker_close_tab(
         .lock()
         .unwrap()
         .close_tab_mark(&params.agent_session_id, &params.tab_id)?;
+    state.clear_focused_target(&closed.target_id);
     state
         .diagnostics()
         .lock()
@@ -1129,8 +1173,10 @@ async fn create_and_lease_tab(
     }
 
     let target = state.browser.create_page(url.as_deref(), focus).await?;
-    let mut snapshot = TabSnapshot::from(&target);
-    snapshot.focused = focus;
+    if focus {
+        state.mark_focused_target(&target.id);
+    }
+    let snapshot = tab_snapshot(&target, focus.then_some(target.id.as_str()));
     let summary = state
         .registry()
         .lock()
@@ -1199,6 +1245,7 @@ fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
     if !missing.is_empty() {
         let mut diagnostics = state.diagnostics().lock().unwrap();
         for lease in missing {
+            state.clear_focused_target(&lease.target_id);
             diagnostics.reset_target(&lease.target_id);
         }
     }
@@ -1243,6 +1290,12 @@ fn owned_summary(lease: &TabLease, focused: bool) -> OwnedTabSummary {
         created_at_ms: lease.created_at_ms,
         updated_at_ms: lease.updated_at_ms,
     }
+}
+
+fn tab_snapshot(target: &CdpTarget, focused_target_id: Option<&str>) -> TabSnapshot {
+    let mut snapshot = TabSnapshot::from(target);
+    snapshot.focused = focused_target_id == Some(target.id.as_str());
+    snapshot
 }
 
 fn broker_status(config: &RuntimeConfig) -> BrokerStatus {
@@ -1364,6 +1417,7 @@ impl Drop for RuntimeFileGuard {
 mod tests {
     use super::*;
     use crate::{config::RuntimeConfig, leases::TabSnapshot};
+    use serde::ser::Error as _;
     use serde_json::json;
 
     fn test_config(state_dir: PathBuf) -> RuntimeConfig {
@@ -1415,6 +1469,30 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[test]
+    fn serialization_fallback_preserves_request_id() {
+        struct FailsSerialize;
+
+        impl Serialize for FailsSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(S::Error::custom("intentional serialization failure"))
+            }
+        }
+
+        let response = broker_response("request-1".to_string(), Ok(FailsSerialize));
+
+        assert_eq!(response.id, "request-1");
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert_eq!(
+            response.error.unwrap().message,
+            "failed to serialize broker response: intentional serialization failure"
+        );
     }
 
     #[test]
@@ -1500,6 +1578,15 @@ mod tests {
         )
         .await
         .unwrap();
+        broker_focus_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: first.agent_session_id.clone(),
+                tab_id: first_tab.tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
 
         let owned = broker_list_tabs(
             &state,
@@ -1524,6 +1611,7 @@ mod tests {
             ListTabsResult::Owned { tabs } => {
                 assert_eq!(tabs.len(), 1);
                 assert_eq!(tabs[0].tab_id, first_tab.tab_id);
+                assert!(tabs[0].focused);
             }
             ListTabsResult::GlobalReadonly { .. } => panic!("expected owned tab listing"),
         }
@@ -1545,8 +1633,10 @@ mod tests {
 
                 assert_eq!(first_summary.caller_tab_id, Some(first_tab.tab_id));
                 assert!(first_summary.owned_by_caller);
+                assert!(first_summary.focused);
                 assert_eq!(second_summary.caller_tab_id, None);
                 assert!(!second_summary.owned_by_caller);
+                assert!(!second_summary.focused);
             }
             ListTabsResult::Owned { .. } => panic!("expected global tab listing"),
         }

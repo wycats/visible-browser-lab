@@ -1303,15 +1303,12 @@ fn close_target_via_cdp(cdp_endpoint: &str, target_id: &str) -> Result<()> {
         "{}/json/close/{target_id}",
         cdp_endpoint.trim_end_matches('/')
     );
-    let output = Command::new("curl")
-        .args(["-fsS", &close_url])
-        .output()
+    let response = reqwest::blocking::get(&close_url)
         .with_context(|| format!("failed to call Chrome close endpoint `{close_url}`"))?;
-    if !output.status.success() {
-        bail!(
-            "Chrome close endpoint failed for target `{target_id}`: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        bail!("Chrome close endpoint failed for target `{target_id}` with status {status}: {body}");
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1327,18 +1324,18 @@ fn close_target_via_cdp(cdp_endpoint: &str, target_id: &str) -> Result<()> {
 
 fn target_is_listed(cdp_endpoint: &str, target_id: &str) -> Result<bool> {
     let list_url = format!("{}/json/list", cdp_endpoint.trim_end_matches('/'));
-    let output = Command::new("curl")
-        .args(["-fsS", &list_url])
-        .output()
+    let response = reqwest::blocking::get(&list_url)
         .with_context(|| format!("failed to call Chrome list endpoint `{list_url}`"))?;
-    if !output.status.success() {
-        bail!(
-            "Chrome list endpoint failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        bail!("Chrome list endpoint failed with status {status}: {body}",);
     }
 
-    let targets: Value = serde_json::from_slice(&output.stdout)
+    let body = response
+        .bytes()
+        .with_context(|| format!("failed to read Chrome list endpoint body `{list_url}`"))?;
+    let targets: Value = serde_json::from_slice(&body)
         .with_context(|| format!("Chrome list endpoint returned invalid JSON from `{list_url}`"))?;
     let targets = targets
         .as_array()
