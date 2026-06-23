@@ -14,8 +14,9 @@ use crate::{
     config::RuntimeConfig,
     leases::BrowserToolError,
     protocol::{
-        BrokerResponse, ClaimTabParams, ListTabsParams, NavigateParams, NewTabParams,
-        ScreenshotParams, StartSessionParams, TabActionParams,
+        BrokerResponse, ClaimTabParams, ClickParams, DiagnosticsParams, EvaluateParams,
+        ListTabsParams, NavigateParams, NewTabParams, PressKeyParams, ScreenshotParams,
+        StartSessionParams, TabActionParams, TypeTextParams,
     },
 };
 
@@ -142,6 +143,54 @@ impl VisibleBrowserLab {
     )]
     async fn screenshot(&self, params: Parameters<ScreenshotParams>) -> CallToolResult {
         self.call_broker("screenshot", params.0).await
+    }
+
+    #[tool(
+        name = "evaluate",
+        description = "Evaluate JavaScript in an active tab owned by this session."
+    )]
+    async fn evaluate(&self, params: Parameters<EvaluateParams>) -> CallToolResult {
+        self.call_broker("evaluate", params.0).await
+    }
+
+    #[tool(
+        name = "click",
+        description = "Click the first visible main-frame element matching a CSS selector in an owned tab."
+    )]
+    async fn click(&self, params: Parameters<ClickParams>) -> CallToolResult {
+        self.call_broker("click", params.0).await
+    }
+
+    #[tool(
+        name = "type_text",
+        description = "Insert text into the focused element in an active tab owned by this session."
+    )]
+    async fn type_text(&self, params: Parameters<TypeTextParams>) -> CallToolResult {
+        self.call_broker("type_text", params.0).await
+    }
+
+    #[tool(
+        name = "press_key",
+        description = "Dispatch one printable or common named key in an active tab owned by this session."
+    )]
+    async fn press_key(&self, params: Parameters<PressKeyParams>) -> CallToolResult {
+        self.call_broker("press_key", params.0).await
+    }
+
+    #[tool(
+        name = "console_messages",
+        description = "Read buffered console messages for an active tab owned by this session."
+    )]
+    async fn console_messages(&self, params: Parameters<DiagnosticsParams>) -> CallToolResult {
+        self.call_broker("console_messages", params.0).await
+    }
+
+    #[tool(
+        name = "network_events",
+        description = "Read buffered network events for an active tab owned by this session."
+    )]
+    async fn network_events(&self, params: Parameters<DiagnosticsParams>) -> CallToolResult {
+        self.call_broker("network_events", params.0).await
     }
 
     #[tool(

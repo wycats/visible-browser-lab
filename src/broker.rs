@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -16,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    cdp::{CdpClient, CdpTarget},
+    cdp::{CdpClient, CdpDiagnosticEvent, CdpDiagnosticsMonitor, CdpTarget},
     config::RuntimeConfig,
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
@@ -25,19 +26,25 @@ use crate::{
     },
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
-        ClaimTabParams, CloseTabResult, ListTabsParams, ListTabsResult, ListTabsScope,
-        NavigateParams, NewTabParams, ReleaseTabResult, ScreenshotParams, ScreenshotResult,
-        StartSessionParams, StartSessionResult, TabActionParams, TabResult,
+        ClaimTabParams, ClickParams, ClickResult, CloseTabResult, ConsoleMessage,
+        ConsoleMessagesResult, DiagnosticsParams, EvaluateParams, EvaluateResult, ListTabsParams,
+        ListTabsResult, ListTabsScope, NavigateParams, NetworkEvent, NetworkEventsResult,
+        NewTabParams, PressKeyParams, PressKeyResult, ReleaseTabResult, ScreenshotParams,
+        ScreenshotResult, StartSessionParams, StartSessionResult, TabActionParams, TabResult,
+        TypeTextParams, TypeTextResult,
     },
 };
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
+const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
 
 #[derive(Clone)]
 struct BrokerState {
     registry: Arc<Mutex<LeaseRegistry>>,
+    diagnostics: Arc<Mutex<DiagnosticsRegistry>>,
     browser: BrowserBackend,
 }
 
@@ -45,6 +52,7 @@ impl BrokerState {
     fn new(config: &RuntimeConfig) -> Result<Self> {
         Ok(Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
+            diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
             browser: BrowserBackend::new(&config.cdp_endpoint)?,
         })
     }
@@ -53,12 +61,134 @@ impl BrokerState {
     fn with_browser(browser: BrowserBackend) -> Self {
         Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
+            diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
             browser,
         }
     }
 
     fn registry(&self) -> &Mutex<LeaseRegistry> {
         &self.registry
+    }
+
+    fn diagnostics(&self) -> &Mutex<DiagnosticsRegistry> {
+        &self.diagnostics
+    }
+}
+
+struct DiagnosticsRegistry {
+    targets: HashMap<String, TargetDiagnostics>,
+    monitored_targets: HashSet<String>,
+    monitors: HashMap<String, CdpDiagnosticsMonitor>,
+    next_sequence: u64,
+}
+
+impl DiagnosticsRegistry {
+    fn new() -> Self {
+        Self {
+            targets: HashMap::new(),
+            monitored_targets: HashSet::new(),
+            monitors: HashMap::new(),
+            next_sequence: 1,
+        }
+    }
+
+    fn ensure_target(&mut self, target_id: &str) {
+        self.targets.entry(target_id.to_string()).or_default();
+    }
+
+    fn is_monitored(&self, target_id: &str) -> bool {
+        self.monitored_targets.contains(target_id)
+    }
+
+    fn mark_monitored(&mut self, target_id: &str, monitor: Option<CdpDiagnosticsMonitor>) {
+        self.monitored_targets.insert(target_id.to_string());
+        if let Some(monitor) = monitor {
+            self.monitors.insert(target_id.to_string(), monitor);
+        }
+    }
+
+    fn reset_target(&mut self, target_id: &str) {
+        self.targets.remove(target_id);
+        self.monitored_targets.remove(target_id);
+        self.monitors.remove(target_id);
+    }
+
+    fn push_event(&mut self, target_id: &str, event: CdpDiagnosticEvent) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        match event {
+            CdpDiagnosticEvent::Console {
+                level,
+                text,
+                timestamp_ms,
+            } => {
+                self.push_console(
+                    target_id,
+                    ConsoleMessage {
+                        sequence,
+                        level,
+                        text,
+                        timestamp_ms,
+                    },
+                );
+            }
+            CdpDiagnosticEvent::Network(mut event) => {
+                event.sequence = sequence;
+                self.push_network(target_id, event);
+            }
+        }
+    }
+
+    fn push_console(&mut self, target_id: &str, message: ConsoleMessage) {
+        let target = self.targets.entry(target_id.to_string()).or_default();
+        target.console.push_back(message);
+        truncate_front(&mut target.console);
+    }
+
+    fn push_network(&mut self, target_id: &str, event: NetworkEvent) {
+        let target = self.targets.entry(target_id.to_string()).or_default();
+        target.network.push_back(event);
+        truncate_front(&mut target.network);
+    }
+
+    fn console_messages(&self, target_id: &str, since: Option<u64>) -> Vec<ConsoleMessage> {
+        self.targets
+            .get(target_id)
+            .map(|target| {
+                target
+                    .console
+                    .iter()
+                    .filter(|message| since.is_none_or(|since| message.sequence > since))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn network_events(&self, target_id: &str, since: Option<u64>) -> Vec<NetworkEvent> {
+        self.targets
+            .get(target_id)
+            .map(|target| {
+                target
+                    .network
+                    .iter()
+                    .filter(|event| since.is_none_or(|since| event.sequence > since))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct TargetDiagnostics {
+    console: VecDeque<ConsoleMessage>,
+    network: VecDeque<NetworkEvent>,
+}
+
+fn truncate_front<T>(buffer: &mut VecDeque<T>) {
+    while buffer.len() > DIAGNOSTICS_BUFFER_LIMIT {
+        buffer.pop_front();
     }
 }
 
@@ -69,6 +199,9 @@ struct FakeBrowser {
     next_target: u64,
     focused_target_id: Option<String>,
     closed_targets: Vec<String>,
+    clicked_selectors: Vec<String>,
+    typed_text: Vec<String>,
+    pressed_keys: Vec<String>,
 }
 
 #[cfg(test)]
@@ -79,6 +212,9 @@ impl FakeBrowser {
             next_target: 1,
             focused_target_id: None,
             closed_targets: Vec::new(),
+            clicked_selectors: Vec::new(),
+            typed_text: Vec::new(),
+            pressed_keys: Vec::new(),
         }
     }
 
@@ -146,12 +282,100 @@ impl FakeBrowser {
         Err(BrowserToolError::target_missing_for_target(&target.id))
     }
 
+    fn evaluate(
+        &self,
+        target: &CdpTarget,
+        expression: &str,
+    ) -> Result<EvaluateResult, BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+
+        let value = match expression {
+            "1 + 1" => Some(serde_json::json!(2)),
+            "document.title" => Some(serde_json::json!(target.title)),
+            _ => None,
+        };
+        Ok(EvaluateResult {
+            value,
+            preview: Some(expression.to_string()),
+        })
+    }
+
+    fn click(&mut self, target: &CdpTarget, selector: &str) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+
+        if selector == "#missing" {
+            return Err(BrowserToolError::operation_timeout(
+                "timed out waiting for visible selector `#missing`",
+            ));
+        }
+
+        self.clicked_selectors.push(selector.to_string());
+        Ok(())
+    }
+
+    fn type_text(&mut self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+
+        self.typed_text.push(text.to_string());
+        Ok(())
+    }
+
+    fn press_key(
+        &mut self,
+        target: &CdpTarget,
+        key: &str,
+        _modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+
+        self.pressed_keys.push(key.to_string());
+        Ok(())
+    }
+
     fn remove_target(&mut self, target_id: &str) {
         self.targets.retain(|target| target.id != target_id);
     }
 
     fn was_closed(&self, target_id: &str) -> bool {
         self.closed_targets.iter().any(|closed| closed == target_id)
+    }
+
+    fn was_clicked(&self, selector: &str) -> bool {
+        self.clicked_selectors
+            .iter()
+            .any(|clicked| clicked == selector)
+    }
+
+    fn typed_text(&self) -> &[String] {
+        &self.typed_text
+    }
+
+    fn pressed_keys(&self) -> &[String] {
+        &self.pressed_keys
     }
 }
 
@@ -229,6 +453,64 @@ impl BrowserBackend {
             Self::Cdp(client) => client.screenshot(target, full_page).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().screenshot(target, full_page),
+        }
+    }
+
+    async fn evaluate(
+        &self,
+        target: &CdpTarget,
+        expression: &str,
+    ) -> Result<EvaluateResult, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.evaluate(target, expression).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().evaluate(target, expression),
+        }
+    }
+
+    async fn click(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.click(target, selector, timeout_ms).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().click(target, selector),
+        }
+    }
+
+    async fn type_text(&self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.type_text(target, text).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().type_text(target, text),
+        }
+    }
+
+    async fn press_key(
+        &self,
+        target: &CdpTarget,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            Self::Cdp(client) => client.press_key(target, key, modifiers).await,
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().press_key(target, key, modifiers),
+        }
+    }
+
+    async fn diagnostics_monitor(
+        &self,
+        target: &CdpTarget,
+        sink: Arc<dyn Fn(CdpDiagnosticEvent) + Send + Sync>,
+    ) -> Result<Option<CdpDiagnosticsMonitor>, BrowserToolError> {
+        match self {
+            Self::Cdp(client) => Ok(Some(client.diagnostics_monitor(target, sink).await?)),
+            #[cfg(test)]
+            Self::Fake(_) => Ok(None),
         }
     }
 }
@@ -494,6 +776,30 @@ async fn dispatch_request(
             request.id,
             broker_screenshot(state, parse_params(request.params)).await,
         ),
+        "evaluate" => broker_response(
+            request.id,
+            broker_evaluate(state, parse_params(request.params)).await,
+        ),
+        "click" => broker_response(
+            request.id,
+            broker_click(state, parse_params(request.params)).await,
+        ),
+        "type_text" => broker_response(
+            request.id,
+            broker_type_text(state, parse_params(request.params)).await,
+        ),
+        "press_key" => broker_response(
+            request.id,
+            broker_press_key(state, parse_params(request.params)).await,
+        ),
+        "console_messages" => broker_response(
+            request.id,
+            broker_console_messages(state, parse_params(request.params)).await,
+        ),
+        "network_events" => broker_response(
+            request.id,
+            broker_network_events(state, parse_params(request.params)).await,
+        ),
         "close_tab" => broker_response(
             request.id,
             broker_close_tab(state, parse_params(request.params)).await,
@@ -605,6 +911,8 @@ async fn broker_claim_tab(
         params.takeover,
         params.user_instruction.as_deref(),
     )?;
+    state.diagnostics().lock().unwrap().reset_target(&target.id);
+    ensure_diagnostics_monitor(state, &target).await?;
 
     Ok(TabResult { tab })
 }
@@ -614,11 +922,16 @@ async fn broker_release_tab(
     params: Result<TabActionParams, BrowserToolError>,
 ) -> Result<ReleaseTabResult, BrowserToolError> {
     let params = params?;
-    state
+    let lease = state
         .registry()
         .lock()
         .unwrap()
         .release_tab(&params.agent_session_id, &params.tab_id)?;
+    state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .reset_target(&lease.target_id);
     Ok(ReleaseTabResult { released: true })
 }
 
@@ -628,6 +941,7 @@ async fn broker_focus_tab(
 ) -> Result<TabResult, BrowserToolError> {
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
     let lease = state
         .registry()
@@ -646,6 +960,7 @@ async fn broker_navigate(
 ) -> Result<TabResult, BrowserToolError> {
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
     let target = state
         .browser
@@ -673,6 +988,7 @@ async fn broker_screenshot(
 ) -> Result<ScreenshotResult, BrowserToolError> {
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
     state.browser.activate_target(&target.id).await?;
     let data_base64 = state.browser.screenshot(&target, params.full_page).await?;
 
@@ -680,6 +996,92 @@ async fn broker_screenshot(
         mime_type: "image/png".to_string(),
         data_base64,
     })
+}
+
+async fn broker_evaluate(
+    state: &BrokerState,
+    params: Result<EvaluateParams, BrowserToolError>,
+) -> Result<EvaluateResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    state.browser.evaluate(&target, &params.expression).await
+}
+
+async fn broker_click(
+    state: &BrokerState,
+    params: Result<ClickParams, BrowserToolError>,
+) -> Result<ClickResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    state.browser.activate_target(&target.id).await?;
+    state
+        .browser
+        .click(
+            &target,
+            &params.selector,
+            params.timeout_ms.unwrap_or(DEFAULT_CLICK_TIMEOUT_MS),
+        )
+        .await?;
+    Ok(ClickResult { clicked: true })
+}
+
+async fn broker_type_text(
+    state: &BrokerState,
+    params: Result<TypeTextParams, BrowserToolError>,
+) -> Result<TypeTextResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    state.browser.activate_target(&target.id).await?;
+    state.browser.type_text(&target, &params.text).await?;
+    Ok(TypeTextResult { typed: true })
+}
+
+async fn broker_press_key(
+    state: &BrokerState,
+    params: Result<PressKeyParams, BrowserToolError>,
+) -> Result<PressKeyResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    state.browser.activate_target(&target.id).await?;
+    state
+        .browser
+        .press_key(&target, &params.key, &params.modifiers)
+        .await?;
+    Ok(PressKeyResult { pressed: true })
+}
+
+async fn broker_console_messages(
+    state: &BrokerState,
+    params: Result<DiagnosticsParams, BrowserToolError>,
+) -> Result<ConsoleMessagesResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    let messages = state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .console_messages(&target.id, params.since);
+    Ok(ConsoleMessagesResult { messages })
+}
+
+async fn broker_network_events(
+    state: &BrokerState,
+    params: Result<DiagnosticsParams, BrowserToolError>,
+) -> Result<NetworkEventsResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    ensure_diagnostics_monitor(state, &target).await?;
+    let events = state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .network_events(&target.id, params.since);
+    Ok(NetworkEventsResult { events })
 }
 
 async fn broker_close_tab(
@@ -701,11 +1103,16 @@ async fn broker_close_tab(
         }
     }
 
-    state
+    let closed = state
         .registry()
         .lock()
         .unwrap()
         .close_tab_mark(&params.agent_session_id, &params.tab_id)?;
+    state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .reset_target(&closed.target_id);
 
     Ok(CloseTabResult { closed: true })
 }
@@ -724,11 +1131,14 @@ async fn create_and_lease_tab(
     let target = state.browser.create_page(url.as_deref(), focus).await?;
     let mut snapshot = TabSnapshot::from(&target);
     snapshot.focused = focus;
-    state
+    let summary = state
         .registry()
         .lock()
         .unwrap()
-        .lease_tab(session_id, snapshot)
+        .lease_tab(session_id, snapshot)?;
+    state.diagnostics().lock().unwrap().reset_target(&target.id);
+    ensure_diagnostics_monitor(state, &target).await?;
+    Ok(summary)
 }
 
 async fn active_owned_target(
@@ -742,7 +1152,22 @@ async fn active_owned_target(
         let target_exists = |target_id: &str| targets.iter().any(|target| target.id == target_id);
         let mut registry = state.registry().lock().unwrap();
         let lease = registry.owned_lease(session_id, tab_id)?;
-        registry.require_active_owned(session_id, tab_id, target_exists(&lease.target_id))?
+        match registry.require_active_owned(session_id, tab_id, target_exists(&lease.target_id)) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if matches!(
+                    &error.code,
+                    crate::leases::BrowserToolErrorCode::TargetMissing
+                ) {
+                    state
+                        .diagnostics()
+                        .lock()
+                        .unwrap()
+                        .reset_target(&lease.target_id);
+                }
+                return Err(error);
+            }
+        }
     };
 
     targets
@@ -766,11 +1191,45 @@ fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
         .iter()
         .map(|target| target.id.clone())
         .collect::<Vec<_>>();
-    state
+    let missing = state
         .registry()
         .lock()
         .unwrap()
         .mark_missing_targets_not_in(visible_ids);
+    if !missing.is_empty() {
+        let mut diagnostics = state.diagnostics().lock().unwrap();
+        for lease in missing {
+            diagnostics.reset_target(&lease.target_id);
+        }
+    }
+}
+
+async fn ensure_diagnostics_monitor(
+    state: &BrokerState,
+    target: &CdpTarget,
+) -> Result<(), BrowserToolError> {
+    let should_start = {
+        let mut diagnostics = state.diagnostics().lock().unwrap();
+        diagnostics.ensure_target(&target.id);
+        !diagnostics.is_monitored(&target.id)
+    };
+
+    if !should_start {
+        return Ok(());
+    }
+
+    let target_id = target.id.clone();
+    let diagnostics = state.diagnostics.clone();
+    let sink = Arc::new(move |event| {
+        diagnostics.lock().unwrap().push_event(&target_id, event);
+    });
+    let monitor = state.browser.diagnostics_monitor(target, sink).await?;
+    state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .mark_monitored(&target.id, monitor);
+    Ok(())
 }
 
 fn owned_summary(lease: &TabLease, focused: bool) -> OwnedTabSummary {
@@ -905,6 +1364,7 @@ impl Drop for RuntimeFileGuard {
 mod tests {
     use super::*;
     use crate::{config::RuntimeConfig, leases::TabSnapshot};
+    use serde_json::json;
 
     fn test_config(state_dir: PathBuf) -> RuntimeConfig {
         RuntimeConfig::from_parts("http://127.0.0.1:9222".to_string(), state_dir).unwrap()
@@ -1286,6 +1746,252 @@ mod tests {
             missing_error.code,
             crate::leases::BrowserToolErrorCode::TargetMissing
         );
+    }
+
+    #[tokio::test]
+    async fn page_actions_require_owned_tabs_and_route_to_browser_backend() {
+        let fake = Arc::new(Mutex::new(FakeBrowser::with_targets(vec![fake_target(
+            "target-a",
+        )])));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake.clone()));
+        let owner = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("owner".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let foreign = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("foreign".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+
+        let evaluated = broker_evaluate(
+            &state,
+            Ok(EvaluateParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                expression: "1 + 1".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evaluated.value, Some(json!(2)));
+
+        let clicked = broker_click(
+            &state,
+            Ok(ClickParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                selector: "#submit".to_string(),
+                timeout_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(clicked.clicked);
+
+        broker_type_text(
+            &state,
+            Ok(TypeTextParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                text: "hello".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        broker_press_key(
+            &state,
+            Ok(PressKeyParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                key: "Enter".to_string(),
+                modifiers: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fake = fake.lock().unwrap();
+        assert!(fake.was_clicked("#submit"));
+        assert_eq!(fake.typed_text(), &["hello".to_string()]);
+        assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
+        drop(fake);
+
+        let foreign_error = broker_evaluate(
+            &state,
+            Ok(EvaluateParams {
+                agent_session_id: foreign.agent_session_id,
+                tab_id: tab.tab_id,
+                expression: "1 + 1".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            foreign_error.code,
+            crate::leases::BrowserToolErrorCode::TabNotOwned
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_buffers_support_since_and_reset_on_release() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let session = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("owner".to_string()),
+                start_url: None,
+                focus: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+
+        {
+            let mut diagnostics = state.diagnostics().lock().unwrap();
+            diagnostics.push_event(
+                "target-a",
+                CdpDiagnosticEvent::Console {
+                    level: "log".to_string(),
+                    text: "first".to_string(),
+                    timestamp_ms: Some(1),
+                },
+            );
+            diagnostics.push_event(
+                "target-a",
+                CdpDiagnosticEvent::Console {
+                    level: "log".to_string(),
+                    text: "second".to_string(),
+                    timestamp_ms: Some(2),
+                },
+            );
+            diagnostics.push_event(
+                "target-a",
+                CdpDiagnosticEvent::Network(NetworkEvent {
+                    sequence: 0,
+                    kind: "request".to_string(),
+                    url: Some("https://example.com/data.json".to_string()),
+                    method: Some("GET".to_string()),
+                    status: None,
+                    error_text: None,
+                    timestamp_ms: Some(3),
+                }),
+            );
+        }
+
+        let messages = broker_console_messages(
+            &state,
+            Ok(DiagnosticsParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                since: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(messages.len(), 2);
+        let since = messages[0].sequence;
+        let filtered = broker_console_messages(
+            &state,
+            Ok(DiagnosticsParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                since: Some(since),
+            }),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].text, "second");
+
+        let network = broker_network_events(
+            &state,
+            Ok(DiagnosticsParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                since: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .events;
+        assert_eq!(network.len(), 1);
+        assert_eq!(
+            network[0].url.as_deref(),
+            Some("https://example.com/data.json")
+        );
+
+        broker_release_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reclaimed = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        let after_reset = broker_console_messages(
+            &state,
+            Ok(DiagnosticsParams {
+                agent_session_id: session.agent_session_id,
+                tab_id: reclaimed.tab_id,
+                since: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(after_reset.is_empty());
     }
 
     #[tokio::test]

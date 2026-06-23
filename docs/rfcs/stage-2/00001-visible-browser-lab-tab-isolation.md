@@ -31,21 +31,20 @@ Broker-backed MCP tools:
 - `navigate`
 - `screenshot`
 - `close_tab`
-
-The `cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222` smoke test launches `visible-browser-lab-mcp` over stdio and drives it against a visible Chrome CDP endpoint. It checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, PNG screenshot capture, ownership errors, `target_owned` for owned-target claim attempts, release and claim transfer, close, and missing-target recovery after an external Chrome tab close.
-
-### Stage 3 Criteria
-
-Stage 3 promotion requires the RFC, plugin configuration, broker implementation, skill text, and `cargo xtask live-smoke` checks to describe the same tool contract. Before promotion, owned-tab page actions and diagnostics must either be implemented and tested, or assigned to a named follow-up RFC or Exo task.
-
-Owned-tab page actions and diagnostics are:
-
 - `evaluate`
 - `click`
 - `type_text`
 - `press_key`
 - `console_messages`
 - `network_events`
+
+The `cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222` smoke test launches `visible-browser-lab-mcp` over stdio and drives it against a visible Chrome CDP endpoint. It checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, PNG screenshot capture, page evaluation, CSS selector click, text input, key press, console diagnostics, network diagnostics, ownership errors, `target_owned` for owned-target claim attempts, release and claim transfer, close, and missing-target recovery after an external Chrome tab close.
+
+### Stage 3 Criteria
+
+Stage 3 promotion requires the RFC, plugin configuration, broker implementation, skill text, and `cargo xtask live-smoke` checks to describe the same tool contract.
+
+The Stage 3 tool contract includes the session and tab lifecycle tools, owned-tab navigation and screenshot tools, owned-tab page actions, and owned-tab diagnostics. The Stage 3 validation set checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, screenshots, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, `network_events`, ownership refusal for every owned-tab action class, release and claim transfer, close, and missing-target recovery.
 
 ## Isolation Model
 
@@ -358,9 +357,9 @@ Action semantics:
 - `close_tab` closes the owned Chrome target when it exists and marks the lease `closed`.
 - `focus_tab`, `navigate`, `screenshot`, `release_tab`, and `close_tab` all validate ownership before touching Chrome or changing lease state.
 
-### Reserved Owned-Tab Page Actions and Diagnostics
+### Owned-Tab Page Actions and Diagnostics
 
-The RFC reserves these owned-tab page action and diagnostic tool names:
+These tools require an owned `tab_id`:
 
 ```ts
 evaluate({ agent_session_id, tab_id, expression }) -> { value?: unknown, preview?: string }
@@ -371,10 +370,10 @@ console_messages({ agent_session_id, tab_id, since? }) -> { messages: ConsoleMes
 network_events({ agent_session_id, tab_id, since? }) -> { events: NetworkEvent[] }
 ```
 
-Reserved action semantics:
+Action semantics:
 
 - `evaluate` runs in the main frame execution context. If the result is JSON-serializable, return it in `value`; otherwise return a string preview.
-- `click` accepts a CSS selector in the main frame. It clicks the center of the first matching visible element. Iframe traversal, role selectors, text selectors, and Playwright locator semantics belong to a separate design.
+- `click` accepts a CSS selector in the main frame. It finds the first visible matching element, scrolls it into view, and dispatches a left-click at its center.
 - `type_text` sends text to the currently focused element after activating the owned tab.
 - `press_key` supports one key at a time. `modifiers` may include `Alt`, `Control`, `Meta`, and `Shift`.
 - Input actions activate the owned tab before dispatching input.
@@ -467,7 +466,7 @@ Bearer custody is part of the local contract: callers keep `agent_session_id` an
 
 The facade exposes named owned-tab tools. Arbitrary Playwright or DevTools operations require a separate tool surface.
 
-The page interaction tools use the semantics named in this RFC. Full Playwright locator semantics belong to a separate design.
+The page interaction tools use the semantics named in this RFC. The `click` selector is a main-frame CSS selector.
 
 The Chrome profile is shared by all browser sessions in this RFC.
 
@@ -480,17 +479,11 @@ Available components:
 3. Detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
 4. Cross-platform broker IPC using local IPC transport so release binaries can be built for macOS, Linux, and Windows.
 5. Session and lease registries with opaque bearer IDs and ownership checks shared by owned-tab action tools.
-6. CDP target discovery, target creation, target activation, navigation, screenshot capture, and target close.
-7. MCP tools: `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, and `close_tab`.
+6. CDP target discovery, target creation, target activation, navigation, screenshot capture, target close, page evaluation, CSS selector click, text input, key press, console buffering, and network buffering.
+7. MCP tools: `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, `close_tab`, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events`.
 8. Plugin-facing MCP surfaces for the `visible-browser-lab` facade.
-9. Skill text for the explicit session and owned-tab workflow.
+9. Skill text for the explicit session, owned-tab action, and diagnostics workflow.
 10. Live MCP smoke test through `cargo xtask live-smoke`.
-
-Reserved page-action components:
-
-1. Owned-tab page actions and diagnostics: `evaluate`, selector-based `click`, `type_text`, `press_key`, `console_messages`, and `network_events`.
-2. CDP target attachment, console buffering, and network buffering required by the diagnostic tools.
-3. Skill wording for owned-tab page actions and diagnostics.
 
 ## Test Plan
 
@@ -510,17 +503,19 @@ Broker contract tests with a fake CDP transport:
 - Concurrent claims for the same target serialize to one success and one `target_owned` error.
 - Broker restart clears leases while preserving Chrome tab state.
 - Navigation timeout, missing target, and Chrome unavailable errors return the documented `BrowserToolError` codes and recovery actions.
+- Page actions route through ownership validation before CDP evaluation, CSS selector click, text input, or key press.
+- Diagnostic buffers preserve per-target console and network events, support `since` filtering, and reset at lease boundaries.
 
 Live Chrome smoke tests:
 
 - Bootstrap a visible Chrome instance through `scripts/start-visible-browser.sh` and verify endpoint precedence respects CLI and environment overrides.
 - Start two sessions, create one tab in each, and verify default `list_tabs` returns only the caller's tab.
 - Verify `global_readonly` lists both tabs, groups them by owner, and returns usable `tab_id`s only for caller-owned tabs.
-- Verify ownership errors for focus, navigate, screenshot, release, and close against another session's tab.
+- Verify ownership errors for focus, navigate, screenshot, evaluate, click, type_text, press_key, console_messages, network_events, release, and close against another session's tab.
 - Verify `claim_tab` succeeds for an unowned target and returns `target_owned` for an owned target unless takeover is explicit.
 - Verify closing a Chrome tab through Chrome UI or another client marks the lease `missing` and produces `target_missing` on the next action.
 - Verify the plugin exposes exactly one MCP server: `visible-browser-lab`.
-- When owned-tab page actions and diagnostics exist, extend the smoke test to verify `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events` on owned tabs and ownership errors for those tools on foreign tabs.
+- Verify `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events` against a local HTTP fixture.
 
 ## Validation Contract
 
@@ -528,7 +523,7 @@ Live Chrome smoke tests:
 - The broker validates ownership for every owned-tab action tool.
 - Default tab listing returns the caller's owned working set.
 - Read-only target inventory shows visible Chrome targets grouped by owner with action handles only for caller-owned tabs.
-- Live smoke verifies session creation, owned/default listing, read-only target inventory, navigation, screenshots, ownership errors, release and claim transfer, close, and missing-target recovery.
+- Live smoke verifies session creation, owned/default listing, read-only target inventory, navigation, screenshots, page actions, diagnostics, ownership errors, release and claim transfer, close, and missing-target recovery.
 
 A takeover call with `user_instruction` is the transfer path for mutating a tab owned by another session.
 

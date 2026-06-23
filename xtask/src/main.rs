@@ -2,6 +2,7 @@ use std::{
     env,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -399,6 +400,12 @@ fn run_live_smoke(
         "focus_tab",
         "navigate",
         "screenshot",
+        "evaluate",
+        "click",
+        "type_text",
+        "press_key",
+        "console_messages",
+        "network_events",
         "close_tab",
     ] {
         if !tool_names.contains(&expected) {
@@ -494,6 +501,8 @@ fn run_live_smoke(
         bail!("global_readonly did not show both caller-owned and foreign-owned tabs");
     }
 
+    let fixture = FixtureServer::start()?;
+
     let new_tab = client.call_tool(
         "new_tab",
         json!({
@@ -540,6 +549,171 @@ fn run_live_smoke(
     let screenshot_data = field_str(&screenshot, "data_base64")?;
     if !screenshot_data.starts_with("iVBOR") || screenshot_data.len() < 1000 {
         bail!("screenshot payload does not look like a PNG");
+    }
+
+    client.call_tool(
+        "navigate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "url": fixture.url("/page"),
+            "timeout_ms": 10000
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
+
+    let evaluated = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "(async () => { console.log('vbl-console-ready'); await fetch('/data.json'); return { title: document.title, ready: true }; })()"
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
+    if evaluated
+        .get("value")
+        .and_then(|value| value.get("ready"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("evaluate did not return the expected JSON value: {evaluated}");
+    }
+
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "selector": "#clicker",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let clicked = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "document.body.dataset.clicked"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if clicked.get("value").and_then(Value::as_str) != Some("yes") {
+        bail!("click did not update the fixture page: {clicked}");
+    }
+
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "selector": "#entry",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    client.call_tool(
+        "type_text",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "text": "typed"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    client.call_tool(
+        "press_key",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "key": "Enter"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let typed = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "({ value: document.querySelector('#entry').value, key: document.body.dataset.key })"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if typed
+        .get("value")
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        != Some("typed")
+        || typed
+            .get("value")
+            .and_then(|value| value.get("key"))
+            .and_then(Value::as_str)
+            != Some("Enter")
+    {
+        bail!("type_text or press_key did not update the fixture page: {typed}");
+    }
+
+    wait_for_console_message(
+        client,
+        &first_session,
+        &transferable_tab.tab_id,
+        "vbl-console-ready",
+    )?;
+    wait_for_network_event(
+        client,
+        &first_session,
+        &transferable_tab.tab_id,
+        "/data.json",
+    )?;
+
+    for tool in [
+        "evaluate",
+        "click",
+        "type_text",
+        "press_key",
+        "console_messages",
+        "network_events",
+    ] {
+        let arguments = match tool {
+            "evaluate" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id,
+                "expression": "1 + 1"
+            }),
+            "click" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id,
+                "selector": "body"
+            }),
+            "type_text" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id,
+                "text": "x"
+            }),
+            "press_key" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id,
+                "key": "Enter"
+            }),
+            "console_messages" | "network_events" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id
+            }),
+            _ => unreachable!(),
+        };
+        let error = client.call_tool(tool, arguments, Duration::from_secs(20), true)?;
+        if field_str(&error, "code")? != "tab_not_owned" {
+            bail!("foreign tab `{tool}` returned the wrong error: {error}");
+        }
     }
 
     let ownership_error = client.call_tool(
@@ -686,6 +860,171 @@ fn cleanup_open_tabs(client: &mut McpClient, open_tabs: &mut Vec<OpenTab>) {
             false,
         );
     }
+}
+
+fn wait_for_console_message(
+    client: &mut McpClient,
+    session_id: &str,
+    tab_id: &str,
+    expected: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let result = client.call_tool(
+            "console_messages",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        if result
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|message| {
+                message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(expected))
+            })
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!("console_messages did not include `{expected}`");
+}
+
+fn wait_for_network_event(
+    client: &mut McpClient,
+    session_id: &str,
+    tab_id: &str,
+    expected_url_fragment: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let result = client.call_tool(
+            "network_events",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        if result
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|event| {
+                event
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.contains(expected_url_fragment))
+            })
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!("network_events did not include `{expected_url_fragment}`");
+}
+
+struct FixtureServer {
+    base_url: String,
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FixtureServer {
+    fn start() -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind live-smoke fixture server")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure live-smoke fixture server")?;
+        let address = listener
+            .local_addr()
+            .context("failed to read fixture server address")?;
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((stream, _)) => handle_fixture_connection(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            base_url: format!("http://{address}"),
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_fixture_connection(mut stream: TcpStream) {
+    let mut buffer = [0; 2048];
+    let Ok(bytes) = stream.read(&mut buffer) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    let (content_type, body) = match path {
+        "/data.json" => ("application/json", r#"{"ok":true}"#.to_string()),
+        _ => (
+            "text/html; charset=utf-8",
+            r#"<!doctype html>
+<title>VBL Fixture</title>
+<button id="clicker" onclick="document.body.dataset.clicked='yes'; console.log('vbl-clicked')">Click</button>
+<input id="entry" />
+<script>
+document.querySelector('#entry').addEventListener('keydown', (event) => {
+  document.body.dataset.key = event.key;
+});
+</script>"#
+                .to_string(),
+        ),
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
 }
 
 #[derive(Debug, Clone)]
