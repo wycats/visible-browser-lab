@@ -39,7 +39,7 @@ Use `new_tab` to create an owned visible tab. Use `claim_tab` to claim an unowne
 
 Use `focus_tab`, `navigate`, `screenshot`, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, `network_events`, `release_tab`, and `close_tab` only with an owned `tab_id`. `release_tab` leaves the Chrome target visible and claimable. `close_tab` closes the Chrome target and marks the lease closed.
 
-Use `evaluate` for main-frame JavaScript expressions. Use `click` with a main-frame CSS selector; it finds the first visible matching element, scrolls it into view, and dispatches a left-click at its center. Use `type_text` and `press_key` after focusing the intended element. Use `console_messages` and `network_events` to inspect broker-owned diagnostics collected for the leased target.
+Use `evaluate` for main-frame JavaScript expressions. Use `click` with a main-frame CSS selector; it finds the first visible matching element, scrolls it into view, and dispatches a left-click at its center. `click` and `press_key` return `focus_required` while the owned tab lacks browser focus; invoke `focus_tab` and retry the action. Use `type_text` after focusing the intended DOM element. Use `console_messages` and `network_events` to inspect broker-owned diagnostics collected for the leased target.
 
 If a leased target disappears, keep the missing lease visible in owned listings, create or claim another tab, and continue with the new `tab_id`.
 

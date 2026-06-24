@@ -125,6 +125,7 @@ pub enum RecoveryAction {
     NewTab,
     ClaimExistingTab,
     ReleaseTab,
+    FocusTab,
     StartChrome,
 }
 
@@ -166,6 +167,7 @@ pub enum BrowserToolErrorCode {
     TargetOwned,
     InvalidInput,
     OperationTimeout,
+    FocusRequired,
 }
 
 impl BrowserToolError {
@@ -233,6 +235,17 @@ impl BrowserToolError {
             code: BrowserToolErrorCode::OperationTimeout,
             message: message.into(),
             recovery: Some(RecoveryAction::ListTabs),
+        }
+    }
+
+    pub fn focus_required(tab_id: &TabId) -> Self {
+        Self {
+            code: BrowserToolErrorCode::FocusRequired,
+            message: format!(
+                "tab `{}` must have browser focus before dispatching native input",
+                tab_id.0
+            ),
+            recovery: Some(RecoveryAction::FocusTab),
         }
     }
 }
@@ -728,6 +741,15 @@ mod tests {
 
         assert_eq!(value["code"], "tab_not_owned");
         assert_eq!(value["recovery"], "list_tabs");
+    }
+
+    #[test]
+    fn focus_required_names_the_explicit_recovery_action() {
+        let error = BrowserToolError::focus_required(&TabId("tab_test".to_string()));
+        let value = serde_json::to_value(error).unwrap();
+
+        assert_eq!(value["code"], "focus_required");
+        assert_eq!(value["recovery"], "focus_tab");
     }
 
     #[test]
