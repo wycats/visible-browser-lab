@@ -4,34 +4,27 @@
 
 ## Summary
 
-Visible Browser Lab should be installable and updateable through the agent surfaces where this browser tooling is used: Codex, Claude Code, and VS Code. The repository is currently a local plugin source tree. That is enough for development, but not enough for installed copies that should run without a local Rust toolchain or a local source checkout.
+Visible Browser Lab is installable and updateable through the agent surfaces where this browser tooling is used: Codex, Claude Code, and VS Code. The source tree remains the development authority, and release artifacts provide installed copies that run without a local Rust toolchain or a local source checkout.
 
-This RFC adds a trusted binary publishing track. CI builds the Rust MCP facade for supported platforms, packages each host plugin around a prebuilt binary, and publishes immutable GitHub Release assets with checksums and provenance. Installed machines consume release artifacts. They do not compile Rust and they do not need Node or pnpm at runtime.
+This RFC defines the trusted binary publishing track. CI builds the Rust MCP facade for supported platforms, packages each host plugin around a prebuilt binary, and publishes immutable GitHub Release assets with checksums and provenance. Installed machines consume release artifacts. They do not compile Rust and they do not need Node or pnpm at runtime.
 
 This publishing track is independent from the tab-isolation tool implementation, except that Windows release binaries require RFC 00001's broker IPC to be cross-platform.
 
-## Current State
+## Implemented Contract
 
-The repository currently contains:
+The repository publishes from a protected source tree through GitHub Actions. The implemented release path contains:
 
 - a Codex plugin manifest at `.codex-plugin/plugin.json`;
+- Claude Code and VS Code package manifests generated from the package target;
 - local skill files under `skills/`;
 - local MCP configuration;
 - shell scripts for development startup;
 - a Rust MCP facade crate.
+- Rust-native packaging commands under `cargo xtask`;
+- CI workflows for native tests, real-browser tests, multi-platform release binaries, package archives, checksums, and artifact attestations;
+- a tag-triggered GitHub Release publication path.
 
-The repository does not yet contain:
-
-- a Claude Code plugin manifest or package shape;
-- a VS Code plugin package shape;
-- Rust-native packaging commands;
-- CI workflows for multi-platform release binaries;
-- GitHub Release packaging, checksums, or artifact attestations;
-- validation that proves generated packages contain only expected files.
-
-## Proposal
-
-Add Rust-native publishing support for three distribution surfaces:
+The release interface contains three distribution surfaces:
 
 - Codex plugin distribution.
 - Claude Code plugin distribution.
@@ -39,11 +32,11 @@ Add Rust-native publishing support for three distribution surfaces:
 
 The source repository remains authoritative. CI builds platform binaries from protected source, assembles platform-specific plugin archives, and publishes those archives through GitHub Releases.
 
-Do not publish through generated branches in v1. Do not force-push publication branches. Do not require Node or pnpm for packaging or runtime.
+Publication uses release artifacts from CI. Packages are not published through generated branches, local force pushes, Node tooling, or pnpm tooling.
 
 ## Binary Targets
 
-Build release binaries for:
+The release workflow builds release binaries for:
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
@@ -68,7 +61,7 @@ Release assets also include individual binary archives for debugging and manual 
 
 ## Rust-Native Tooling
 
-Add an `xtask` crate under `xtask/` and expose these commands:
+The `xtask` crate under `xtask/` exposes these commands:
 
 ```text
 cargo xtask validate
@@ -82,7 +75,7 @@ cargo xtask checksums
 
 `cargo xtask checksums` writes `SHA256SUMS` for generated release assets.
 
-The xtask may use only Rust dependencies. Do not add Node, pnpm, or JavaScript packaging scripts.
+The package path uses Rust dependencies only.
 
 ## Package Contents
 
@@ -121,14 +114,17 @@ Real publication runs only from protected `v*` tags. Pull requests run the relea
 
 Repository protection is configured outside this repo: mandatory pull requests, required checks, resolved conversations, protected `main`, and protected `v*` tags.
 
+The `v0.1.0` release exercised this path and published 25 assets: 18 host plugin archives, 6 standalone binary archives, and `SHA256SUMS`. A release from current `main` packages the Stage 3 tab-lease facade from RFC 00001.
+
 ## CI Shape
 
-Add release-oriented workflows:
+The repository has release-oriented workflows:
 
 - A PR validation workflow builds and tests the crate on native Linux, macOS, and Windows runners.
+- A real-browser CI job runs the MCP facade against Chrome for Testing.
 - A release workflow builds every target binary, packages every host/target archive, writes checksums, generates artifact attestations, runs as a PR dry-run, and publishes a GitHub Release only for protected version tags.
 
-Workflow permissions should be minimal:
+Workflow permissions are scoped to the release jobs:
 
 ```yaml
 permissions:
@@ -139,26 +135,26 @@ permissions:
 
 Use GitHub-hosted runners for the supported OS/architecture matrix. If a public-preview runner label changes or is unavailable, the workflow should make that unsupported runner explicit rather than silently skipping the target.
 
-## Non-Goals
+## Contract Boundaries
 
-This RFC does not define browser tab isolation, CDP action semantics, or MCP tool behavior.
+RFC 00001 defines browser tab isolation, CDP action semantics, and MCP tool behavior.
 
-This RFC does not publish generated plugin branches.
+This RFC defines GitHub Release publication for installable plugin and binary archives.
 
-This RFC does not add Node, pnpm, or JavaScript tooling.
+The package path is Rust-native.
 
-This RFC does not solve code signing or notarization. Unsigned binaries are acceptable for v1 unless host requirements force signing.
+Code signing and notarization are a separate release-hardening track. Unsigned binaries are acceptable for v1 unless a host requirement changes.
 
-## Implementation Plan
+## Build Map
 
-1. Amend RFC 00001 so broker IPC is cross-platform local IPC instead of Unix sockets only.
-2. Add an Exo phase and goal for this publishing track.
-3. Replace direct Unix socket usage with a cross-platform IPC abstraction.
-4. Add the `xtask` crate and the `cargo xtask` command surface.
-5. Implement package generation for Codex, Claude Code, and VS Code.
-6. Add checksum generation and release asset validation.
-7. Add PR validation and release workflows.
-8. Verify all local commands and CI-facing package layouts.
+Available components:
+
+1. Cross-platform broker IPC required for Windows release binaries.
+2. `cargo xtask validate`, `cargo xtask package`, and `cargo xtask checksums`.
+3. Package generation for Codex, Claude Code, and VS Code.
+4. Checksum generation and release asset validation.
+5. CI validation for native tests, real-browser tests, release binary builds, package archives, and artifact attestations.
+6. Tag-triggered GitHub Release publication.
 
 ## Test Plan
 
@@ -183,6 +179,9 @@ Release validation:
 - Run the release workflow in PR dry-run mode before merging the publishing change.
 - Verify GitHub Release assets, checksums, and attestations are generated from the same commit.
 - Verify Codex, Claude Code, and VS Code package archives can be unpacked and locate their packaged binary.
+- Verify the release contains 25 assets: 18 host plugin archives, 6 standalone binary archives, and `SHA256SUMS`.
+- Verify release checksums with `shasum -a 256 -c SHA256SUMS`.
+- Verify artifact attestations with `gh attestation verify`.
 
 ## Acceptance Criteria
 
@@ -195,3 +194,5 @@ CI builds macOS, Linux, and Windows binaries, including ARM targets.
 GitHub Releases contain package archives, binary archives, checksums, and artifact attestations.
 
 No publication path relies on local force pushes or generated branch publishing.
+
+A release tag from current `main` publishes packages that contain the Stage 3 tab-lease facade.
