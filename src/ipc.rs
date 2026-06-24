@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::protocol::BROKER_PROTOCOL_VERSION;
 use anyhow::{Context, Result};
 #[cfg(not(windows))]
 use interprocess::local_socket::{GenericFilePath, ToFsName};
@@ -74,12 +75,18 @@ pub fn default_endpoint_display(state_dir: &Path) -> String {
 
         let mut hasher = DefaultHasher::new();
         state_dir.hash(&mut hasher);
-        return format!("visible-browser-lab-{:016x}", hasher.finish());
+        return format!(
+            "visible-browser-lab-v{BROKER_PROTOCOL_VERSION}-{:016x}",
+            hasher.finish()
+        );
     }
 
     #[cfg(not(windows))]
     {
-        state_dir.join("broker.sock").to_string_lossy().into_owned()
+        state_dir
+            .join(format!("broker-v{BROKER_PROTOCOL_VERSION}.sock"))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -122,7 +129,7 @@ mod tests {
 
         let endpoint = default_endpoint_display(Path::new("/tmp/visible-browser-lab-test"));
 
-        assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker.sock");
+        assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker-v2.sock");
     }
 
     #[test]
@@ -135,7 +142,7 @@ mod tests {
         } else {
             assert_eq!(
                 endpoint.stale_path(),
-                Some(Path::new("/tmp/visible-browser-lab-test/broker.sock"))
+                Some(Path::new("/tmp/visible-browser-lab-test/broker-v2.sock"))
             );
         }
     }

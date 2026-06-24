@@ -2606,6 +2606,7 @@ dependencies = [
  "anyhow",
  "chromiumoxide",
  "clap",
+ "directories",
  "fs2",
  "futures-util",
  "interprocess",

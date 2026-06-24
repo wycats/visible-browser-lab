@@ -664,7 +664,14 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
 async fn connect_and_ping(config: &RuntimeConfig) -> Result<BrokerClient> {
     let endpoint = broker_endpoint(config)?;
     let mut client = BrokerClient::connect(&endpoint).await?;
-    client.ping().await?;
+    let status = client.ping().await?;
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        bail!(
+            "broker protocol mismatch: expected {}, got {}",
+            BROKER_PROTOCOL_VERSION,
+            status.protocol_version
+        );
+    }
     Ok(client)
 }
 
