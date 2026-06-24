@@ -4,5 +4,6 @@ pub mod chrome;
 pub mod config;
 pub mod ipc;
 pub mod leases;
+pub mod managed_chrome;
 pub mod mcp;
 pub mod protocol;

@@ -2613,6 +2613,7 @@ dependencies = [
  "libc",
  "proptest",
  "proptest-state-machine",
+ "reqwest 0.13.4",
  "rmcp",
  "schemars",
  "serde",
@@ -2624,6 +2625,7 @@ dependencies = [
  "url",
  "uuid",
  "visible-browser-lab-test-support",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

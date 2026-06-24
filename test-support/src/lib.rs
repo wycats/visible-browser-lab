@@ -119,7 +119,7 @@ impl Drop for RealBrowser {
     }
 }
 
-fn chrome_for_testing_executable() -> Result<PathBuf> {
+pub fn chrome_for_testing_executable() -> Result<PathBuf> {
     static CHROME_FOR_TESTING_LOCK: Mutex<()> = Mutex::new(());
     let _guard = CHROME_FOR_TESTING_LOCK
         .lock()
@@ -920,12 +920,33 @@ pub struct McpClient {
 
 impl McpClient {
     pub fn spawn(binary: &Path, cdp_endpoint: &str, state_dir: &Path, root: &Path) -> Result<Self> {
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .arg("--cdp-endpoint")
             .arg(cdp_endpoint)
             .arg("--state-dir")
             .arg(state_dir)
+            .current_dir(root);
+        Self::spawn_command(command, binary)
+    }
+
+    pub fn spawn_managed(
+        binary: &Path,
+        state_dir: &Path,
+        root: &Path,
+        chrome_path: &Path,
+    ) -> Result<Self> {
+        let mut command = Command::new(binary);
+        command
+            .arg("--state-dir")
+            .arg(state_dir)
             .current_dir(root)
+            .env("VISIBLE_BROWSER_LAB_CHROME_PATH", chrome_path);
+        Self::spawn_command(command, binary)
+    }
+
+    fn spawn_command(mut command: Command, binary: &Path) -> Result<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

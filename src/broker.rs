@@ -13,17 +13,19 @@ use fs2::FileExt;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::Mutex as AsyncMutex,
     time::{Instant, sleep},
 };
 
 use crate::{
     cdp::{CdpClient, CdpDiagnosticEvent, CdpDiagnosticsMonitor, CdpTarget},
-    config::RuntimeConfig,
+    config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
         AgentSessionId, BrowserToolError, LeaseRegistry, LeaseState, OwnedTabSummary, TabId,
         TabLease, TabSnapshot,
     },
+    managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
         ClaimTabParams, ClickParams, ClickResult, CloseTabResult, ConsoleMessage,
@@ -55,7 +57,7 @@ impl BrokerState {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
             diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
-            browser: BrowserBackend::new(&config.cdp_endpoint)?,
+            browser: BrowserBackend::new(config)?,
         })
     }
 
@@ -420,21 +422,95 @@ impl FakeBrowser {
 
 #[derive(Clone)]
 enum BrowserBackend {
-    Cdp(CdpClient),
+    External(CdpClient),
+    Managed(Arc<ManagedBrowserBackend>),
     #[cfg(test)]
     Fake(Arc<Mutex<FakeBrowser>>),
 }
 
+#[derive(Clone)]
+struct ManagedBrowserBackend {
+    config: RuntimeConfig,
+    client: Arc<AsyncMutex<Option<(String, CdpClient)>>>,
+}
+
+impl ManagedBrowserBackend {
+    fn new(config: RuntimeConfig) -> Self {
+        Self {
+            config,
+            client: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    async fn client(&self) -> Result<CdpClient, BrowserToolError> {
+        let managed = ensure_managed_chrome(&self.config, BrowserLaunchMode::Visible)
+            .await
+            .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+        let mut client = self.client.lock().await;
+        if client
+            .as_ref()
+            .is_none_or(|(endpoint, _)| endpoint != &managed.cdp_endpoint)
+        {
+            let cdp = CdpClient::new(&managed.cdp_endpoint)
+                .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+            *client = Some((managed.cdp_endpoint, cdp));
+        }
+        Ok(client
+            .as_ref()
+            .expect("managed CDP client was initialized")
+            .1
+            .clone())
+    }
+}
+
 impl BrowserBackend {
-    fn new(cdp_endpoint: &str) -> Result<Self> {
-        Ok(Self::Cdp(CdpClient::new(cdp_endpoint)?))
+    fn new(config: &RuntimeConfig) -> Result<Self> {
+        match config.runtime_mode {
+            RuntimeMode::External => {
+                let endpoint = config
+                    .cdp_endpoint
+                    .as_deref()
+                    .context("external runtime omitted its CDP endpoint")?;
+                Ok(Self::External(CdpClient::new(endpoint)?))
+            }
+            RuntimeMode::Managed => Ok(Self::Managed(Arc::new(ManagedBrowserBackend::new(
+                config.clone(),
+            )))),
+        }
+    }
+
+    async fn cdp_client(&self) -> Result<CdpClient, BrowserToolError> {
+        match self {
+            Self::External(client) => Ok(client.clone()),
+            Self::Managed(browser) => browser.client().await,
+            #[cfg(test)]
+            Self::Fake(_) => unreachable!("fake browser does not expose a CDP client"),
+        }
+    }
+
+    async fn resolved_endpoint(&self) -> Result<String, BrowserToolError> {
+        match self {
+            Self::External(_) => Ok(self
+                .cdp_client()
+                .await?
+                .endpoint()
+                .as_str()
+                .trim_end_matches('/')
+                .to_string()),
+            Self::Managed(browser) => browser
+                .client()
+                .await
+                .map(|client| client.endpoint().as_str().to_string()),
+            #[cfg(test)]
+            Self::Fake(_) => Ok("fake://browser".to_string()),
+        }
     }
 
     async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.page_targets().await,
             #[cfg(test)]
             Self::Fake(browser) => Ok(browser.lock().unwrap().page_targets()),
+            _ => self.cdp_client().await?.page_targets().await,
         }
     }
 
@@ -444,33 +520,48 @@ impl BrowserBackend {
         focus: bool,
     ) -> Result<CdpTarget, BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.create_page(url, focus).await,
             #[cfg(test)]
             Self::Fake(browser) => Ok(browser.lock().unwrap().create_page(url, focus)),
+            Self::External(client) => client.create_page(url, focus).await,
+            Self::Managed(browser) => {
+                let client = browser.client().await?;
+                let target = client.create_page(url, false).await?;
+                if focus {
+                    client.activate_target(&target.id).await?;
+                    activate_managed_chrome(&browser.config)
+                        .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+                }
+                Ok(target)
+            }
         }
     }
 
     async fn activate_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.activate_target(target_id).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().activate_target(target_id),
+            Self::External(client) => client.activate_target(target_id).await,
+            Self::Managed(browser) => {
+                browser.client().await?.activate_target(target_id).await?;
+                activate_managed_chrome(&browser.config)
+                    .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))
+            }
         }
     }
 
     async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.close_target(target_id).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().close_target(target_id),
+            _ => self.cdp_client().await?.close_target(target_id).await,
         }
     }
 
     async fn has_focus(&self, target: &CdpTarget) -> Result<bool, BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.has_focus(target).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().has_focus(&target.id),
+            _ => self.cdp_client().await?.has_focus(target).await,
         }
     }
 
@@ -482,12 +573,13 @@ impl BrowserBackend {
         timeout_ms: u64,
     ) -> Result<CdpTarget, BrowserToolError> {
         match self {
-            Self::Cdp(client) => {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().navigate(target, url),
+            _ => {
+                let client = self.cdp_client().await?;
                 client.navigate(target, url, wait_until, timeout_ms).await?;
                 client.page_target(&target.id).await
             }
-            #[cfg(test)]
-            Self::Fake(browser) => browser.lock().unwrap().navigate(target, url),
         }
     }
 
@@ -497,9 +589,9 @@ impl BrowserBackend {
         full_page: bool,
     ) -> Result<String, BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.screenshot(target, full_page).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().screenshot(target, full_page),
+            _ => self.cdp_client().await?.screenshot(target, full_page).await,
         }
     }
 
@@ -509,9 +601,9 @@ impl BrowserBackend {
         expression: &str,
     ) -> Result<EvaluateResult, BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.evaluate(target, expression).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().evaluate(target, expression),
+            _ => self.cdp_client().await?.evaluate(target, expression).await,
         }
     }
 
@@ -522,17 +614,22 @@ impl BrowserBackend {
         timeout_ms: u64,
     ) -> Result<(), BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.click(target, selector, timeout_ms).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().click(target, selector),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .click(target, selector, timeout_ms)
+                    .await
+            }
         }
     }
 
     async fn type_text(&self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.type_text(target, text).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().type_text(target, text),
+            _ => self.cdp_client().await?.type_text(target, text).await,
         }
     }
 
@@ -543,9 +640,14 @@ impl BrowserBackend {
         modifiers: &[String],
     ) -> Result<(), BrowserToolError> {
         match self {
-            Self::Cdp(client) => client.press_key(target, key, modifiers).await,
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().press_key(target, key, modifiers),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .press_key(target, key, modifiers)
+                    .await
+            }
         }
     }
 
@@ -555,9 +657,14 @@ impl BrowserBackend {
         sink: Arc<dyn Fn(CdpDiagnosticEvent) + Send + Sync>,
     ) -> Result<Option<CdpDiagnosticsMonitor>, BrowserToolError> {
         match self {
-            Self::Cdp(client) => Ok(Some(client.diagnostics_monitor(target, sink).await?)),
             #[cfg(test)]
             Self::Fake(_) => Ok(None),
+            _ => Ok(Some(
+                self.cdp_client()
+                    .await?
+                    .diagnostics_monitor(target, sink)
+                    .await?,
+            )),
         }
     }
 }
@@ -574,7 +681,8 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
     );
 
     tracing::info!(
-        cdp_endpoint = %config.cdp_endpoint,
+        runtime_mode = ?config.runtime_mode,
+        cdp_endpoint = ?config.cdp_endpoint,
         ipc_endpoint = %endpoint.display(),
         state_dir = %config.state_dir.display(),
         "visible browser broker listening"
@@ -682,10 +790,15 @@ async fn wait_for_broker(config: &RuntimeConfig, timeout: Duration) -> Result<Br
         match connect_and_ping(config).await {
             Ok(client) => return Ok(client),
             Err(error) if Instant::now() >= deadline => {
+                let diagnostics = fs::read_to_string(config.log_dir.join("broker.stderr.log"))
+                    .unwrap_or_else(|read_error| {
+                        format!("failed to read broker diagnostics: {read_error}")
+                    });
                 return Err(error).with_context(|| {
                     format!(
-                        "timed out waiting for broker socket `{}`",
-                        config.ipc_endpoint
+                        "timed out waiting for broker socket `{}`; broker diagnostics: {}",
+                        config.ipc_endpoint,
+                        diagnostics.trim()
                     )
                 });
             }
@@ -701,17 +814,23 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
     let stdout = append_log_file(&config.log_dir.join("broker.stdout.log"))?;
     let stderr = append_log_file(&config.log_dir.join("broker.stderr.log"))?;
 
-    let child = Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("broker")
         .arg("--socket")
         .arg(&config.ipc_endpoint)
-        .arg("--cdp-endpoint")
-        .arg(&config.cdp_endpoint)
         .arg("--state-dir")
         .arg(&config.state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+    if let Some(cdp_endpoint) = &config.cdp_endpoint {
+        command.arg("--cdp-endpoint").arg(cdp_endpoint);
+    }
+    if let Some(chrome_path) = &config.chrome_path {
+        command.env(CHROME_PATH_ENV, chrome_path);
+    }
+    let child = command
         .spawn()
         .context("failed to spawn visible browser broker")?;
 
@@ -788,15 +907,7 @@ async fn dispatch_request(
     request: BrokerRequest,
 ) -> BrokerResponse {
     match request.method.as_str() {
-        "ping" => BrokerResponse::success(request.id.clone(), broker_status(config))
-            .unwrap_or_else(|error| {
-                BrokerResponse::error(
-                    request.id,
-                    BrowserToolError::invalid_input(format!(
-                        "failed to serialize broker status: {error}"
-                    )),
-                )
-            }),
+        "ping" => broker_response(request.id, broker_status(config, state).await),
         "start_session" => broker_response(
             request.id,
             broker_start_session(state, parse_params(request.params)).await,
@@ -1319,14 +1430,18 @@ fn tab_snapshot(target: &CdpTarget, focused_target_id: Option<&str>) -> TabSnaps
     snapshot
 }
 
-fn broker_status(config: &RuntimeConfig) -> BrokerStatus {
-    BrokerStatus {
+async fn broker_status(
+    config: &RuntimeConfig,
+    state: &BrokerState,
+) -> Result<BrokerStatus, BrowserToolError> {
+    Ok(BrokerStatus {
         protocol_version: BROKER_PROTOCOL_VERSION,
         pid: std::process::id(),
-        cdp_endpoint: config.cdp_endpoint.clone(),
+        runtime_mode: config.runtime_mode,
+        cdp_endpoint: state.browser.resolved_endpoint().await?,
         ipc_endpoint: config.ipc_endpoint.clone(),
         socket_path: config.socket_path.clone(),
-    }
+    })
 }
 
 fn broker_endpoint(config: &RuntimeConfig) -> Result<BrokerEndpoint> {
@@ -1485,6 +1600,7 @@ mod tests {
         let status = client.ping().await.unwrap();
 
         assert_eq!(status.protocol_version, BROKER_PROTOCOL_VERSION);
+        assert_eq!(status.runtime_mode, RuntimeMode::External);
         assert_eq!(status.cdp_endpoint, "http://127.0.0.1:9222");
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 

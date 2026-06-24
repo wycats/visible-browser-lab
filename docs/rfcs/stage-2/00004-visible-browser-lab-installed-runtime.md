@@ -64,7 +64,7 @@ Platform launch adapters preserve the common runtime contract:
 - Windows starts the discovered executable with a non-activating window startup mode;
 - Linux starts the discovered executable directly and relies on desktop focus-stealing prevention while creating Chrome targets in the background.
 
-The broker waits for `DevToolsActivePort`, validates `/json/version`, and reports a bounded startup error with captured diagnostics. A healthy managed instance is reused across MCP server and broker restarts.
+The broker waits for `DevToolsActivePort`, validates `/json/version`, and reports a bounded startup error with captured diagnostics. A healthy managed instance is reused across MCP server and broker restarts. Broker status reports `managed` or `external` together with the resolved CDP endpoint. Broker socket, lock, and PID paths carry protocol version 2 so an older broker cannot satisfy this runtime contract.
 
 The launcher is implemented in this repository. General-purpose opener crates model opening URLs or files through desktop defaults. The managed runtime needs browser discovery, a persistent profile, CDP port discovery, startup diagnostics, and platform no-activation behavior as one owned contract.
 
@@ -76,6 +76,8 @@ Chrome remains visible and available for user interaction. Session and tab creat
 
 - `focus_tab`;
 - `start_session` or `new_tab` with `focus: true`.
+
+For managed Chrome, these explicit focus requests also invoke the platform activation adapter after activating the CDP target. On macOS, the adapter asks LaunchServices to bring the managed Chrome application forward. Background tab creation never invokes the activation adapter.
 
 Navigation, screenshots, evaluation, text insertion, console reads, and network reads operate on the owned target's CDP session without activating Chrome. `type_text` inserts text into the element that already owns DOM focus in that target.
 
