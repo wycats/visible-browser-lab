@@ -1,16 +1,16 @@
 <!-- exo:3 ulid:01kvtxcp8a0592mpeaggnjke98 -->
 
-# RFC 3: Visible Browser Lab Real-Browser Property Tests
+# RFC 00003: Visible Browser Lab Real-Browser Property Tests
 
 ## Summary
 
-Visible Browser Lab needs a CI-safe real-browser validation layer for the tab ownership facade. Unit tests and fake-CDP broker tests validate isolated Rust behavior. The visible smoke test validates the installed workflow against a user-watchable Chrome profile. This RFC adds a Cargo integration test layer that provisions Chrome for Testing through Rust, launches an isolated browser in `headless` or `visible` mode, drives the real `visible-browser-lab-mcp` stdio server, and checks the broker-enforced tab ownership contract through generated command sequences.
+Visible Browser Lab has a CI-safe real-browser validation layer for the tab ownership facade. Unit tests and fake-CDP broker tests validate isolated Rust behavior. The visible smoke test validates the installed workflow against a user-watchable Chrome profile. This RFC defines the Cargo integration test layer that provisions Chrome for Testing through Rust, launches an isolated browser in `headless` or `visible` mode, drives the real `visible-browser-lab-mcp` stdio server, and checks the broker-enforced tab ownership contract through deterministic and generated command sequences.
 
-The new test target is `cargo test --test headless_mcp`. It runs against a temporary Chrome profile, a temporary broker state directory, and a local HTTP fixture. It uses this repository's MCP facade and CDP implementation directly.
+The test target is `cargo test --test headless_mcp`. It runs against a temporary Chrome profile, a temporary broker state directory, and a local HTTP fixture. It uses this repository's MCP facade and CDP implementation directly.
 
-## Motivation
+## Validation Contract
 
-RFC 00001 defines a local capability boundary around a shared visible Chrome profile. That boundary is only useful if the facade consistently validates ownership before every Chrome action. The current test stack covers important slices of that behavior, but each slice leaves a different gap:
+RFC 00001 defines a local capability boundary around a shared visible Chrome profile. That boundary is only useful if the facade consistently validates ownership before every Chrome action. The layered test stack covers complementary slices of that behavior:
 
 - Unit tests cover data structures and helper functions without a browser.
 - Fake-CDP broker tests cover broker behavior without Chrome's target lifecycle, event timing, or screenshot/input behavior.
@@ -66,7 +66,7 @@ The invariant set is the durable contract for this validation layer:
 
 Use Chrome for Testing as the browser source for CI and local real-browser runs. Chrome for Testing is Google's versioned Chrome flavor for browser automation and is released through machine-readable metadata.
 
-Add this dev dependency:
+The repository uses this dev dependency:
 
 ```toml
 chrome-for-testing-manager = { version = "0.12", default-features = false }
@@ -95,7 +95,7 @@ The harness discovers the selected CDP endpoint from Chrome's `DevToolsActivePor
 
 ## Property Model
 
-Add these dev dependencies:
+The repository uses these dev dependencies:
 
 ```toml
 proptest = "1"
@@ -110,7 +110,7 @@ The target supports normal Proptest controls. CI uses a modest default case coun
 
 ## Test Harness
 
-Add a publish-disabled workspace crate named `visible-browser-lab-test-support`. Both `xtask` and `tests/headless_mcp.rs` use this crate for shared protocol and fixture helpers:
+The publish-disabled workspace crate `visible-browser-lab-test-support` is shared by `xtask` and `tests/headless_mcp.rs` for protocol and fixture helpers:
 
 - stdio MCP client;
 - local HTTP fixture;
@@ -120,7 +120,7 @@ Add a publish-disabled workspace crate named `visible-browser-lab-test-support`.
 - target close through Chrome HTTP endpoints;
 - response helpers for tab summaries and browser tool errors.
 
-Add a Chrome for Testing harness that owns:
+The Chrome for Testing harness owns:
 
 - Chrome for Testing cache directory selection;
 - browser mode selection;
@@ -137,7 +137,7 @@ The state-machine tests build on that harness and run generated sequential comma
 
 ## CI Shape
 
-Add a Linux real-browser job to CI. The job runs the default `headless` mode:
+The Linux real-browser job in CI runs the default `headless` mode:
 
 ```text
 cargo test --test headless_mcp
@@ -147,9 +147,9 @@ The job caches the Chrome for Testing artifact directory. The existing OS matrix
 
 Release PR dry-runs include the real-browser test before package generation. The real-browser test becomes part of the evidence for promoting RFC 00001 to Stage 3 because it exercises the implemented facade contract through a real browser in CI.
 
-## Drawbacks
+## Operational Costs
 
-The real-browser test downloads and launches Chrome for Testing, so it is slower than unit and fake-CDP tests. The CI job should be separate from the fast Rust matrix so ordinary failures stay easy to read.
+The real-browser test downloads and launches Chrome for Testing, so it is slower than unit and fake-CDP tests. The CI job is separate from the fast Rust matrix so ordinary failures stay easy to read.
 
 The test adds a network-dependent first run when the Chrome for Testing cache is empty. CI cache configuration and a local override path keep repeated runs fast.
 
@@ -165,9 +165,9 @@ Drive a separate browser automation client from the test: this is well-establish
 
 Use deterministic scripted integration tests only: this is simpler to implement, and the RFC includes one deterministic harness test. It leaves sequence-sensitive lease bugs underexplored, so property/state-machine tests remain part of the design.
 
-## Stage 2 Readiness
+## Stage 3 Candidate State
 
-This RFC is ready for Stage 2 when the implementation task starts and the RFC still matches:
+This RFC is a Stage 3 candidate when the implementation and validation layers match:
 
 - the Cargo test target name;
 - the Chrome for Testing provisioning crate and cache path;
@@ -185,16 +185,18 @@ This RFC is ready for Stage 2 when the implementation task starts and the RFC st
 - `chrome-for-testing-manager`: https://docs.rs/chrome-for-testing-manager
 - Proptest state-machine testing: https://proptest-rs.github.io/proptest/proptest/state-machine.html
 
-## Implementation Plan
+## Build Map
 
-1. Add the test-only dependencies for Chrome for Testing provisioning and property testing.
-2. Add the `visible-browser-lab-test-support` workspace crate and move shared MCP smoke-test helpers from `xtask` into it.
-3. Add the Chrome for Testing harness with `headless` and `visible` browser modes.
-4. Add `tests/headless_mcp.rs` with a deterministic smoke case that proves the harness, MCP facade, and Chrome for Testing wiring.
-5. Add sequential state-machine property tests for the tab ownership invariants.
-6. Add the Linux CI job with Chrome for Testing cache support.
-7. Include the real-browser test in release PR dry-runs before package generation.
-8. Update RFC 00001's Stage 3 validation language to reference the real-browser CI validation layer.
+Available components:
+
+1. Test-only dependencies for Chrome for Testing provisioning and property testing.
+2. The `visible-browser-lab-test-support` workspace crate shared by `xtask` and `tests/headless_mcp.rs`.
+3. Chrome for Testing harness with `headless` and `visible` browser modes.
+4. `tests/headless_mcp.rs` deterministic smoke case for harness, MCP facade, and Chrome for Testing wiring.
+5. Sequential state-machine property tests for tab ownership invariants.
+6. Linux CI job with Chrome for Testing cache support.
+7. Release PR dry-run gate that runs the real-browser test before package generation.
+8. RFC 00001 Stage 3 validation language that cites the real-browser CI validation layer.
 
 ## Test Plan
 
