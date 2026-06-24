@@ -69,7 +69,7 @@ impl RealBrowser {
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
 
         if mode == BrowserMode::Headless {
             command.arg("--headless=new");

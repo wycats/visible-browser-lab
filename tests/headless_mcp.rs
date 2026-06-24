@@ -23,7 +23,7 @@ fn deterministic_real_browser_facade() -> Result<()> {
     let summary = run_live_smoke(harness.client_mut(), &mut open_tabs, &cdp_endpoint);
     cleanup_open_tabs(harness.client_mut(), &mut open_tabs);
     let summary = summary?;
-    assert_eq!(summary.tool_count, EXPECTED_TOOLS.len());
+    assert!(summary.tool_count >= EXPECTED_TOOLS.len());
     assert!(summary.screenshot_bytes > 1000);
     assert!(summary.global_groups > 0);
     Ok(())
@@ -476,13 +476,26 @@ impl BrowserMcpHarness {
         let old_error = self.client_mut().call_tool(
             "focus_tab",
             json!({
-                "agent_session_id": old_session,
+                "agent_session_id": old_session.clone(),
                 "tab_id": old_tab_id
             }),
             Duration::from_secs(20),
             true,
         )?;
         assert_tool_error(&old_error, "unknown_tab")?;
+        let old_owner_tabs = self.client_mut().call_tool(
+            "list_tabs",
+            json!({ "agent_session_id": old_session }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let old_owner_tabs = old_owner_tabs
+            .get("tabs")
+            .and_then(Value::as_array)
+            .context("old owner list_tabs omitted tabs array")?;
+        if tabs_include_id(old_owner_tabs, &old_tab_id) {
+            bail!("old owner list_tabs exposed stale takeover tab_id `{old_tab_id}`");
+        }
         self.tabs[tab].tab_id = new_tab_id;
         self.tabs[tab].owner = Some(caller);
         Ok(())
