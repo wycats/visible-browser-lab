@@ -40,6 +40,14 @@ The `directories` crate resolves the operating-system cache directory. The defau
 
 Discovery returns the executable path and browser family. Startup errors name the attempted executable paths and the configuration override.
 
+## CDP connection
+
+The broker uses `chromiumoxide` 0.9.1 with default features disabled as its low-level Chrome DevTools Protocol client. Each configured CDP endpoint has one `Browser` connection and one continuously driven `Handler`. Viewport emulation is disabled so screenshots, layout coordinates, and input use the visible browser's native viewport.
+
+The broker uses Chromiumoxide's typed protocol commands and event streams for target inventory, target creation and closure, navigation, JavaScript evaluation, screenshots, mouse and keyboard input, console messages, and network events. The broker retains ownership of endpoint selection, Chrome launch, session and tab leases, error translation, and MCP response types.
+
+Handler completion invalidates the endpoint connection. A subsequent broker operation establishes a new `Browser` and `Handler` against the selected endpoint. If the endpoint no longer identifies a running Chrome instance, the operation returns the broker's browser-unavailable error with the connection failure as diagnostic context. The broker does not replay an interrupted Chrome action because the client cannot establish whether Chrome performed it before the connection ended.
+
 ## Managed browser launch
 
 The launcher starts Chrome with:
@@ -62,14 +70,20 @@ The launcher is implemented in this repository. General-purpose opener crates mo
 
 # Focus Contract
 
-Chrome remains visible and available for user interaction. MCP actions preserve the user's active application and active Chrome tab unless the caller invokes `focus_tab` or requests `focus: true` while creating a tab.
+Chrome remains visible and available for user interaction. Session and tab creation preserve the user's active application and active Chrome tab unless the caller invokes `focus_tab` or requests `focus: true` while creating a tab.
 
 `Target.createTarget` receives `background: true` for the default tab-creation path. The broker calls `Target.activateTarget` only for:
 
 - `focus_tab`;
 - `start_session` or `new_tab` with `focus: true`.
 
-Navigation, screenshots, evaluation, clicking, text insertion, key dispatch, console reads, and network reads operate on the owned target's CDP session without activating the target. Owned-tab actions continue to enforce `agent_session_id` and `tab_id` before calling Chrome.
+Navigation, screenshots, evaluation, text insertion, console reads, and network reads operate on the owned target's CDP session without activating Chrome. `type_text` inserts text into the element that already owns DOM focus in that target.
+
+`click` and `press_key` dispatch native mouse and keyboard events only while the owned target has browser focus. After validating `agent_session_id` and `tab_id`, the broker evaluates `document.hasFocus()` in the target. When the result is false, the broker returns `focus_required` without dispatching input. The caller invokes `focus_tab` and retries the action. This explicit transition keeps trusted input attached to the tab the user can see as active.
+
+The broker implements `click` through a CSS selector, a visible-element center point, and CDP mouse events. It implements `press_key` through CDP keyboard events. DOM-mediated click and keyboard fallbacks are not part of the tool contract.
+
+Every owned-tab action validates `agent_session_id` and `tab_id` before evaluating focus or calling Chrome.
 
 The broker's `focused` field describes focus changes issued through the facade and is cleared when the corresponding target disappears, closes, or leaves its lease boundary.
 
@@ -99,18 +113,21 @@ The test accepts a preauthenticated isolated Codex home for model-driven invocat
 
 # Implementation Map
 
-1. Add cross-platform runtime directory resolution and the managed/external runtime mode.
-2. Add browser discovery, platform launch adapters, `DevToolsActivePort` readiness, reuse, and startup diagnostics.
-3. Make background target creation explicit and reserve target activation for explicit focus operations.
-4. Generate host MCP configuration from the installed plugin root and align package versions with the release tag.
-5. Add the isolated installed-package smoke harness and CI coverage for package-root and managed-runtime behavior.
-6. Update the skill and release documentation with the zero-setup installed workflow and explicit external-endpoint override.
+1. Replace the broker's manual WebSocket transport with a broker-owned Chromiumoxide connection and handler for each CDP endpoint.
+2. Add cross-platform runtime directory resolution and the managed/external runtime mode.
+3. Add browser discovery, platform launch adapters, `DevToolsActivePort` readiness, reuse, and startup diagnostics.
+4. Make background target creation explicit, reserve target activation for explicit focus operations, and require browser focus for trusted mouse and keyboard dispatch.
+5. Generate host MCP configuration from the installed plugin root and align package versions with the release tag.
+6. Add the isolated installed-package smoke harness and CI coverage for package-root and managed-runtime behavior.
+7. Update the skill and release documentation with the zero-setup installed workflow, explicit focus transition, and external-endpoint override.
 
 # Drawbacks
 
 The managed profile consumes persistent disk space and keeps browser state across sessions. Visible Browser Lab owns that profile so users can inspect and interact with its tabs.
 
 Desktop focus behavior crosses Chrome, the operating system, and the window manager. The platform adapters express the strongest supported no-activation request, and real-browser tests verify observable focus behavior on supported development and CI platforms.
+
+Native mouse and keyboard dispatch requires an explicit focus operation for background tabs. Callers handle `focus_required` by deciding whether to activate the tab and retry the input action.
 
 Browser discovery must track common installation paths. The explicit Chrome path override provides a stable route for custom installations.
 
@@ -120,6 +137,8 @@ A desktop opener crate can open a browser or URL through system configuration. T
 
 The `browser_launcher` crate provides browser flags and executable discovery. Its public contract does not expose platform no-activation behavior or `DevToolsActivePort` resolution for a dynamically assigned port, so adopting it would still require the runtime layer defined here.
 
+A repository-owned WebSocket transport can send the required CDP messages directly. Chromiumoxide already provides typed protocol commands, target sessions, event streams, and a driven connection lifecycle. Using that client concentrates this repository's implementation on browser ownership, focus, error semantics, and MCP behavior.
+
 A fixed debugging port simplifies startup but creates collisions between users, tests, and concurrent installations. Chrome's dynamic port and `DevToolsActivePort` provide an isolated endpoint for each managed profile.
 
 # Stage 3 Criteria
@@ -128,9 +147,11 @@ A fixed debugging port simplifies startup but creates collisions between users, 
 - With no external endpoint configuration, the broker starts or reuses the managed visible Chrome profile and reports its dynamically assigned endpoint.
 - Default session and tab creation leave the user's active application and active Chrome tab unchanged on macOS.
 - `focus_tab` and `focus: true` activate the owned tab.
-- Navigation, screenshots, evaluation, click, text insertion, key dispatch, and diagnostics complete against a background owned tab.
+- Navigation, screenshots, evaluation, text insertion, and diagnostics complete against a background owned tab without activating Chrome.
+- `click` and `press_key` return `focus_required` without dispatching input when the owned target lacks browser focus.
+- After `focus_tab`, retrying `click` or `press_key` dispatches the requested native input to the owned target.
+- Handler termination invalidates the Chromiumoxide connection, and the next broker operation reconnects to a running endpoint.
 - Runtime directories contain no developer-specific absolute paths.
 - Package manifests and binary version output match the release version.
 - The isolated Codex installation smoke test verifies installation, MCP discovery, managed Chrome startup, the tab lifecycle, and cleanup.
 - Unit, fake-CDP, real-browser, package, macOS visible-mode, Windows compile, and release dry-run checks pass.
-
