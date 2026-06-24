@@ -3,9 +3,9 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub const DEFAULT_CDP_PORT: &str = "9222";
 pub const DEFAULT_CDP_ORIGIN: &str = "http://127.0.0.1";
 const CDP_ENDPOINT_ENV: &str = "VISIBLE_BROWSER_CDP_ENDPOINT";
 const CDP_PORT_ENV: &str = "VISIBLE_BROWSER_CDP_PORT";
@@ -72,13 +72,26 @@ impl RuntimeOptions {
         let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
         let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
 
-        RuntimeConfig::from_parts_with_chrome(cdp_endpoint, state_dir, chrome_path)
+        match cdp_endpoint {
+            Some(cdp_endpoint) => {
+                RuntimeConfig::external_with_chrome(cdp_endpoint, state_dir, chrome_path)
+            }
+            None => Ok(RuntimeConfig::managed(state_dir, chrome_path)),
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    Managed,
+    External,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
-    pub cdp_endpoint: String,
+    pub runtime_mode: RuntimeMode,
+    pub cdp_endpoint: Option<String>,
     pub state_dir: PathBuf,
     pub ipc_endpoint: String,
     pub socket_path: PathBuf,
@@ -87,15 +100,16 @@ pub struct RuntimeConfig {
     pub log_dir: PathBuf,
     pub chrome_profile_dir: PathBuf,
     pub devtools_active_port_path: PathBuf,
+    pub chrome_lock_path: PathBuf,
     pub chrome_path: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
     pub fn from_parts(cdp_endpoint: String, state_dir: PathBuf) -> Result<Self> {
-        Self::from_parts_with_chrome(cdp_endpoint, state_dir, None)
+        Self::external_with_chrome(cdp_endpoint, state_dir, None)
     }
 
-    pub fn from_parts_with_chrome(
+    pub fn external_with_chrome(
         cdp_endpoint: String,
         state_dir: PathBuf,
         chrome_path: Option<PathBuf>,
@@ -104,17 +118,37 @@ impl RuntimeConfig {
         let chrome_profile_dir = state_dir.join("chrome-profile");
 
         Ok(Self {
-            cdp_endpoint,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: Some(cdp_endpoint),
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
             socket_path: state_dir.join("broker-v2.sock"),
             lock_path: state_dir.join("broker-v2.lock"),
             pid_path: state_dir.join("broker-v2.pid"),
             log_dir: state_dir.join("logs"),
             devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
+            chrome_lock_path: state_dir.join("chrome-launch.lock"),
             chrome_profile_dir,
             chrome_path,
             state_dir,
         })
+    }
+
+    pub fn managed(state_dir: PathBuf, chrome_path: Option<PathBuf>) -> Self {
+        let chrome_profile_dir = state_dir.join("chrome-profile");
+        Self {
+            runtime_mode: RuntimeMode::Managed,
+            cdp_endpoint: None,
+            ipc_endpoint: derive_ipc_endpoint(&state_dir),
+            socket_path: state_dir.join("broker-v2.sock"),
+            lock_path: state_dir.join("broker-v2.lock"),
+            pid_path: state_dir.join("broker-v2.pid"),
+            log_dir: state_dir.join("logs"),
+            devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
+            chrome_lock_path: state_dir.join("chrome-launch.lock"),
+            chrome_profile_dir,
+            chrome_path,
+            state_dir,
+        }
     }
 }
 
@@ -126,17 +160,20 @@ pub fn resolve_cdp_endpoint(
     cli_endpoint: Option<&str>,
     env_endpoint: Option<&str>,
     env_port: Option<&str>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     if let Some(endpoint) = non_empty(cli_endpoint) {
-        return normalize_cdp_endpoint(endpoint);
+        return normalize_cdp_endpoint(endpoint).map(Some);
     }
 
     if let Some(endpoint) = non_empty(env_endpoint) {
-        return normalize_cdp_endpoint(endpoint);
+        return normalize_cdp_endpoint(endpoint).map(Some);
     }
 
-    let port = non_empty(env_port).unwrap_or(DEFAULT_CDP_PORT);
-    normalize_cdp_endpoint(&format!("{DEFAULT_CDP_ORIGIN}:{port}"))
+    if let Some(port) = non_empty(env_port) {
+        return normalize_cdp_endpoint(&format!("{DEFAULT_CDP_ORIGIN}:{port}")).map(Some);
+    }
+
+    Ok(None)
 }
 
 pub fn resolve_state_dir(
@@ -173,10 +210,10 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn default_endpoint_targets_visible_browser_port() {
+    fn absent_endpoint_selects_managed_runtime() {
         let endpoint = resolve_cdp_endpoint(None, None, None).unwrap();
 
-        assert_eq!(endpoint, "http://127.0.0.1:9222");
+        assert_eq!(endpoint, None);
     }
 
     #[test]
@@ -188,7 +225,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(endpoint, "http://127.0.0.1:9333");
+        assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9333"));
     }
 
     #[test]
@@ -196,14 +233,14 @@ mod tests {
         let endpoint =
             resolve_cdp_endpoint(None, Some("http://127.0.0.1:9444/"), Some("9555")).unwrap();
 
-        assert_eq!(endpoint, "http://127.0.0.1:9444");
+        assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9444"));
     }
 
     #[test]
     fn environment_port_builds_localhost_endpoint() {
         let endpoint = resolve_cdp_endpoint(None, None, Some("9333")).unwrap();
 
-        assert_eq!(endpoint, "http://127.0.0.1:9333");
+        assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9333"));
     }
 
     #[test]
@@ -220,6 +257,12 @@ mod tests {
             PathBuf::from("/tmp/visible-browser-lab-test"),
         )
         .unwrap();
+
+        assert_eq!(config.runtime_mode, RuntimeMode::External);
+        assert_eq!(
+            config.cdp_endpoint.as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
 
         assert_eq!(
             config.socket_path,

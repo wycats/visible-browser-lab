@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use crate::{
+    config::RuntimeMode,
     ipc::{BrokerEndpoint, BrokerStream},
     leases::{
         AgentSessionId, BrowserToolError, BrowserToolErrorCode, GlobalTabGroup, OwnedTabSummary,
@@ -21,6 +22,7 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 2;
 pub struct BrokerStatus {
     pub protocol_version: u32,
     pub pid: u32,
+    pub runtime_mode: RuntimeMode,
     pub cdp_endpoint: String,
     pub ipc_endpoint: String,
     pub socket_path: PathBuf,

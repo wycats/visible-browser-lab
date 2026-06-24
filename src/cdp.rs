@@ -89,6 +89,10 @@ impl CdpClient {
         })
     }
 
+    pub fn endpoint(&self) -> &Url {
+        self.runtime.endpoint.origin()
+    }
+
     #[cfg(test)]
     async fn disconnect_for_test(&self) {
         self.runtime.disconnect().await;
