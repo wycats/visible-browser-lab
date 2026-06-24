@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         shell: bash
@@ -56,7 +56,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         shell: bash
@@ -66,7 +66,7 @@ jobs:
           rustup default stable
 
       - name: Cache Chrome for Testing
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target/chrome-for-testing
           key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
@@ -101,7 +101,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         shell: bash
@@ -135,7 +135,7 @@ jobs:
           cp "target/${target}/release/${binary}" "dist/binaries/${target}/${binary}"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/binaries/${{ matrix.target }}/*
@@ -152,7 +152,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust stable
         shell: bash
@@ -162,7 +162,7 @@ jobs:
           rustup default stable
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/binaries
 
@@ -193,7 +193,7 @@ jobs:
           cargo xtask validate
 
       - name: Upload release assets artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: out/packages/*
@@ -214,7 +214,7 @@ jobs:
 
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: out/packages
