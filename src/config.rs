@@ -2,15 +2,15 @@ use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use directories::BaseDirs;
 use url::Url;
 
 pub const DEFAULT_CDP_PORT: &str = "9222";
 pub const DEFAULT_CDP_ORIGIN: &str = "http://127.0.0.1";
-pub const DEFAULT_STATE_DIR: &str = "/Users/wycats/.cache/visible-browser-lab";
-
 const CDP_ENDPOINT_ENV: &str = "VISIBLE_BROWSER_CDP_ENDPOINT";
 const CDP_PORT_ENV: &str = "VISIBLE_BROWSER_CDP_PORT";
 const STATE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_STATE_DIR";
+pub const CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_PATH";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,9 +69,10 @@ impl RuntimeOptions {
         )?;
 
         let env_state_dir = env::var_os(STATE_DIR_ENV).map(PathBuf::from);
-        let state_dir = resolve_state_dir(self.state_dir, env_state_dir);
+        let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
+        let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
 
-        RuntimeConfig::from_parts(cdp_endpoint, state_dir)
+        RuntimeConfig::from_parts_with_chrome(cdp_endpoint, state_dir, chrome_path)
     }
 }
 
@@ -84,19 +85,34 @@ pub struct RuntimeConfig {
     pub lock_path: PathBuf,
     pub pid_path: PathBuf,
     pub log_dir: PathBuf,
+    pub chrome_profile_dir: PathBuf,
+    pub devtools_active_port_path: PathBuf,
+    pub chrome_path: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
     pub fn from_parts(cdp_endpoint: String, state_dir: PathBuf) -> Result<Self> {
+        Self::from_parts_with_chrome(cdp_endpoint, state_dir, None)
+    }
+
+    pub fn from_parts_with_chrome(
+        cdp_endpoint: String,
+        state_dir: PathBuf,
+        chrome_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let cdp_endpoint = normalize_cdp_endpoint(&cdp_endpoint)?;
+        let chrome_profile_dir = state_dir.join("chrome-profile");
 
         Ok(Self {
             cdp_endpoint,
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
-            socket_path: state_dir.join("broker.sock"),
-            lock_path: state_dir.join("broker.lock"),
-            pid_path: state_dir.join("broker.pid"),
+            socket_path: state_dir.join("broker-v2.sock"),
+            lock_path: state_dir.join("broker-v2.lock"),
+            pid_path: state_dir.join("broker-v2.pid"),
             log_dir: state_dir.join("logs"),
+            devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
+            chrome_profile_dir,
+            chrome_path,
             state_dir,
         })
     }
@@ -126,10 +142,14 @@ pub fn resolve_cdp_endpoint(
 pub fn resolve_state_dir(
     cli_state_dir: Option<PathBuf>,
     env_state_dir: Option<PathBuf>,
-) -> PathBuf {
-    cli_state_dir
-        .or(env_state_dir)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR))
+) -> Result<PathBuf> {
+    if let Some(state_dir) = cli_state_dir.or(env_state_dir) {
+        return Ok(state_dir);
+    }
+
+    let base_dirs =
+        BaseDirs::new().context("could not resolve the operating-system cache directory")?;
+    Ok(base_dirs.cache_dir().join("visible-browser-lab"))
 }
 
 fn normalize_cdp_endpoint(endpoint: &str) -> Result<String> {
@@ -203,7 +223,7 @@ mod tests {
 
         assert_eq!(
             config.socket_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker.sock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.sock")
         );
         if cfg!(windows) {
             assert!(config.ipc_endpoint.starts_with("visible-browser-lab-"));
@@ -211,20 +231,41 @@ mod tests {
         } else {
             assert_eq!(
                 config.ipc_endpoint,
-                "/tmp/visible-browser-lab-test/broker.sock"
+                "/tmp/visible-browser-lab-test/broker-v2.sock"
             );
         }
         assert_eq!(
             config.lock_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker.lock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.lock")
         );
         assert_eq!(
             config.pid_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker.pid")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.pid")
         );
         assert_eq!(
             config.log_dir,
             PathBuf::from("/tmp/visible-browser-lab-test/logs")
+        );
+        assert_eq!(
+            config.chrome_profile_dir,
+            PathBuf::from("/tmp/visible-browser-lab-test/chrome-profile")
+        );
+        assert_eq!(
+            config.devtools_active_port_path,
+            PathBuf::from("/tmp/visible-browser-lab-test/chrome-profile/DevToolsActivePort")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_uses_the_platform_cache_directory() {
+        let state_dir = resolve_state_dir(None, None).unwrap();
+
+        assert_eq!(
+            state_dir,
+            BaseDirs::new()
+                .unwrap()
+                .cache_dir()
+                .join("visible-browser-lab")
         );
     }
 
