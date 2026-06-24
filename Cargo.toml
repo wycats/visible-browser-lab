@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "test-support", "xtask"]
+exclude = ["spikes/chromiumoxide", "spikes/chromiumoxide-core"]
 resolver = "3"
 
 [package]

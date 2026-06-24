@@ -1,0 +1,13 @@
+[package]
+name = "visible-browser-lab-chromiumoxide-core-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0"
+chromiumoxide = { version = "0.9.1", default-features = false }
+futures-util = "0.3"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
