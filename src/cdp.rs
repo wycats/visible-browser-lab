@@ -1,15 +1,47 @@
 use std::{sync::Arc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
+use chromiumoxide::{
+    Browser,
+    cdp::{
+        browser_protocol::{
+            input::{
+                DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
+                DispatchMouseEventType, InsertTextParams, MouseButton,
+            },
+            log::{EnableParams as LogEnableParams, EventEntryAdded},
+            network::{
+                EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
+                EventRequestWillBeSent, EventResponseReceived,
+            },
+            page::{
+                CaptureScreenshotFormat, CaptureScreenshotParams, GetLayoutMetricsParams, Viewport,
+            },
+            target::{
+                ActivateTargetParams, CloseTargetParams, CreateTargetParams, GetTargetsParams,
+                TargetId,
+            },
+        },
+        js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventConsoleApiCalled},
+    },
+    error::CdpError,
+    handler::HandlerConfig,
+    page::Page,
+};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
-use tokio::time::{Instant, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
+    time::{Instant, sleep, timeout},
+};
 use url::Url;
 
 use crate::leases::{BrowserToolError, TabSnapshot};
 use crate::protocol::{EvaluateResult, NetworkEvent};
+
+const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdpEndpoint {
@@ -18,9 +50,11 @@ pub struct CdpEndpoint {
 
 impl CdpEndpoint {
     pub fn parse(endpoint: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            origin: Url::parse(endpoint)?,
-        })
+        let origin = Url::parse(endpoint)?;
+        if !matches!(origin.scheme(), "http" | "https" | "ws" | "wss") {
+            anyhow::bail!("unsupported CDP endpoint scheme `{}`", origin.scheme());
+        }
+        Ok(Self { origin })
     }
 
     pub fn version_url(&self) -> Url {
@@ -44,45 +78,44 @@ impl CdpEndpoint {
 
 #[derive(Debug, Clone)]
 pub struct CdpClient {
-    endpoint: CdpEndpoint,
-    http: reqwest::Client,
+    runtime: Arc<CdpRuntime>,
 }
 
 impl CdpClient {
     pub fn new(endpoint: &str) -> anyhow::Result<Self> {
+        let endpoint = CdpEndpoint::parse(endpoint)?;
         Ok(Self {
-            endpoint: CdpEndpoint::parse(endpoint)?,
-            http: reqwest::Client::new(),
+            runtime: Arc::new(CdpRuntime::new(endpoint)),
         })
     }
 
-    pub async fn browser_version(&self) -> Result<BrowserVersion, BrowserToolError> {
-        self.get_json(self.endpoint.version_url()).await
-    }
-
-    pub async fn browser_websocket_url(&self) -> Result<String, BrowserToolError> {
-        let version = self.browser_version().await?;
-        let browser = version.browser.unwrap_or_default();
-        if !browser.contains("Chrome") && !browser.contains("Chromium") {
-            return Err(BrowserToolError::chrome_unavailable(format!(
-                "CDP endpoint `{}` did not report a Chrome-compatible browser",
-                self.endpoint.origin()
-            )));
-        }
-
-        version.web_socket_debugger_url.ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "CDP endpoint `{}` did not expose a browser websocket URL",
-                self.endpoint.origin()
-            ))
-        })
+    #[cfg(test)]
+    async fn disconnect_for_test(&self) {
+        self.runtime.disconnect().await;
     }
 
     pub async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
-        let targets: Vec<CdpTarget> = self.get_json(self.endpoint.targets_url()).await?;
-        Ok(targets
+        let connection = self.runtime.connection().await?;
+        let response = self
+            .runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(GetTargetsParams::default()),
+                "list Chrome targets",
+            )
+            .await?;
+
+        Ok(response
+            .result
+            .target_infos
             .into_iter()
-            .filter(|target| target.target_type == "page")
+            .filter(|target| target.r#type == "page")
+            .map(|target| CdpTarget {
+                id: target.target_id.as_ref().to_string(),
+                target_type: target.r#type,
+                title: target.title,
+                url: target.url,
+            })
             .collect())
     }
 
@@ -91,25 +124,27 @@ impl CdpClient {
         url: Option<&str>,
         focus: bool,
     ) -> Result<CdpTarget, BrowserToolError> {
-        let browser_ws = self.browser_websocket_url().await?;
-        let result = cdp_call(
-            &browser_ws,
-            "Target.createTarget",
-            json!({ "url": url.unwrap_or("about:blank") }),
-        )
-        .await?;
-        let target_id = result
-            .get("targetId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                BrowserToolError::chrome_unavailable("Chrome omitted targetId for new page")
-            })?;
+        let connection = self.runtime.connection().await?;
+        let params = CreateTargetParams::builder()
+            .url(url.unwrap_or("about:blank"))
+            .background(!focus)
+            .build()
+            .map_err(BrowserToolError::invalid_input)?;
+        let response = self
+            .runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(params),
+                "create Chrome target",
+            )
+            .await?;
+        let target_id = response.result.target_id.as_ref().to_string();
 
         if focus {
-            self.activate_target(target_id).await?;
+            self.activate_target(&target_id).await?;
         }
 
-        self.page_target(target_id).await
+        self.page_target(&target_id).await
     }
 
     pub async fn page_target(&self, target_id: &str) -> Result<CdpTarget, BrowserToolError> {
@@ -121,24 +156,30 @@ impl CdpClient {
     }
 
     pub async fn activate_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
-        let browser_ws = self.browser_websocket_url().await?;
-        cdp_call(
-            &browser_ws,
-            "Target.activateTarget",
-            json!({ "targetId": target_id }),
-        )
-        .await?;
+        let connection = self.runtime.connection().await?;
+        self.runtime
+            .browser_command(
+                &connection,
+                connection
+                    .browser
+                    .execute(ActivateTargetParams::new(TargetId::new(target_id))),
+                "activate Chrome target",
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
-        let browser_ws = self.browser_websocket_url().await?;
-        cdp_call(
-            &browser_ws,
-            "Target.closeTarget",
-            json!({ "targetId": target_id }),
-        )
-        .await?;
+        let connection = self.runtime.connection().await?;
+        self.runtime
+            .browser_command(
+                &connection,
+                connection
+                    .browser
+                    .execute(CloseTargetParams::new(TargetId::new(target_id))),
+                "close Chrome target",
+            )
+            .await?;
         Ok(())
     }
 
@@ -149,22 +190,23 @@ impl CdpClient {
         wait_until: Option<&str>,
         timeout_ms: u64,
     ) -> Result<(), BrowserToolError> {
-        let wait_until = wait_until.unwrap_or("load");
-        if wait_until != "load" {
+        if wait_until.unwrap_or("load") != "load" {
             return Err(BrowserToolError::invalid_input(
                 "navigate currently supports only wait_until `load`",
             ));
         }
 
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
-        let deadline = Duration::from_millis(timeout_ms);
-
-        cdp_page_navigate(ws_url, url, deadline).await
+        let (page, connection) = self.page(&target.id).await?;
+        match timeout(Duration::from_millis(timeout_ms), page.goto(url)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(self
+                .runtime
+                .page_error(&connection, "navigate", error)
+                .await),
+            Err(_) => Err(BrowserToolError::operation_timeout(format!(
+                "timed out waiting for load after navigating to `{url}`"
+            ))),
+        }
     }
 
     pub async fn screenshot(
@@ -172,14 +214,42 @@ impl CdpClient {
         target: &CdpTarget,
         full_page: bool,
     ) -> Result<String, BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
+        let (page, connection) = self.page(&target.id).await?;
+        let mut builder = CaptureScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .from_surface(true)
+            .capture_beyond_viewport(full_page);
 
-        cdp_page_screenshot(ws_url, full_page).await
+        if full_page {
+            let metrics = self
+                .runtime
+                .page_command(
+                    &connection,
+                    page.execute(GetLayoutMetricsParams::default()),
+                    "read page layout metrics",
+                )
+                .await?;
+            let size = metrics.result.css_content_size;
+            let clip = Viewport::builder()
+                .x(size.x)
+                .y(size.y)
+                .width(size.width.max(1.0))
+                .height(size.height.max(1.0))
+                .scale(1.0)
+                .build()
+                .map_err(BrowserToolError::invalid_input)?;
+            builder = builder.clip(clip);
+        }
+
+        let response = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(builder.build()),
+                "capture page screenshot",
+            )
+            .await?;
+        Ok(response.result.data.into())
     }
 
     pub async fn evaluate(
@@ -187,14 +257,42 @@ impl CdpClient {
         target: &CdpTarget,
         expression: &str,
     ) -> Result<EvaluateResult, BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
+        let (page, connection) = self.page(&target.id).await?;
+        let result = match page.evaluate_expression(expression).await {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self
+                    .runtime
+                    .page_error(&connection, "evaluate", error)
+                    .await);
+            }
+        };
+        let remote = result.object();
+        Ok(EvaluateResult {
+            value: remote.value.clone(),
+            preview: remote
+                .description
+                .clone()
+                .or_else(|| Some(remote.r#type.as_ref().to_string())),
+        })
+    }
 
-        cdp_runtime_evaluate(ws_url, expression).await
+    pub async fn has_focus(&self, target: &CdpTarget) -> Result<bool, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        match page
+            .evaluate_expression("document.hasFocus() && document.visibilityState === 'visible'")
+            .await
+        {
+            Ok(result) => result.into_value::<bool>().map_err(|error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid focus result: {error}"
+                ))
+            }),
+            Err(error) => Err(self
+                .runtime
+                .page_error(&connection, "check page focus", error)
+                .await),
+        }
     }
 
     pub async fn click(
@@ -203,25 +301,57 @@ impl CdpClient {
         selector: &str,
         timeout_ms: u64,
     ) -> Result<(), BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
+        let (page, connection) = self.page(&target.id).await?;
+        let point = self
+            .selector_point(
+                &page,
+                &connection,
+                selector,
+                Duration::from_millis(timeout_ms),
+            )
+            .await?;
 
-        cdp_click_selector(ws_url, selector, Duration::from_millis(timeout_ms)).await
+        for event in [
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::None)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+        ] {
+            let event = event.map_err(BrowserToolError::invalid_input)?;
+            self.runtime
+                .page_command(&connection, page.execute(event), "dispatch mouse input")
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub async fn type_text(&self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
-
-        cdp_insert_text(ws_url, text).await
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(InsertTextParams::new(text)),
+                "insert text",
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn press_key(
@@ -230,14 +360,16 @@ impl CdpClient {
         key: &str,
         modifiers: &[String],
     ) -> Result<(), BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
+        let key_event = key_event_for(key, modifiers)?;
+        let (page, connection) = self.page(&target.id).await?;
 
-        cdp_press_key(ws_url, key, modifiers).await
+        for event_type in [DispatchKeyEventType::KeyDown, DispatchKeyEventType::KeyUp] {
+            let params = key_event.params(event_type)?;
+            self.runtime
+                .page_command(&connection, page.execute(params), "dispatch keyboard input")
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn diagnostics_monitor(
@@ -245,34 +377,352 @@ impl CdpClient {
         target: &CdpTarget,
         sink: Arc<dyn Fn(CdpDiagnosticEvent) + Send + Sync>,
     ) -> Result<CdpDiagnosticsMonitor, BrowserToolError> {
-        let ws_url = target.web_socket_debugger_url.as_ref().ok_or_else(|| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome target `{}` does not expose a websocket URL",
-                target.id
-            ))
-        })?;
+        let (page, connection) = self.page(&target.id).await?;
 
-        start_diagnostics_monitor(ws_url, sink).await
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(RuntimeEnableParams::default()),
+                "enable runtime diagnostics",
+            )
+            .await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(LogEnableParams::default()),
+                "enable log diagnostics",
+            )
+            .await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(NetworkEnableParams::default()),
+                "enable network diagnostics",
+            )
+            .await?;
+
+        let mut console = self
+            .event_listener::<EventConsoleApiCalled>(&page, &connection)
+            .await?;
+        let mut log = self
+            .event_listener::<EventEntryAdded>(&page, &connection)
+            .await?;
+        let mut request = self
+            .event_listener::<EventRequestWillBeSent>(&page, &connection)
+            .await?;
+        let mut response = self
+            .event_listener::<EventResponseReceived>(&page, &connection)
+            .await?;
+        let mut failed = self
+            .event_listener::<EventLoadingFailed>(&page, &connection)
+            .await?;
+        let mut finished = self
+            .event_listener::<EventLoadingFinished>(&page, &connection)
+            .await?;
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    event = console.next() => typed_event("Runtime.consoleAPICalled", event),
+                    event = log.next() => typed_event("Log.entryAdded", event),
+                    event = request.next() => typed_event("Network.requestWillBeSent", event),
+                    event = response.next() => typed_event("Network.responseReceived", event),
+                    event = failed.next() => typed_event("Network.loadingFailed", event),
+                    event = finished.next() => typed_event("Network.loadingFinished", event),
+                };
+
+                match event {
+                    Some(event) => sink(event),
+                    None => break,
+                }
+            }
+        });
+
+        Ok(CdpDiagnosticsMonitor {
+            stop: Some(stop_tx),
+            task,
+        })
     }
 
-    async fn get_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        url: Url,
-    ) -> Result<T, BrowserToolError> {
-        let response = self.http.get(url.clone()).send().await.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("failed to reach `{url}`: {error}"))
-        })?;
+    async fn page(&self, target_id: &str) -> Result<(Page, RuntimeConnection), BrowserToolError> {
+        let connection = self.runtime.connection().await?;
+        let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
+        loop {
+            match connection.browser.get_page(TargetId::new(target_id)).await {
+                Ok(page) => return Ok((page, connection)),
+                Err(CdpError::NotFound) if Instant::now() < deadline => {
+                    sleep(PAGE_DISCOVERY_RETRY).await;
+                }
+                Err(CdpError::NotFound) => {
+                    return Err(BrowserToolError::target_missing_for_target(target_id));
+                }
+                Err(error) => {
+                    return Err(self
+                        .runtime
+                        .page_error(&connection, "open Chrome target session", error)
+                        .await);
+                }
+            }
+        }
+    }
 
-        if !response.status().is_success() {
-            return Err(BrowserToolError::chrome_unavailable(format!(
-                "`{url}` returned HTTP {}",
-                response.status()
-            )));
+    async fn event_listener<T>(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<chromiumoxide::listeners::EventStream<T>, BrowserToolError>
+    where
+        T: chromiumoxide::cdp::IntoEventKind + Unpin,
+    {
+        match page.event_listener::<T>().await {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                let operation = format!("subscribe to {}", std::any::type_name::<T>());
+                if invalidates_connection(&error) {
+                    self.runtime.invalidate(connection.generation).await;
+                }
+                Err(map_cdp_error(&operation, &error))
+            }
+        }
+    }
+
+    async fn selector_point(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        selector: &str,
+        deadline: Duration,
+    ) -> Result<ClickPoint, BrowserToolError> {
+        let selector_json = serde_json::to_string(selector).map_err(|error| {
+            BrowserToolError::invalid_input(format!("invalid selector: {error}"))
+        })?;
+        let expression = format!(
+            r#"(() => {{
+  const selector = {selector_json};
+  const element = document.querySelector(selector);
+  if (!element) return {{ found: false, visible: false }};
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") !== 0;
+  if (!visible) return {{ found: true, visible: false }};
+  return {{ found: true, visible: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
+}})()"#
+        );
+        let end = Instant::now() + deadline;
+
+        loop {
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(BrowserToolError::operation_timeout(format!(
+                    "timed out waiting for visible selector `{selector}`"
+                )));
+            }
+
+            let result = match timeout(remaining, page.evaluate_expression(&expression)).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    return Err(self
+                        .runtime
+                        .page_error(connection, "evaluate click selector", error)
+                        .await);
+                }
+                Err(_) => {
+                    return Err(BrowserToolError::operation_timeout(format!(
+                        "timed out waiting for visible selector `{selector}`"
+                    )));
+                }
+            };
+
+            if let Some(point) = click_point(result.value().cloned())? {
+                return Ok(point);
+            }
+            sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CdpRuntime {
+    endpoint: CdpEndpoint,
+    state: Mutex<RuntimeState>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeState {
+    connection: Option<ConnectedBrowser>,
+    generation: u64,
+}
+
+#[derive(Debug)]
+struct ConnectedBrowser {
+    generation: u64,
+    browser: Arc<Browser>,
+    handler: JoinHandle<Result<(), String>>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConnection {
+    generation: u64,
+    browser: Arc<Browser>,
+}
+
+impl CdpRuntime {
+    fn new(endpoint: CdpEndpoint) -> Self {
+        Self {
+            endpoint,
+            state: Mutex::new(RuntimeState::default()),
+        }
+    }
+
+    async fn connection(&self) -> Result<RuntimeConnection, BrowserToolError> {
+        let mut state = self.state.lock().await;
+        if let Some(connection) = &state.connection
+            && !connection.handler.is_finished()
+        {
+            return Ok(RuntimeConnection {
+                generation: connection.generation,
+                browser: connection.browser.clone(),
+            });
         }
 
-        response.json::<T>().await.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("`{url}` returned invalid JSON: {error}"))
+        if let Some(connection) = state.connection.take() {
+            connection.handler.abort();
+        }
+
+        let endpoint = self.endpoint.origin().as_str().to_string();
+        let (browser, mut handler) = Browser::connect_with_config(
+            endpoint.clone(),
+            HandlerConfig {
+                viewport: None,
+                ..HandlerConfig::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            BrowserToolError::chrome_unavailable(format!(
+                "failed to connect Chromiumoxide to `{endpoint}`: {error}"
+            ))
+        })?;
+        let browser = Arc::new(browser);
+        let handler_task = tokio::spawn(async move {
+            while let Some(result) = handler.next().await {
+                result.map_err(|error| error.to_string())?;
+            }
+            Err("Chromiumoxide handler ended".to_string())
+        });
+        state.generation += 1;
+        let generation = state.generation;
+        state.connection = Some(ConnectedBrowser {
+            generation,
+            browser: browser.clone(),
+            handler: handler_task,
+        });
+
+        Ok(RuntimeConnection {
+            generation,
+            browser,
         })
+    }
+
+    async fn browser_command<T, F>(
+        &self,
+        connection: &RuntimeConnection,
+        future: F,
+        operation: &str,
+    ) -> Result<T, BrowserToolError>
+    where
+        F: Future<Output = Result<T, CdpError>>,
+    {
+        match future.await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if invalidates_connection(&error) {
+                    self.invalidate(connection.generation).await;
+                }
+                Err(map_cdp_error(operation, &error))
+            }
+        }
+    }
+
+    async fn page_command<T, F>(
+        &self,
+        connection: &RuntimeConnection,
+        future: F,
+        operation: &str,
+    ) -> Result<T, BrowserToolError>
+    where
+        F: Future<Output = Result<T, CdpError>>,
+    {
+        self.browser_command(connection, future, operation).await
+    }
+
+    async fn page_error(
+        &self,
+        connection: &RuntimeConnection,
+        operation: &str,
+        error: CdpError,
+    ) -> BrowserToolError {
+        if invalidates_connection(&error) {
+            self.invalidate(connection.generation).await;
+        }
+        map_cdp_error(operation, &error)
+    }
+
+    async fn invalidate(&self, generation: u64) {
+        let mut state = self.state.lock().await;
+        if state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+            && let Some(connection) = state.connection.take()
+        {
+            connection.handler.abort();
+        }
+    }
+
+    #[cfg(test)]
+    async fn disconnect(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(connection) = state.connection.take() {
+            connection.handler.abort();
+        }
+    }
+}
+
+impl Drop for CdpRuntime {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.try_lock()
+            && let Some(connection) = state.connection.take()
+        {
+            connection.handler.abort();
+        }
+    }
+}
+
+fn invalidates_connection(error: &CdpError) -> bool {
+    matches!(
+        error,
+        CdpError::Ws(_)
+            | CdpError::Io(_)
+            | CdpError::NoResponse
+            | CdpError::ChannelSendError(_)
+            | CdpError::UnexpectedWsMessage(_)
+    )
+}
+
+fn map_cdp_error(operation: &str, error: &CdpError) -> BrowserToolError {
+    match error {
+        CdpError::JavascriptException(details) => {
+            BrowserToolError::invalid_input(format!("{operation} failed: {}", details.text))
+        }
+        CdpError::Timeout => BrowserToolError::operation_timeout(format!("{operation} timed out")),
+        CdpError::NotFound => BrowserToolError::chrome_unavailable(format!(
+            "{operation} failed because Chrome no longer exposes the target"
+        )),
+        _ => BrowserToolError::chrome_unavailable(format!("{operation} failed: {error}")),
     }
 }
 
@@ -288,6 +738,13 @@ pub enum CdpDiagnosticEvent {
 
 pub struct CdpDiagnosticsMonitor {
     stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl CdpDiagnosticsMonitor {
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 impl Drop for CdpDiagnosticsMonitor {
@@ -295,19 +752,8 @@ impl Drop for CdpDiagnosticsMonitor {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+        self.task.abort();
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserVersion {
-    #[serde(rename = "Browser")]
-    pub browser: Option<String>,
-
-    #[serde(rename = "Protocol-Version")]
-    pub protocol_version: Option<String>,
-
-    #[serde(rename = "webSocketDebuggerUrl")]
-    pub web_socket_debugger_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,278 +765,11 @@ pub struct CdpTarget {
 
     pub title: String,
     pub url: String,
-
-    #[serde(rename = "webSocketDebuggerUrl")]
-    pub web_socket_debugger_url: Option<String>,
 }
 
 impl From<&CdpTarget> for TabSnapshot {
     fn from(target: &CdpTarget) -> Self {
         TabSnapshot::new(&target.id, &target.title, &target.url, false)
-    }
-}
-
-async fn cdp_call(
-    websocket_url: &str,
-    method: &str,
-    params: Value,
-) -> Result<Value, BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, method, params).await?;
-
-    loop {
-        let message = socket.next().await.ok_or_else(|| {
-            BrowserToolError::chrome_unavailable("Chrome websocket closed before responding")
-        })?;
-        let message = message.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("Chrome websocket read failed: {error}"))
-        })?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome websocket returned invalid JSON: {error}"
-            ))
-        })?;
-
-        if value.get("id").and_then(Value::as_u64) == Some(1) {
-            return parse_cdp_response(value);
-        }
-    }
-}
-
-async fn cdp_page_navigate(
-    websocket_url: &str,
-    url: &str,
-    deadline: Duration,
-) -> Result<(), BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Page.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-    send_cdp_command(&mut socket, 2, "Page.navigate", json!({ "url": url })).await?;
-    wait_for_cdp_response(&mut socket, 2).await?;
-
-    let end = Instant::now() + deadline;
-    loop {
-        let remaining = end.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(BrowserToolError::operation_timeout(format!(
-                "timed out waiting for load after navigating to `{url}`"
-            )));
-        }
-
-        let message = timeout(remaining, socket.next()).await.map_err(|_| {
-            BrowserToolError::operation_timeout(format!(
-                "timed out waiting for load after navigating to `{url}`"
-            ))
-        })?;
-        let message = message.ok_or_else(|| {
-            BrowserToolError::chrome_unavailable("Chrome websocket closed before load event")
-        })?;
-        let message = message.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("Chrome websocket read failed: {error}"))
-        })?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome websocket returned invalid JSON: {error}"
-            ))
-        })?;
-
-        if value.get("method").and_then(Value::as_str) == Some("Page.loadEventFired") {
-            return Ok(());
-        }
-    }
-}
-
-async fn cdp_page_screenshot(
-    websocket_url: &str,
-    full_page: bool,
-) -> Result<String, BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Page.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-
-    let params = if full_page {
-        send_cdp_command(&mut socket, 2, "Page.getLayoutMetrics", json!({})).await?;
-        let metrics = wait_for_cdp_response(&mut socket, 2).await?;
-        let content_size = metrics.get("contentSize").ok_or_else(|| {
-            BrowserToolError::chrome_unavailable("Chrome omitted contentSize for full-page capture")
-        })?;
-        json!({
-            "format": "png",
-            "fromSurface": true,
-            "captureBeyondViewport": true,
-            "clip": {
-                "x": content_size.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-                "y": content_size.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-                "width": content_size.get("width").and_then(Value::as_f64).unwrap_or(1.0),
-                "height": content_size.get("height").and_then(Value::as_f64).unwrap_or(1.0),
-                "scale": 1
-            }
-        })
-    } else {
-        json!({
-            "format": "png",
-            "fromSurface": true
-        })
-    };
-
-    send_cdp_command(&mut socket, 3, "Page.captureScreenshot", params).await?;
-    let result = wait_for_cdp_response(&mut socket, 3).await?;
-    result
-        .get("data")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| BrowserToolError::chrome_unavailable("Chrome omitted screenshot data"))
-}
-
-async fn cdp_runtime_evaluate(
-    websocket_url: &str,
-    expression: &str,
-) -> Result<EvaluateResult, BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Runtime.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-    send_cdp_command(
-        &mut socket,
-        2,
-        "Runtime.evaluate",
-        json!({
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": true,
-            "userGesture": true
-        }),
-    )
-    .await?;
-    let result = wait_for_cdp_response(&mut socket, 2).await?;
-
-    parse_evaluate_result(result)
-}
-
-fn parse_evaluate_result(result: Value) -> Result<EvaluateResult, BrowserToolError> {
-    if let Some(exception) = result.get("exceptionDetails") {
-        return Err(BrowserToolError::invalid_input(format!(
-            "evaluation failed: {}",
-            exception_text(exception)
-        )));
-    }
-
-    let remote = result.get("result").ok_or_else(|| {
-        BrowserToolError::chrome_unavailable("Chrome omitted Runtime.evaluate result")
-    })?;
-    let value = remote.get("value").cloned();
-    let preview = remote
-        .get("description")
-        .and_then(Value::as_str)
-        .or_else(|| remote.get("type").and_then(Value::as_str))
-        .map(str::to_string);
-
-    Ok(EvaluateResult { value, preview })
-}
-
-fn exception_text(exception: &Value) -> String {
-    exception
-        .get("exception")
-        .and_then(|value| value.get("description").or_else(|| value.get("value")))
-        .and_then(Value::as_str)
-        .or_else(|| exception.get("text").and_then(Value::as_str))
-        .unwrap_or("JavaScript exception")
-        .to_string()
-}
-
-async fn cdp_click_selector(
-    websocket_url: &str,
-    selector: &str,
-    deadline: Duration,
-) -> Result<(), BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Runtime.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-
-    let end = Instant::now() + deadline;
-    let mut next_id = 2;
-    let selector_json = serde_json::to_string(selector)
-        .map_err(|error| BrowserToolError::invalid_input(format!("invalid selector: {error}")))?;
-    let expression = format!(
-        r#"
-(() => {{
-  const selector = {selector_json};
-  const element = document.querySelector(selector);
-  if (!element) return {{ found: false, visible: false }};
-  element.scrollIntoView({{ block: "center", inline: "center" }});
-  const rect = element.getBoundingClientRect();
-  const style = window.getComputedStyle(element);
-  const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") !== 0;
-  if (!visible) return {{ found: true, visible: false }};
-  return {{
-    found: true,
-    visible: true,
-    x: rect.left + rect.width / 2,
-    y: rect.top + rect.height / 2
-  }};
-}})()
-"#
-    );
-
-    loop {
-        let remaining = end.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(BrowserToolError::operation_timeout(format!(
-                "timed out waiting for visible selector `{selector}`"
-            )));
-        }
-
-        send_cdp_command(
-            &mut socket,
-            next_id,
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-                "userGesture": true
-            }),
-        )
-        .await?;
-        let response = wait_for_cdp_response(&mut socket, next_id).await?;
-        next_id += 1;
-
-        if let Some(point) = click_point(response)? {
-            send_mouse_click(&mut socket, next_id, point.x, point.y).await?;
-            return Ok(());
-        }
-
-        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
 }
 
@@ -600,18 +779,10 @@ struct ClickPoint {
     y: f64,
 }
 
-fn click_point(result: Value) -> Result<Option<ClickPoint>, BrowserToolError> {
-    if let Some(exception) = result.get("exceptionDetails") {
-        return Err(BrowserToolError::invalid_input(format!(
-            "selector evaluation failed: {}",
-            exception_text(exception)
-        )));
-    }
-
-    let Some(value) = result.get("result").and_then(|remote| remote.get("value")) else {
+fn click_point(value: Option<Value>) -> Result<Option<ClickPoint>, BrowserToolError> {
+    let Some(value) = value else {
         return Ok(None);
     };
-
     if !value.get("found").and_then(Value::as_bool).unwrap_or(false)
         || !value
             .get("visible")
@@ -629,106 +800,7 @@ fn click_point(result: Value) -> Result<Option<ClickPoint>, BrowserToolError> {
         .get("y")
         .and_then(Value::as_f64)
         .ok_or_else(|| BrowserToolError::chrome_unavailable("selector result omitted y"))?;
-
     Ok(Some(ClickPoint { x, y }))
-}
-
-async fn send_mouse_click<S>(
-    socket: &mut S,
-    start_id: u64,
-    x: f64,
-    y: f64,
-) -> Result<(), BrowserToolError>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
-        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-{
-    send_cdp_command(
-        socket,
-        start_id,
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseMoved",
-            "x": x,
-            "y": y,
-            "button": "none"
-        }),
-    )
-    .await?;
-    wait_for_cdp_response(socket, start_id).await?;
-    send_cdp_command(
-        socket,
-        start_id + 1,
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mousePressed",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1
-        }),
-    )
-    .await?;
-    wait_for_cdp_response(socket, start_id + 1).await?;
-    send_cdp_command(
-        socket,
-        start_id + 2,
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseReleased",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1
-        }),
-    )
-    .await?;
-    wait_for_cdp_response(socket, start_id + 2).await?;
-    Ok(())
-}
-
-async fn cdp_insert_text(websocket_url: &str, text: &str) -> Result<(), BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Input.insertText", json!({ "text": text })).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-    Ok(())
-}
-
-async fn cdp_press_key(
-    websocket_url: &str,
-    key: &str,
-    modifiers: &[String],
-) -> Result<(), BrowserToolError> {
-    let key_event = key_event_for(key, modifiers)?;
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(
-        &mut socket,
-        1,
-        "Input.dispatchKeyEvent",
-        key_event.params("keyDown"),
-    )
-    .await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-    send_cdp_command(
-        &mut socket,
-        2,
-        "Input.dispatchKeyEvent",
-        key_event.params("keyUp"),
-    )
-    .await?;
-    wait_for_cdp_response(&mut socket, 2).await?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,33 +813,30 @@ struct KeyEvent {
 }
 
 impl KeyEvent {
-    fn params(&self, event_type: &str) -> Value {
-        let mut params = json!({
-            "type": event_type,
-            "key": self.key,
-            "code": self.code,
-            "modifiers": self.modifiers
-        });
-
-        if event_type == "keyDown" {
-            if let Some(text) = &self.text {
-                params["text"] = Value::String(text.clone());
-                params["unmodifiedText"] = Value::String(text.clone());
-            }
+    fn params(
+        &self,
+        event_type: DispatchKeyEventType,
+    ) -> Result<DispatchKeyEventParams, BrowserToolError> {
+        let is_key_down = event_type == DispatchKeyEventType::KeyDown;
+        let mut builder = DispatchKeyEventParams::builder()
+            .r#type(event_type)
+            .key(&self.key)
+            .code(&self.code)
+            .modifiers(i64::from(self.modifiers));
+        if is_key_down && let Some(text) = &self.text {
+            builder = builder.text(text).unmodified_text(text);
         }
-
         if let Some(code) = self.windows_virtual_key_code {
-            params["windowsVirtualKeyCode"] = Value::from(code);
-            params["nativeVirtualKeyCode"] = Value::from(code);
+            builder = builder
+                .windows_virtual_key_code(i64::from(code))
+                .native_virtual_key_code(i64::from(code));
         }
-
-        params
+        builder.build().map_err(BrowserToolError::invalid_input)
     }
 }
 
 fn key_event_for(key: &str, modifiers: &[String]) -> Result<KeyEvent, BrowserToolError> {
     let modifiers = modifier_bits(modifiers)?;
-
     let named = match key {
         "Enter" => Some(("Enter", "Enter", 13)),
         "Tab" => Some(("Tab", "Tab", 9)),
@@ -790,11 +859,7 @@ fn key_event_for(key: &str, modifiers: &[String]) -> Result<KeyEvent, BrowserToo
         return Ok(KeyEvent {
             key: mapped_key.to_string(),
             code: code.to_string(),
-            text: if mapped_key == " " {
-                Some(" ".to_string())
-            } else {
-                None
-            },
+            text: (mapped_key == " ").then(|| " ".to_string()),
             modifiers,
             windows_virtual_key_code: Some(virtual_key),
         });
@@ -846,11 +911,9 @@ fn printable_code(ch: char) -> String {
     if ch.is_ascii_alphabetic() {
         return format!("Key{}", ch.to_ascii_uppercase());
     }
-
     if ch.is_ascii_digit() {
         return format!("Digit{ch}");
     }
-
     match ch {
         ' ' => "Space".to_string(),
         '-' => "Minus".to_string(),
@@ -868,52 +931,10 @@ fn printable_code(ch: char) -> String {
     }
 }
 
-async fn start_diagnostics_monitor(
-    websocket_url: &str,
-    sink: Arc<dyn Fn(CdpDiagnosticEvent) + Send + Sync>,
-) -> Result<CdpDiagnosticsMonitor, BrowserToolError> {
-    let (mut socket, _) = connect_async(websocket_url).await.map_err(|error| {
-        BrowserToolError::chrome_unavailable(format!(
-            "failed to connect to Chrome websocket `{websocket_url}`: {error}"
-        ))
-    })?;
-
-    send_cdp_command(&mut socket, 1, "Runtime.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 1).await?;
-    send_cdp_command(&mut socket, 2, "Log.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 2).await?;
-    send_cdp_command(&mut socket, 3, "Network.enable", json!({})).await?;
-    wait_for_cdp_response(&mut socket, 3).await?;
-
-    let (stop_tx, mut stop_rx) = oneshot::channel();
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => break,
-                message = socket.next() => {
-                    let Some(Ok(Message::Text(text))) = message else {
-                        if message.is_none() {
-                            break;
-                        }
-                        continue;
-                    };
-
-                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                        continue;
-                    };
-
-                    if let Some(event) = diagnostic_event(&value) {
-                        sink(event);
-                    }
-                }
-            }
-        }
-    });
-
-    Ok(CdpDiagnosticsMonitor {
-        stop: Some(stop_tx),
-    })
+fn typed_event<T: Serialize>(method: &str, event: Option<Arc<T>>) -> Option<CdpDiagnosticEvent> {
+    let event = event?;
+    let params = serde_json::to_value(&*event).ok()?;
+    diagnostic_event(&json!({ "method": method, "params": params }))
 }
 
 fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
@@ -945,8 +966,8 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
             method: None,
             status: value
                 .pointer("/params/response/status")
-                .and_then(Value::as_u64)
-                .and_then(|status| u16::try_from(status).ok()),
+                .and_then(Value::as_f64)
+                .and_then(|status| u16::try_from(status as u64).ok()),
             error_text: None,
             timestamp_ms: monotonic_timestamp_ms(value.pointer("/params/timestamp")),
         })),
@@ -992,7 +1013,6 @@ fn runtime_console_event(value: &Value) -> Option<CdpDiagnosticEvent> {
                 .join(" ")
         })
         .unwrap_or_default();
-
     Some(CdpDiagnosticEvent::Console {
         level,
         text,
@@ -1059,74 +1079,14 @@ fn wall_timestamp_ms(value: Option<&Value>) -> Option<u64> {
     })
 }
 
-async fn send_cdp_command<S>(
-    socket: &mut S,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> Result<(), BrowserToolError>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let request = json!({
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    socket
-        .send(Message::Text(request.to_string().into()))
-        .await
-        .map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("Chrome websocket write failed: {error}"))
-        })
-}
-
-async fn wait_for_cdp_response<S>(socket: &mut S, id: u64) -> Result<Value, BrowserToolError>
-where
-    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let message = socket.next().await.ok_or_else(|| {
-            BrowserToolError::chrome_unavailable("Chrome websocket closed before responding")
-        })?;
-        let message = message.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("Chrome websocket read failed: {error}"))
-        })?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!(
-                "Chrome websocket returned invalid JSON: {error}"
-            ))
-        })?;
-
-        if value.get("id").and_then(Value::as_u64) == Some(id) {
-            return parse_cdp_response(value);
-        }
-    }
-}
-
-fn parse_cdp_response(value: Value) -> Result<Value, BrowserToolError> {
-    if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Chrome returned a CDP error");
-        return Err(BrowserToolError::chrome_unavailable(message));
-    }
-
-    Ok(value.get("result").cloned().unwrap_or(Value::Null))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use visible_browser_lab_test_support::{BrowserMode, RealBrowser};
 
     #[test]
     fn builds_cdp_discovery_urls() {
         let endpoint = CdpEndpoint::parse("http://127.0.0.1:9222").unwrap();
-
         assert_eq!(
             endpoint.version_url().as_str(),
             "http://127.0.0.1:9222/json/version"
@@ -1144,11 +1104,8 @@ mod tests {
             target_type: "page".to_string(),
             title: "Example".to_string(),
             url: "https://example.com".to_string(),
-            web_socket_debugger_url: Some("ws://127.0.0.1/devtools/page/target-1".to_string()),
         };
-
         let snapshot = TabSnapshot::from(&target);
-
         assert_eq!(snapshot.target_id, "target-1");
         assert_eq!(snapshot.title, "Example");
         assert_eq!(snapshot.url, "https://example.com");
@@ -1173,19 +1130,14 @@ mod tests {
 
     #[test]
     fn parses_selector_click_point() {
-        let result = json!({
-            "result": {
-                "value": {
-                    "found": true,
-                    "visible": true,
-                    "x": 12.5,
-                    "y": 30.0
-                }
-            }
-        });
-
-        let point = click_point(result).unwrap().unwrap();
-
+        let point = click_point(Some(json!({
+            "found": true,
+            "visible": true,
+            "x": 12.5,
+            "y": 30.0
+        })))
+        .unwrap()
+        .unwrap();
         assert_eq!(point, ClickPoint { x: 12.5, y: 30.0 });
     }
 
@@ -1203,7 +1155,6 @@ mod tests {
             }
         }))
         .unwrap();
-
         assert_eq!(
             event,
             CdpDiagnosticEvent::Console {
@@ -1218,16 +1169,9 @@ mod tests {
     fn parses_log_entry_timestamp_as_milliseconds() {
         let event = diagnostic_event(&json!({
             "method": "Log.entryAdded",
-            "params": {
-                "entry": {
-                    "level": "warning",
-                    "text": "careful",
-                    "timestamp": 1234.5
-                }
-            }
+            "params": { "entry": { "level": "warning", "text": "careful", "timestamp": 1234.5 } }
         }))
         .unwrap();
-
         assert_eq!(
             event,
             CdpDiagnosticEvent::Console {
@@ -1244,14 +1188,10 @@ mod tests {
             "method": "Network.responseReceived",
             "params": {
                 "timestamp": 12.5,
-                "response": {
-                    "url": "https://example.com/data.json",
-                    "status": 201
-                }
+                "response": { "url": "https://example.com/data.json", "status": 201 }
             }
         }))
         .unwrap();
-
         assert_eq!(
             event,
             CdpDiagnosticEvent::Network(NetworkEvent {
@@ -1263,6 +1203,29 @@ mod tests {
                 error_text: None,
                 timestamp_ms: Some(12_500)
             })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnects_after_handler_shutdown_and_reports_browser_disappearance() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+
+        client.page_targets().await.unwrap();
+        client.disconnect_for_test().await;
+        client.page_targets().await.unwrap();
+
+        chrome.shutdown();
+        let error = timeout(Duration::from_secs(5), client.page_targets())
+            .await
+            .expect("Chrome disappearance should be observed without a request timeout")
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::leases::BrowserToolErrorCode::ChromeUnavailable
         );
     }
 }

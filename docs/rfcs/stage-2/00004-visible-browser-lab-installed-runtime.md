@@ -79,7 +79,7 @@ Chrome remains visible and available for user interaction. Session and tab creat
 
 Navigation, screenshots, evaluation, text insertion, console reads, and network reads operate on the owned target's CDP session without activating Chrome. `type_text` inserts text into the element that already owns DOM focus in that target.
 
-`click` and `press_key` dispatch native mouse and keyboard events only while the owned target has browser focus. After validating `agent_session_id` and `tab_id`, the broker evaluates `document.hasFocus()` in the target. When the result is false, the broker returns `focus_required` without dispatching input. The caller invokes `focus_tab` and retries the action. This explicit transition keeps trusted input attached to the tab the user can see as active.
+`click` and `press_key` dispatch native mouse and keyboard events only while the owned target is the visible, focused document. After validating `agent_session_id` and `tab_id`, the broker evaluates `document.hasFocus()` and requires `document.visibilityState === "visible"` in the target. When either condition is false, the broker returns `focus_required` without dispatching input. The caller invokes `focus_tab` and retries the action. This explicit transition keeps trusted input attached to the tab the user can see as active.
 
 The broker implements `click` through a CSS selector, a visible-element center point, and CDP mouse events. It implements `press_key` through CDP keyboard events. DOM-mediated click and keyboard fallbacks are not part of the tool contract.
 

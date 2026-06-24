@@ -11,8 +11,9 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use visible_browser_lab_test_support::{
-    EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser, cleanup_open_tabs,
-    close_target_via_cdp, data_url, field_str, run_live_smoke, stop_broker, tabs_include_id,
+    BROWSER_MODE_ENV, EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser,
+    cleanup_open_tabs, close_target_via_cdp, data_url, field_str, run_live_smoke, stop_broker,
+    tabs_include_id,
 };
 
 #[test]
@@ -26,6 +27,213 @@ fn deterministic_real_browser_facade() -> Result<()> {
     assert!(summary.tool_count >= EXPECTED_TOOLS.len());
     assert!(summary.screenshot_bytes > 1000);
     assert!(summary.global_groups > 0);
+    Ok(())
+}
+
+#[test]
+fn explicit_focus_contract() -> Result<()> {
+    let mut harness = BrowserMcpHarness::start("visible-browser-lab-focus-contract", true)?;
+    let url = harness.fixture.url("/page");
+    let session = harness.client_mut().call_tool(
+        "start_session",
+        json!({
+            "label": "focus-contract",
+            "start_url": url,
+            "focus": false
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = session.get("tab").context("start_session omitted tab")?;
+    let open_tab = OpenTab::from_summary(&session_id, tab)?;
+    let active = harness.client_mut().call_tool(
+        "new_tab",
+        json!({
+            "agent_session_id": session_id,
+            "url": "about:blank",
+            "focus": true
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let active_tab = OpenTab::from_summary(
+        &session_id,
+        active.get("tab").context("new_tab omitted tab")?,
+    )?;
+
+    let navigation_url = harness.fixture.url("/page?background-navigation=1");
+    harness.client_mut().call_tool(
+        "navigate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "url": navigation_url,
+            "wait_until": "load"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    let title = harness.client_mut().call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "expression": "document.title"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if title.get("value").and_then(Value::as_str) != Some("VBL Fixture") {
+        bail!("background evaluation returned an unexpected title: {title}");
+    }
+
+    harness.client_mut().call_tool(
+        "screenshot",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "full_page": false
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "expression": "document.querySelector('#entry').focus()"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "type_text",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "text": "background text"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "console_messages",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "network_events",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    let focus_state = harness.client_mut().call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "expression": "document.hasFocus() && document.visibilityState === 'visible'"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let browser_reports_focus = focus_state
+        .get("value")
+        .and_then(Value::as_bool)
+        .context("trusted-input focus probe did not return a boolean")?;
+    if env::var(BROWSER_MODE_ENV).as_deref() == Ok("visible") && browser_reports_focus {
+        bail!("visible Chrome reported trusted-input focus for the background test tab");
+    }
+
+    for (tool, params) in [
+        (
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "selector": "#clicker"
+            }),
+        ),
+        (
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "key": "Enter"
+            }),
+        ),
+    ] {
+        let result = harness.client_mut().call_tool(
+            tool,
+            params,
+            Duration::from_secs(20),
+            !browser_reports_focus,
+        )?;
+        if !browser_reports_focus {
+            assert_tool_error(&result, "focus_required")?;
+        }
+    }
+
+    if !browser_reports_focus {
+        harness.client_mut().call_tool(
+            "focus_tab",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        harness.client_mut().call_tool(
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "selector": "#clicker"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        harness.client_mut().call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "key": "Enter"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+    }
+    harness.client_mut().call_tool(
+        "close_tab",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "close_tab",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": active_tab.tab_id
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
     Ok(())
 }
 
