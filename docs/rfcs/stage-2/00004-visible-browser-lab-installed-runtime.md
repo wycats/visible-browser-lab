@@ -113,19 +113,19 @@ Codex applies the user's configured MCP approval policy when the facade invokes 
 6. confirms the managed browser used the isolated profile and state directory;
 7. terminates the broker and managed Chrome, then removes the disposable environment. `--keep-temp` retains the isolated files for inspection.
 
-`--invoke-codex --auth-source <path>` copies only `auth.json` from the selected Codex home into the disposable Codex home and runs an ephemeral model invocation with `--dangerously-bypass-approvals-and-sandbox`. The copied credential file is removed before retained diagnostics are exposed. The JSONL event stream must contain completed `start_session`, default `list_tabs`, `evaluate`, and `close_tab` calls through `visible-browser-lab` in that order. Command execution and calls to another MCP server fail the smoke. Package-root resolution, MCP startup, managed browser launch, and the deterministic facade lifecycle are validated without model participation.
+`--invoke-codex --auth-source <path>` copies only `auth.json` from the selected Codex home into the disposable Codex home and runs an ephemeral model invocation with `--dangerously-bypass-approvals-and-sandbox`. The copied credential file is removed before retained diagnostics are exposed. The JSONL event stream must contain completed `start_session`, default `list_tabs`, `evaluate`, and `close_tab` calls through `visible-browser-lab` in that order. Command execution and calls to another MCP server fail the smoke. The deterministic package check establishes package-root resolution, MCP startup, managed browser launch, and the facade lifecycle before the optional model invocation checks tool discovery and selection.
 
 The release dry run downloads a pinned standalone Codex package from the `openai/codex` GitHub release, verifies it against `codex-package_SHA256SUMS`, and runs the Linux package smoke under Xvfb. The smoke runs before release assets are uploaded or published.
 
-# Implementation Map
+# System Components
 
-1. Replace the broker's manual WebSocket transport with a broker-owned Chromiumoxide connection and handler for each CDP endpoint.
-2. Add cross-platform runtime directory resolution and the managed/external runtime mode.
-3. Add browser discovery, platform launch adapters, `DevToolsActivePort` readiness, reuse, and startup diagnostics.
-4. Make background target creation explicit, reserve target activation for explicit focus operations, and require browser focus for trusted mouse and keyboard dispatch.
-5. Generate host MCP configuration from the installed plugin root and align package versions with the release tag.
-6. Add the isolated installed-package smoke harness and CI coverage for package-root and managed-runtime behavior.
-7. Update the skill and release documentation with the zero-setup installed workflow, explicit focus transition, and external-endpoint override.
+1. The broker-owned Chromiumoxide runtime maintains one driven browser connection and handler for each CDP endpoint.
+2. Cross-platform runtime directory resolution provides broker IPC, logs, and the persistent managed Chrome profile.
+3. Browser discovery and platform launch adapters start Chrome in the background, discover `DevToolsActivePort`, retain startup diagnostics, and reuse a healthy managed instance.
+4. Background target creation and background-safe actions preserve application focus. Explicit focus operations activate the target, and native mouse and keyboard dispatch require a focused document.
+5. Generated host MCP configuration resolves the binary from the installed package root. Release metadata and binary version output use the release tag's semantic version.
+6. The isolated installed-package harness validates host installation, MCP discovery, managed browser lifecycle, owned-tab operations, optional model invocation, and cleanup.
+7. The packaged skill teaches the managed default, external endpoint overrides, session-scoped tab ownership, background-safe actions, and explicit focus transitions.
 
 # Drawbacks
 
@@ -160,4 +160,6 @@ A fixed debugging port simplifies startup but creates collisions between users, 
 - Runtime directories contain no developer-specific absolute paths.
 - Package manifests and binary version output match the release version.
 - The isolated Codex installation smoke test verifies installation, MCP discovery, managed Chrome startup, the tab lifecycle, and cleanup.
+- The packaged skill starts browser work through the facade and describes external CDP configuration as an explicit runtime selection.
+- The release dry run executes the installed Codex package smoke before uploading release assets.
 - Unit, fake-CDP, real-browser, package, macOS visible-mode, Windows compile, and release dry-run checks pass.
