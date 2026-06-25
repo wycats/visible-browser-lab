@@ -19,6 +19,7 @@ use crate::{
 
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(15);
 const CHROME_START_RETRY: Duration = Duration::from_millis(50);
+const CHROME_PROFILE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_PAGE: &str = "data:text/html,<title>Visible%20Browser%20Lab</title>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,13 @@ pub async fn ensure_managed_chrome(
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
     if let Some(endpoint) = healthy_active_endpoint(config).await {
+        return Ok(ManagedChrome {
+            cdp_endpoint: endpoint,
+            reused: true,
+            executable: config.chrome_path.clone().unwrap_or_default(),
+        });
+    }
+    if let Some(endpoint) = wait_for_profile_release(config).await? {
         return Ok(ManagedChrome {
             cdp_endpoint: endpoint,
             reused: true,
@@ -153,6 +161,40 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
         .ok()?;
     let endpoint = parse_active_port(&active_port).ok()?;
     validate_endpoint(&endpoint).await.then_some(endpoint)
+}
+
+async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<Option<String>> {
+    let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+    if !path_entry_exists(&profile_lock).await? {
+        return Ok(None);
+    }
+
+    let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
+    loop {
+        if let Some(endpoint) = healthy_active_endpoint(config).await {
+            return Ok(Some(endpoint));
+        }
+        if !path_entry_exists(&profile_lock).await? {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                path = %profile_lock.display(),
+                "managed Chrome profile remained locked after its CDP endpoint stopped responding"
+            );
+            return Ok(None);
+        }
+        sleep(CHROME_START_RETRY).await;
+    }
+}
+
+async fn path_entry_exists(path: &Path) -> Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Chrome profile lock `{}`", path.display())),
+    }
 }
 
 fn parse_active_port(contents: &str) -> Result<String> {
@@ -474,8 +516,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(args.contains(&"--remote-debugging-port=0".into()));
-        assert!(args.contains(&"--user-data-dir=/tmp/vbl/chrome-profile".into()));
+        assert!(
+            args.contains(
+                &format!("--user-data-dir={}", config.chrome_profile_dir.display()).into()
+            )
+        );
         assert!(!args.contains(&"--headless=new".into()));
+    }
+
+    #[tokio::test]
+    async fn waits_for_chrome_profile_lock_release_before_launch() {
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        tokio::fs::write(&profile_lock, b"active").await.unwrap();
+
+        let lock_to_release = profile_lock.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            tokio::fs::remove_file(lock_to_release).await.unwrap();
+        });
+
+        assert_eq!(wait_for_profile_release(&config).await.unwrap(), None);
+        assert!(!path_entry_exists(&profile_lock).await.unwrap());
     }
 
     #[test]
