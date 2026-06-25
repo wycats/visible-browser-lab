@@ -11,8 +11,6 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking"] 
 semver = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
+tempfile = "3.23"
 visible-browser-lab-test-support = { path = "../test-support" }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-tempfile = "3.23"

@@ -14,7 +14,8 @@ use chromiumoxide::{
                 EventRequestWillBeSent, EventResponseReceived,
             },
             page::{
-                CaptureScreenshotFormat, CaptureScreenshotParams, GetLayoutMetricsParams, Viewport,
+                CaptureScreenshotFormat, CaptureScreenshotParams, EnableParams as PageEnableParams,
+                GetLayoutMetricsParams, Viewport,
             },
             target::{
                 ActivateTargetParams, CloseTargetParams, CreateTargetParams, GetTargetsParams,
@@ -219,9 +220,15 @@ impl CdpClient {
         full_page: bool,
     ) -> Result<String, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(PageEnableParams::default()),
+                "enable page for screenshot",
+            )
+            .await?;
         let mut builder = CaptureScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
-            .from_surface(true)
             .capture_beyond_viewport(full_page);
 
         if full_page {

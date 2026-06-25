@@ -14,6 +14,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrome_for_testing_manager::{ChromeBinary, ChromeForTestingManager, VersionRequest};
+use chromiumoxide::Browser;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -66,6 +68,9 @@ impl RealBrowser {
             .arg(format!("--user-data-dir={}", profile_dir.path().display()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
+            .arg("--disable-component-update")
+            .arg("--disable-sync")
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -167,16 +172,21 @@ fn wait_for_devtools_endpoint(profile_dir: &Path) -> Result<String> {
     while Instant::now() < deadline {
         match fs::read_to_string(&active_port) {
             Ok(contents) => {
-                let port = contents
+                let parsed = contents
                     .lines()
                     .next()
-                    .context("DevToolsActivePort did not contain a port")?
-                    .trim()
-                    .parse::<u16>()
-                    .context("DevToolsActivePort contained an invalid port")?;
-                return Ok(format!("http://127.0.0.1:{port}"));
+                    .context("DevToolsActivePort did not contain a port")
+                    .and_then(|port| {
+                        port.trim()
+                            .parse::<u16>()
+                            .context("DevToolsActivePort contained an invalid port")
+                    });
+                match parsed {
+                    Ok(port) => return Ok(format!("http://127.0.0.1:{port}")),
+                    Err(error) => last_error = Some(error),
+                }
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => last_error = Some(error.into()),
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -211,7 +221,7 @@ pub fn run_live_smoke(
     let tools = client.request("tools/list", json!({}), Duration::from_secs(20))?;
     let tool_names = advertised_tool_names(&tools)?;
     for expected in EXPECTED_TOOLS {
-        if !tool_names.contains(&expected) {
+        if !tool_names.contains(expected) {
             bail!("MCP tool `{expected}` was not advertised; got {tool_names:?}");
         }
     }
@@ -945,6 +955,20 @@ impl McpClient {
         Self::spawn_command(command, binary)
     }
 
+    pub fn spawn_managed_from_environment(
+        binary: &Path,
+        state_dir: &Path,
+        root: &Path,
+        chrome_path: &Path,
+    ) -> Result<Self> {
+        let mut command = Command::new(binary);
+        command
+            .current_dir(root)
+            .env("VISIBLE_BROWSER_LAB_STATE_DIR", state_dir)
+            .env("VISIBLE_BROWSER_LAB_CHROME_PATH", chrome_path);
+        Self::spawn_command(command, binary)
+    }
+
     fn spawn_command(mut command: Command, binary: &Path) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -1054,14 +1078,16 @@ impl McpClient {
         timeout: Duration,
         expect_error: bool,
     ) -> Result<Value> {
-        let result = self.request(
-            "tools/call",
-            json!({
-                "name": name,
-                "arguments": arguments
-            }),
-            timeout,
-        )?;
+        let result = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments
+                }),
+                timeout,
+            )
+            .with_context(|| format!("tool `{name}` request failed"))?;
         let is_error = result
             .get("isError")
             .and_then(Value::as_bool)
@@ -1141,9 +1167,13 @@ where
 }
 
 pub fn stop_broker(state_dir: &Path) {
-    let pid = fs::read_to_string(state_dir.join("broker.pid"))
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok());
+    let pid = ["broker-v2.pid", "broker.pid"]
+        .into_iter()
+        .find_map(|name| {
+            fs::read_to_string(state_dir.join(name))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        });
     let Some(pid) = pid else {
         return;
     };
@@ -1155,6 +1185,62 @@ pub fn stop_broker(state_dir: &Path) {
     } else {
         let _ = Command::new("kill").arg(pid.to_string()).output();
     }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let alive = if cfg!(windows) {
+            Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}")])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+                })
+        } else {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !alive {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub fn close_browser_via_cdp(endpoint: &str) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create browser cleanup runtime")?;
+    runtime.block_on(async {
+        let (mut browser, mut handler) = Browser::connect(endpoint)
+            .await
+            .with_context(|| format!("failed to connect to managed Chrome at `{endpoint}`"))?;
+        let handler_task = tokio::spawn(async move {
+            while let Some(result) = handler.next().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        browser
+            .close()
+            .await
+            .context("failed to close managed Chrome")?;
+        let _ = tokio::time::timeout(Duration::from_secs(5), handler_task).await;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let version_url = format!("{}/json/version", endpoint.trim_end_matches('/'));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if reqwest::blocking::get(&version_url).is_err() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("managed Chrome endpoint `{endpoint}` remained reachable after Browser.close")
 }
 
 pub fn close_target_via_cdp(cdp_endpoint: &str, target_id: &str) -> Result<()> {
