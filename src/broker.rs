@@ -28,14 +28,19 @@ use crate::{
     managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
-        ClaimTabParams, ClickParams, ClickResult, CloseTabResult, ConsoleMessage,
-        ConsoleMessagesResult, DiagnosticsParams, EvaluateParams, EvaluateResult, ListTabsParams,
-        ListTabsResult, ListTabsScope, NavigateParams, NetworkEvent, NetworkEventsResult,
-        NewTabParams, PressKeyParams, PressKeyResult, ReleaseTabResult, ScreenshotParams,
-        ScreenshotResult, StartSessionParams, StartSessionResult, TabActionParams, TabResult,
-        TypeTextParams, TypeTextResult,
+        ClaimTabParams, ClickParams, CloseTabResult, ConsoleMessage, ConsoleMessagesResult,
+        DiagnosticsParams, ElementTarget, EvaluateParams, EvaluateResult, FillParams,
+        ListTabsParams, ListTabsResult, ListTabsScope, NavigateParams, NetworkEvent,
+        NetworkEventsResult, NewTabParams, Observation, ObservationMode, PageActionResult,
+        PressKeyParams, PressKeyResult, ReleaseTabResult, ScreenshotParams, ScreenshotResult,
+        SnapshotMode, SnapshotParams, SnapshotResult, StartSessionParams, StartSessionResult,
+        TabActionParams, TabResult, TypeTextParams, TypeTextResult,
     },
+    semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
+
+#[cfg(test)]
+use crate::semantic::{RawAxFrame, RawAxNode};
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
@@ -47,6 +52,7 @@ const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
 struct BrokerState {
     registry: Arc<Mutex<LeaseRegistry>>,
     diagnostics: Arc<Mutex<DiagnosticsRegistry>>,
+    references: Arc<Mutex<ElementReferenceRegistry>>,
     focused_target_id: Arc<Mutex<Option<String>>>,
     browser: BrowserBackend,
 }
@@ -56,6 +62,7 @@ impl BrokerState {
         Ok(Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
             diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
+            references: Arc::new(Mutex::new(ElementReferenceRegistry::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             browser: BrowserBackend::new(config)?,
         })
@@ -66,6 +73,7 @@ impl BrokerState {
         Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
             diagnostics: Arc::new(Mutex::new(DiagnosticsRegistry::new())),
+            references: Arc::new(Mutex::new(ElementReferenceRegistry::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             browser,
         }
@@ -77,6 +85,10 @@ impl BrokerState {
 
     fn diagnostics(&self) -> &Mutex<DiagnosticsRegistry> {
         &self.diagnostics
+    }
+
+    fn references(&self) -> &Mutex<ElementReferenceRegistry> {
+        &self.references
     }
 
     fn mark_focused_target(&self, target_id: &str) {
@@ -234,6 +246,8 @@ struct FakeBrowser {
     focused_target_id: Option<String>,
     closed_targets: Vec<String>,
     clicked_selectors: Vec<String>,
+    clicked_backend_nodes: Vec<i64>,
+    filled_backend_nodes: Vec<(i64, String)>,
     typed_text: Vec<String>,
     pressed_keys: Vec<String>,
 }
@@ -247,6 +261,8 @@ impl FakeBrowser {
             focused_target_id: None,
             closed_targets: Vec::new(),
             clicked_selectors: Vec::new(),
+            clicked_backend_nodes: Vec::new(),
+            filled_backend_nodes: Vec::new(),
             typed_text: Vec::new(),
             pressed_keys: Vec::new(),
         }
@@ -366,6 +382,127 @@ impl FakeBrowser {
         Ok(())
     }
 
+    fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
+        self.targets
+            .iter()
+            .find(|candidate| candidate.id == target.id)
+            .map(|target| format!("loader:{}", target.url))
+            .ok_or_else(|| BrowserToolError::target_missing_for_target(&target.id))
+    }
+
+    fn accessibility_snapshot(
+        &self,
+        target: &CdpTarget,
+    ) -> Result<RawAxSnapshot, BrowserToolError> {
+        let target = self
+            .targets
+            .iter()
+            .find(|candidate| candidate.id == target.id)
+            .ok_or_else(|| BrowserToolError::target_missing_for_target(&target.id))?;
+        Ok(RawAxSnapshot {
+            title: target.title.clone(),
+            url: target.url.clone(),
+            frames: vec![RawAxFrame {
+                frame_id: "frame-main".to_string(),
+                parent_frame_id: None,
+                loader_id: format!("loader:{}", target.url),
+                url: target.url.clone(),
+                nodes: vec![
+                    RawAxNode {
+                        node_id: "root".to_string(),
+                        parent_id: None,
+                        child_ids: vec!["submit".to_string(), "email".to_string()],
+                        backend_node_id: Some(1),
+                        frame_id: "frame-main".to_string(),
+                        role: "WebArea".to_string(),
+                        name: target.title.clone(),
+                        value: None,
+                        properties: Vec::new(),
+                        ignored: false,
+                    },
+                    RawAxNode {
+                        node_id: "submit".to_string(),
+                        parent_id: Some("root".to_string()),
+                        child_ids: Vec::new(),
+                        backend_node_id: Some(2),
+                        frame_id: "frame-main".to_string(),
+                        role: "button".to_string(),
+                        name: "Submit".to_string(),
+                        value: None,
+                        properties: Vec::new(),
+                        ignored: false,
+                    },
+                    RawAxNode {
+                        node_id: "email".to_string(),
+                        parent_id: Some("root".to_string()),
+                        child_ids: Vec::new(),
+                        backend_node_id: Some(3),
+                        frame_id: "frame-main".to_string(),
+                        role: "textbox".to_string(),
+                        name: "Email".to_string(),
+                        value: None,
+                        properties: Vec::new(),
+                        ignored: false,
+                    },
+                ],
+            }],
+        })
+    }
+
+    fn click_backend_node(
+        &mut self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+        self.clicked_backend_nodes.push(backend_node_id);
+        Ok(())
+    }
+
+    fn fill_backend_node(
+        &mut self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+        self.filled_backend_nodes
+            .push((backend_node_id, value.to_string()));
+        Ok(())
+    }
+
+    fn fill_css(
+        &mut self,
+        target: &CdpTarget,
+        selector: &str,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        if !self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        }
+        if selector == "#missing" {
+            return Err(BrowserToolError::element_not_found(selector));
+        }
+        self.filled_backend_nodes.push((0, value.to_string()));
+        Ok(())
+    }
+
     fn type_text(&mut self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
         if !self
             .targets
@@ -403,12 +540,6 @@ impl FakeBrowser {
 
     fn was_closed(&self, target_id: &str) -> bool {
         self.closed_targets.iter().any(|closed| closed == target_id)
-    }
-
-    fn was_clicked(&self, selector: &str) -> bool {
-        self.clicked_selectors
-            .iter()
-            .any(|clicked| clicked == selector)
     }
 
     fn typed_text(&self) -> &[String] {
@@ -601,6 +732,31 @@ impl BrowserBackend {
         }
     }
 
+    async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().document_revision(target),
+            _ => self.cdp_client().await?.document_revision(target).await,
+        }
+    }
+
+    async fn accessibility_snapshot(
+        &self,
+        target: &CdpTarget,
+        depth: usize,
+    ) -> Result<RawAxSnapshot, BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().accessibility_snapshot(target),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .accessibility_snapshot(target, depth)
+                    .await
+            }
+        }
+    }
+
     async fn click(
         &self,
         target: &CdpTarget,
@@ -614,6 +770,67 @@ impl BrowserBackend {
                 self.cdp_client()
                     .await?
                     .click(target, selector, timeout_ms)
+                    .await
+            }
+        }
+    }
+
+    async fn click_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser
+                .lock()
+                .unwrap()
+                .click_backend_node(target, backend_node_id),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .click_backend_node(target, backend_node_id)
+                    .await
+            }
+        }
+    }
+
+    async fn fill_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => {
+                browser
+                    .lock()
+                    .unwrap()
+                    .fill_backend_node(target, backend_node_id, value)
+            }
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .fill_backend_node(target, backend_node_id, value)
+                    .await
+            }
+        }
+    }
+
+    async fn fill_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().fill_css(target, selector, value),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .fill_css(target, selector, value)
                     .await
             }
         }
@@ -943,9 +1160,17 @@ async fn dispatch_request(
             request.id,
             broker_evaluate(state, parse_params(request.params)).await,
         ),
+        "snapshot" => broker_response(
+            request.id,
+            broker_snapshot(state, parse_params(request.params)).await,
+        ),
         "click" => broker_response(
             request.id,
             broker_click(state, parse_params(request.params)).await,
+        ),
+        "fill" => broker_response(
+            request.id,
+            broker_fill(state, parse_params(request.params)).await,
         ),
         "type_text" => broker_response(
             request.id,
@@ -1084,6 +1309,7 @@ async fn broker_claim_tab(
         params.user_instruction.as_deref(),
     )?;
     state.diagnostics().lock().unwrap().reset_target(&target.id);
+    state.references().lock().unwrap().reset_target(&target.id);
     ensure_diagnostics_monitor(state, &target).await?;
 
     Ok(TabResult { tab })
@@ -1104,6 +1330,7 @@ async fn broker_release_tab(
         .lock()
         .unwrap()
         .reset_target(&lease.target_id);
+    state.references().lock().unwrap().reset_tab(&params.tab_id);
     Ok(ReleaseTabResult { released: true })
 }
 
@@ -1143,6 +1370,7 @@ async fn broker_navigate(
             params.timeout_ms.unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS),
         )
         .await?;
+    state.references().lock().unwrap().reset_tab(&params.tab_id);
     let focused = state.is_focused_target(&target.id);
     let lease = state.registry().lock().unwrap().update_tab_snapshot(
         &params.tab_id,
@@ -1179,25 +1407,214 @@ async fn broker_evaluate(
     state.browser.evaluate(&target, &params.expression).await
 }
 
+async fn broker_snapshot(
+    state: &BrokerState,
+    params: Result<SnapshotParams, BrowserToolError>,
+) -> Result<SnapshotResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    snapshot_for_target(
+        state,
+        &params.agent_session_id,
+        &params.tab_id,
+        &target,
+        params.mode.unwrap_or_default(),
+        params.depth.unwrap_or(8).clamp(1, 64),
+        params.max_nodes.unwrap_or(500).clamp(1, 5_000),
+    )
+    .await
+    .map(|(snapshot, _)| snapshot)
+}
+
 async fn broker_click(
     state: &BrokerState,
     params: Result<ClickParams, BrowserToolError>,
-) -> Result<ClickResult, BrowserToolError> {
+) -> Result<PageActionResult, BrowserToolError> {
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
     if !state.browser.has_focus(&target).await? {
         return Err(BrowserToolError::focus_required(&params.tab_id));
     }
-    state
-        .browser
-        .click(
-            &target,
-            &params.selector,
-            params.timeout_ms.unwrap_or(DEFAULT_CLICK_TIMEOUT_MS),
-        )
-        .await?;
-    Ok(ClickResult { clicked: true })
+    match resolve_element_target(
+        state,
+        &params.agent_session_id,
+        &params.tab_id,
+        &target,
+        &params.target,
+    )
+    .await?
+    {
+        ResolvedElementTarget::Reference(element) => {
+            state
+                .browser
+                .click_backend_node(&target, element.backend_node_id)
+                .await?;
+        }
+        ResolvedElementTarget::Css(selector) => {
+            state
+                .browser
+                .click(
+                    &target,
+                    &selector,
+                    params.timeout_ms.unwrap_or(DEFAULT_CLICK_TIMEOUT_MS),
+                )
+                .await?;
+        }
+    }
+    post_action_observation(
+        state,
+        &params.agent_session_id,
+        &params.tab_id,
+        &target,
+        params.observe.unwrap_or_default(),
+    )
+    .await
+}
+
+async fn broker_fill(
+    state: &BrokerState,
+    params: Result<FillParams, BrowserToolError>,
+) -> Result<PageActionResult, BrowserToolError> {
+    let params = params?;
+    let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    match resolve_element_target(
+        state,
+        &params.agent_session_id,
+        &params.tab_id,
+        &target,
+        &params.target,
+    )
+    .await?
+    {
+        ResolvedElementTarget::Reference(element) => {
+            state
+                .browser
+                .fill_backend_node(&target, element.backend_node_id, &params.value)
+                .await?;
+        }
+        ResolvedElementTarget::Css(selector) => {
+            state
+                .browser
+                .fill_css(&target, &selector, &params.value)
+                .await?;
+        }
+    }
+    post_action_observation(
+        state,
+        &params.agent_session_id,
+        &params.tab_id,
+        &target,
+        params.observe.unwrap_or_default(),
+    )
+    .await
+}
+
+enum ResolvedElementTarget {
+    Reference(ElementReference),
+    Css(String),
+}
+
+async fn resolve_element_target(
+    state: &BrokerState,
+    agent_session_id: &AgentSessionId,
+    tab_id: &TabId,
+    target: &CdpTarget,
+    element_target: &ElementTarget,
+) -> Result<ResolvedElementTarget, BrowserToolError> {
+    match element_target {
+        ElementTarget::Reference { reference } => {
+            let document_revision = state.browser.document_revision(target).await?;
+            let element = state.references().lock().unwrap().resolve(
+                agent_session_id,
+                tab_id,
+                reference,
+                &document_revision,
+            )?;
+            if element.target_id != target.id {
+                return Err(BrowserToolError::element_stale(reference));
+            }
+            Ok(ResolvedElementTarget::Reference(element))
+        }
+        ElementTarget::Css { css, frame_ref } => {
+            if frame_ref.is_some() {
+                return Err(BrowserToolError::invalid_input(
+                    "frame_ref CSS fallback is not available in the semantic prototype",
+                ));
+            }
+            Ok(ResolvedElementTarget::Css(css.clone()))
+        }
+    }
+}
+
+async fn snapshot_for_target(
+    state: &BrokerState,
+    agent_session_id: &AgentSessionId,
+    tab_id: &TabId,
+    target: &CdpTarget,
+    mode: SnapshotMode,
+    depth: usize,
+    max_nodes: usize,
+) -> Result<(SnapshotResult, crate::protocol::SnapshotDiff), BrowserToolError> {
+    let raw = state.browser.accessibility_snapshot(target, depth).await?;
+    state.references().lock().unwrap().build_snapshot(
+        SnapshotBuildContext {
+            agent_session_id,
+            tab_id,
+            target_id: &target.id,
+            mode,
+            depth,
+            max_nodes,
+        },
+        raw,
+    )
+}
+
+async fn post_action_observation(
+    state: &BrokerState,
+    agent_session_id: &AgentSessionId,
+    tab_id: &TabId,
+    target: &CdpTarget,
+    mode: ObservationMode,
+) -> Result<PageActionResult, BrowserToolError> {
+    match mode {
+        ObservationMode::None => Ok(PageActionResult {
+            document_revision: state.browser.document_revision(target).await?,
+            observation: Observation::None,
+        }),
+        ObservationMode::Diff => {
+            let (snapshot, diff) = snapshot_for_target(
+                state,
+                agent_session_id,
+                tab_id,
+                target,
+                SnapshotMode::Meaningful,
+                8,
+                500,
+            )
+            .await?;
+            Ok(PageActionResult {
+                document_revision: snapshot.document_revision,
+                observation: Observation::Diff { diff },
+            })
+        }
+        ObservationMode::Snapshot => {
+            let (snapshot, _) = snapshot_for_target(
+                state,
+                agent_session_id,
+                tab_id,
+                target,
+                SnapshotMode::Meaningful,
+                8,
+                500,
+            )
+            .await?;
+            Ok(PageActionResult {
+                document_revision: snapshot.document_revision.clone(),
+                observation: Observation::Snapshot { snapshot },
+            })
+        }
+    }
 }
 
 async fn broker_type_text(
@@ -1288,6 +1705,7 @@ async fn broker_close_tab(
         .lock()
         .unwrap()
         .reset_target(&closed.target_id);
+    state.references().lock().unwrap().reset_tab(&params.tab_id);
 
     Ok(CloseTabResult { closed: true })
 }
@@ -1378,6 +1796,7 @@ fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
         for lease in missing {
             state.clear_focused_target(&lease.target_id);
             diagnostics.reset_target(&lease.target_id);
+            state.references().lock().unwrap().reset_tab(&lease.tab_id);
         }
     }
 }
@@ -2032,13 +2451,47 @@ mod tests {
         .unwrap();
         assert_eq!(evaluated.value, Some(json!(2)));
 
+        let snapshot = broker_snapshot(
+            &state,
+            Ok(SnapshotParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                mode: Some(SnapshotMode::Meaningful),
+                depth: None,
+                max_nodes: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.tree.contains("button \"Submit\" [ref=e_2]"));
+        assert!(snapshot.tree.contains("textbox \"Email\" [ref=e_3]"));
+
+        broker_fill(
+            &state,
+            Ok(FillParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                target: ElementTarget::Reference {
+                    reference: "e_3".to_string(),
+                },
+                value: "person@example.test".to_string(),
+                timeout_ms: None,
+                observe: Some(ObservationMode::None),
+            }),
+        )
+        .await
+        .unwrap();
+
         let click_error = broker_click(
             &state,
             Ok(ClickParams {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
-                selector: "#submit".to_string(),
+                target: ElementTarget::Reference {
+                    reference: "e_2".to_string(),
+                },
                 timeout_ms: None,
+                observe: Some(ObservationMode::None),
             }),
         )
         .await
@@ -2089,13 +2542,16 @@ mod tests {
             Ok(ClickParams {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
-                selector: "#submit".to_string(),
+                target: ElementTarget::Reference {
+                    reference: "e_2".to_string(),
+                },
                 timeout_ms: None,
+                observe: Some(ObservationMode::None),
             }),
         )
         .await
         .unwrap();
-        assert!(clicked.clicked);
+        assert!(matches!(clicked.observation, Observation::None));
         broker_press_key(
             &state,
             Ok(PressKeyParams {
@@ -2110,7 +2566,11 @@ mod tests {
 
         {
             let fake = fake.lock().unwrap();
-            assert!(fake.was_clicked("#submit"));
+            assert_eq!(fake.clicked_backend_nodes, vec![2]);
+            assert_eq!(
+                fake.filled_backend_nodes,
+                vec![(3, "person@example.test".to_string())]
+            );
             assert_eq!(fake.typed_text(), &["hello".to_string()]);
             assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
         }

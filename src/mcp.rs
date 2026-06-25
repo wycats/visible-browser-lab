@@ -19,9 +19,9 @@ use crate::{
     config::RuntimeConfig,
     leases::BrowserToolError,
     protocol::{
-        BrokerResponse, ClaimTabParams, ClickParams, DiagnosticsParams, EvaluateParams,
+        BrokerResponse, ClaimTabParams, ClickParams, DiagnosticsParams, EvaluateParams, FillParams,
         ListTabsParams, NavigateParams, NewTabParams, PressKeyParams, ScreenshotParams,
-        StartSessionParams, TabActionParams, TypeTextParams,
+        SnapshotParams, StartSessionParams, TabActionParams, TypeTextParams,
     },
 };
 
@@ -166,11 +166,27 @@ impl VisibleBrowserLab {
     }
 
     #[tool(
+        name = "snapshot",
+        description = "Inspect user-perceivable page structure and obtain lease-scoped element references."
+    )]
+    async fn snapshot(&self, params: Parameters<SnapshotParams>) -> CallToolResult {
+        self.call_broker("snapshot", params.0).await
+    }
+
+    #[tool(
         name = "click",
-        description = "Click the first visible main-frame element matching a CSS selector in an owned tab."
+        description = "Click one referenced element, or an explicit CSS fallback, after ownership and actionability checks."
     )]
     async fn click(&self, params: Parameters<ClickParams>) -> CallToolResult {
         self.call_broker("click", params.0).await
+    }
+
+    #[tool(
+        name = "fill",
+        description = "Replace the value of one referenced editable control without activating Chrome."
+    )]
+    async fn fill(&self, params: Parameters<FillParams>) -> CallToolResult {
+        self.call_broker("fill", params.0).await
     }
 
     #[tool(
@@ -223,7 +239,7 @@ impl ServerHandler for VisibleBrowserLab {
             JsonObject::new(),
         )]));
         ServerInfo::new(capabilities)
-            .with_instructions("Use start_session first. Reuse the returned agent_session_id and act only through owned tab_id values.")
+            .with_instructions("Use start_session first and retain its agent_session_id. Act only through tab_id values owned by that session. Inspect unfamiliar pages with snapshot, then pass its element references to click or fill. Use focus_tab before trusted pointer or keyboard input when an action returns focus_required.")
     }
 }
 

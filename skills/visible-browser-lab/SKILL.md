@@ -27,9 +27,11 @@ Use `list_tabs` with its default scope for normal work. The default list shows t
 
 Use `new_tab` to create an owned background tab. Set `focus: true` only when the user wants Chrome activated immediately. Use `claim_tab` to claim an unowned Chrome target by `target_id`. Use takeover only when the user explicitly asks to transfer ownership, with a non-empty `user_instruction`; takeover returns a new leased `tab_id` and invalidates the previous active lease.
 
-Use `focus_tab`, `navigate`, `screenshot`, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, `network_events`, `release_tab`, and `close_tab` only with an owned `tab_id`. `release_tab` leaves the Chrome target visible and claimable. `close_tab` closes the Chrome target and marks the lease closed.
+Use `focus_tab`, `navigate`, `snapshot`, `screenshot`, `evaluate`, `click`, `fill`, `type_text`, `press_key`, `console_messages`, `network_events`, `release_tab`, and `close_tab` only with an owned `tab_id`. `release_tab` leaves the Chrome target visible and claimable. `close_tab` closes the Chrome target and marks the lease closed.
 
-Use `evaluate` for main-frame JavaScript expressions. Navigation, screenshots, evaluation, text insertion, and diagnostics preserve application focus. Use `click` with a main-frame CSS selector; it finds the first visible matching element, scrolls it into view, and dispatches a left-click at its center. `click` and `press_key` return `focus_required` while the owned tab lacks browser focus; invoke `focus_tab` and retry the action. Use `type_text` after focusing the intended DOM element. Use `console_messages` and `network_events` to inspect broker-owned diagnostics collected for the leased target.
+Inspect an unfamiliar page with `snapshot`. Its compact accessibility tree assigns short `ref` values to elements in the main document and frames. Pass those references to `click` and `fill`. A reference remains subordinate to its session, tab lease, frame, and document; after navigation or `element_stale`, call `snapshot` again. Use `{ "css": "..." }` only when the accessibility snapshot does not represent the target.
+
+`fill` replaces one editable control without activating Chrome. Mutating semantic actions return an accessibility diff by default; request `observe: "snapshot"` for the complete resulting tree or `observe: "none"` when no page observation is needed. Navigation, snapshots, screenshots, evaluation, fill, text insertion, and diagnostics preserve application focus. `click` and `press_key` return `focus_required` while the owned tab lacks browser focus; invoke `focus_tab` and retry the action. Use `type_text` after focusing the intended DOM element when insertion semantics matter. Use `evaluate` for page state that the semantic tools do not expose. Use `console_messages` and `network_events` to inspect broker-owned diagnostics collected for the leased target.
 
 If a leased target disappears, keep the missing lease visible in owned listings, create or claim another tab, and continue with the new `tab_id`.
 
@@ -45,7 +47,7 @@ When one appears:
 
 ## Interaction Rules
 
-- Use the `visible-browser-lab` MCP server for visible-browser tab lifecycle, focus, navigation, screenshots, page actions, and diagnostics.
+- Use the `visible-browser-lab` MCP server for visible-browser tab lifecycle, semantic snapshots, focus, navigation, screenshots, page actions, and diagnostics.
 - Treat `agent_session_id` and `tab_id` as bearer handles. Record them in task notes when the workflow spans multiple steps.
 - Use `target_id`, title, URL, and owner display information for diagnosis and handoff, not as substitutes for an owned `tab_id`.
 - Record missing browser operations as plugin implementation gaps while preserving the current session and tab context.

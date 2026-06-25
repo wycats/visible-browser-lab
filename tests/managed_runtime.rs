@@ -126,7 +126,8 @@ mod macos {
                 json!({
                     "agent_session_id": session_id,
                     "tab_id": tab.tab_id,
-                    "selector": "#clicker"
+                    "target": { "css": "#clicker" },
+                    "observe": "none"
                 }),
             ),
             (
@@ -165,7 +166,8 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
-                "selector": "#clicker"
+                "target": { "css": "#clicker" },
+                "observe": "none"
             }),
             Duration::from_secs(20),
             false,

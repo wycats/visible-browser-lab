@@ -140,14 +140,103 @@ pub struct EvaluateResult {
 pub struct ClickParams {
     pub agent_session_id: AgentSessionId,
     pub tab_id: TabId,
-    pub selector: String,
+    pub target: ElementTarget,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ElementTarget {
+    Reference {
+        #[serde(rename = "ref")]
+        reference: String,
+    },
+    Css {
+        css: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_ref: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationMode {
+    None,
+    #[default]
+    Diff,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMode {
+    Interactive,
+    #[default]
+    Meaningful,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SnapshotMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClickResult {
-    pub clicked: bool,
+pub struct SnapshotResult {
+    pub snapshot_id: String,
+    pub document_revision: String,
+    pub url: String,
+    pub title: String,
+    pub tree: String,
+    pub node_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDiff {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_snapshot_id: Option<String>,
+    pub snapshot_id: String,
+    pub document_revision: String,
+    pub changes: String,
+    pub changed_node_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Observation {
+    None,
+    Diff { diff: SnapshotDiff },
+    Snapshot { snapshot: SnapshotResult },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageActionResult {
+    pub document_revision: String,
+    pub observation: Observation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FillParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub target: ElementTarget,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -383,15 +472,20 @@ mod tests {
         let params = ClickParams {
             agent_session_id: AgentSessionId("session_test".to_string()),
             tab_id: TabId("tab_test".to_string()),
-            selector: "#submit".to_string(),
+            target: ElementTarget::Css {
+                css: "#submit".to_string(),
+                frame_ref: None,
+            },
             timeout_ms: Some(500),
+            observe: Some(ObservationMode::Diff),
         };
         let value = serde_json::to_value(params).unwrap();
 
         assert_eq!(value["agent_session_id"], "session_test");
         assert_eq!(value["tab_id"], "tab_test");
-        assert_eq!(value["selector"], "#submit");
+        assert_eq!(value["target"]["css"], "#submit");
         assert_eq!(value["timeout_ms"], 500);
+        assert_eq!(value["observe"], "diff");
     }
 
     #[test]

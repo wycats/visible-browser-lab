@@ -7,3 +7,4 @@ pub mod leases;
 pub mod managed_chrome;
 pub mod mcp;
 pub mod protocol;
+pub mod semantic;
