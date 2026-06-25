@@ -166,24 +166,81 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
 
 async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<()> {
     let profile_lock = config.chrome_profile_dir.join("SingletonLock");
-    if !path_entry_exists(&profile_lock).await? {
+    if profile_is_available(&profile_lock).await? {
         return Ok(());
     }
 
     let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
     loop {
-        if !path_entry_exists(&profile_lock).await? {
+        if profile_is_available(&profile_lock).await? {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            tracing::warn!(
-                path = %profile_lock.display(),
-                "managed Chrome profile remained locked after its CDP endpoint stopped responding"
+            bail!(
+                "managed Chrome profile `{}` remained locked by a running Chrome process after its CDP endpoint stopped responding",
+                config.chrome_profile_dir.display()
             );
-            return Ok(());
         }
         sleep(CHROME_START_RETRY).await;
     }
+}
+
+async fn profile_is_available(profile_lock: &Path) -> Result<bool> {
+    if !path_entry_exists(profile_lock).await? {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    if let Some(pid) = profile_lock_pid(profile_lock).await?
+        && !unix_process_is_alive(pid)
+    {
+        tokio::fs::remove_file(profile_lock)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove stale Chrome profile lock `{}`",
+                    profile_lock.display()
+                )
+            })?;
+        tracing::info!(
+            path = %profile_lock.display(),
+            pid,
+            "removed stale managed Chrome profile lock"
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+#[cfg(unix)]
+async fn profile_lock_pid(profile_lock: &Path) -> Result<Option<u32>> {
+    let target = match tokio::fs::read_link(profile_lock).await {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read Chrome profile lock `{}`",
+                    profile_lock.display()
+                )
+            });
+        }
+    };
+    Ok(target
+        .to_string_lossy()
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<u32>().ok()))
+}
+
+#[cfg(unix)]
+fn unix_process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 async fn path_entry_exists(path: &Path) -> Result<bool> {
@@ -591,6 +648,23 @@ mod tests {
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removes_stale_chrome_profile_lock_before_launch() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        symlink("test-host-2147483647", &profile_lock).unwrap();
+
+        wait_for_profile_release(&config).await.unwrap();
+        assert!(!path_entry_exists(&profile_lock).await.unwrap());
+    }
+
     #[test]
     fn startup_diagnostics_falls_back_to_chrome_log() {
         let logs = tempfile::tempdir().unwrap();
@@ -644,7 +718,7 @@ mod tests {
         assert_eq!(reused.cdp_endpoint, first.cdp_endpoint);
         assert_eq!(reused.executable, first.executable);
 
-        terminate_process(first.pid.expect("direct launch should return a pid"));
+        terminate_managed_browser(&config, &first).await;
         wait_until_unhealthy(&first.cdp_endpoint).await;
         let replacement = ensure_managed_chrome(&config, BrowserLaunchMode::Headless)
             .await
@@ -652,18 +726,32 @@ mod tests {
         assert!(!replacement.reused);
         assert!(validate_endpoint(&replacement.cdp_endpoint).await);
 
-        terminate_process(replacement.pid.expect("direct launch should return a pid"));
+        terminate_managed_browser(&config, &replacement).await;
         wait_until_unhealthy(&replacement.cdp_endpoint).await;
     }
 
     #[cfg(unix)]
-    fn terminate_process(pid: u32) {
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    async fn terminate_managed_browser(config: &RuntimeConfig, _chrome: &ManagedChrome) {
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        let pid = profile_lock_pid(&profile_lock)
+            .await
+            .unwrap()
+            .expect("Chrome profile lock did not record its owner PID");
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         assert_eq!(result, 0, "failed to terminate managed Chrome pid {pid}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unix_process_is_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "managed Chrome pid {pid} did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(windows)]
-    fn terminate_process(pid: u32) {
+    async fn terminate_managed_browser(_config: &RuntimeConfig, chrome: &ManagedChrome) {
+        let pid = chrome.pid.expect("direct launch should return a pid");
         let output = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()
