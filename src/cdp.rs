@@ -43,6 +43,7 @@ use crate::protocol::{EvaluateResult, NetworkEvent};
 
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
+const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdpEndpoint {
@@ -623,9 +624,20 @@ impl CdpRuntime {
             }
             Err("Chromiumoxide handler ended".to_string())
         });
-        if let Err(error) = browser.fetch_targets().await {
-            handler_task.abort();
-            return Err(map_cdp_error("register existing Chrome targets", &error));
+        let existing_targets = match browser.fetch_targets().await {
+            Ok(targets) => targets,
+            Err(error) => {
+                handler_task.abort();
+                return Err(map_cdp_error("register existing Chrome targets", &error));
+            }
+        };
+        if existing_targets
+            .iter()
+            .any(|target| target.r#type == "page")
+        {
+            // Chromiumoxide attaches fetched targets asynchronously. Waiting before the first
+            // page lookup prevents it from caching the transient attachment session.
+            sleep(EXISTING_TARGET_REGISTRATION_DELAY).await;
         }
         let browser = Arc::new(browser);
         state.generation += 1;
