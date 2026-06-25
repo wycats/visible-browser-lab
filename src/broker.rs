@@ -490,17 +490,11 @@ impl BrowserBackend {
 
     async fn resolved_endpoint(&self) -> Result<String, BrowserToolError> {
         match self {
-            Self::External(_) => Ok(self
-                .cdp_client()
-                .await?
-                .endpoint()
-                .as_str()
-                .trim_end_matches('/')
-                .to_string()),
+            Self::External(_) => Ok(normalized_endpoint(&self.cdp_client().await?)),
             Self::Managed(browser) => browser
                 .client()
                 .await
-                .map(|client| client.endpoint().as_str().to_string()),
+                .map(|client| normalized_endpoint(&client)),
             #[cfg(test)]
             Self::Fake(_) => Ok("fake://browser".to_string()),
         }
@@ -667,6 +661,10 @@ impl BrowserBackend {
             )),
         }
     }
+}
+
+fn normalized_endpoint(client: &CdpClient) -> String {
+    client.endpoint().as_str().trim_end_matches('/').to_string()
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
@@ -1575,6 +1573,13 @@ mod tests {
         BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(
             FakeBrowser::with_targets(targets),
         ))))
+    }
+
+    #[test]
+    fn normalized_endpoint_omits_the_url_root_slash() {
+        let client = CdpClient::new("http://127.0.0.1:9222/").unwrap();
+
+        assert_eq!(normalized_endpoint(&client), "http://127.0.0.1:9222");
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -32,7 +33,7 @@ pub enum BrowserLaunchMode {
 pub struct ManagedChrome {
     pub cdp_endpoint: String,
     pub reused: bool,
-    pub executable: PathBuf,
+    pub executable: Option<PathBuf>,
     pub pid: Option<u32>,
 }
 
@@ -61,10 +62,13 @@ pub async fn ensure_managed_chrome(
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
     if let Some(endpoint) = healthy_active_endpoint(config).await {
+        let executable = discover_chrome(config.chrome_path.as_deref())
+            .ok()
+            .map(|installation| installation.executable);
         return Ok(ManagedChrome {
             cdp_endpoint: endpoint,
             reused: true,
-            executable: config.chrome_path.clone().unwrap_or_default(),
+            executable,
             pid: None,
         });
     }
@@ -80,7 +84,7 @@ pub async fn ensure_managed_chrome(
             return Ok(ManagedChrome {
                 cdp_endpoint: endpoint,
                 reused: false,
-                executable: installation.executable,
+                executable: Some(installation.executable),
                 pid,
             });
         }
@@ -352,13 +356,48 @@ fn launch_direct(
             installation.executable.display()
         )
     })?;
+    let pid = child.id();
     tracing::info!(
-        pid = child.id(),
+        pid,
         executable = %installation.executable.display(),
         mode = ?launch_mode,
         "launched managed Chrome"
     );
-    Ok(Some(child.id()))
+    spawn_chrome_reaper(child)?;
+    Ok(Some(pid))
+}
+
+fn spawn_chrome_reaper(child: Child) -> Result<()> {
+    let pid = child.id();
+    let child = Arc::new(StdMutex::new(Some(child)));
+    let reaper_child = Arc::clone(&child);
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("visible-browser-chrome-{pid}"))
+        .spawn(move || {
+            let child = reaper_child
+                .lock()
+                .expect("managed Chrome child lock was poisoned")
+                .take();
+            let Some(mut child) = child else {
+                return;
+            };
+            match child.wait() {
+                Ok(status) => tracing::debug!(pid, %status, "managed Chrome exited"),
+                Err(error) => tracing::warn!(pid, %error, "failed to reap managed Chrome"),
+            }
+        })
+    {
+        if let Some(mut child) = child
+            .lock()
+            .expect("managed Chrome child lock was poisoned")
+            .take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error).context("failed to start managed Chrome process reaper");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -563,6 +602,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn direct_child_reaper_waits_for_process_exit() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+
+        spawn_chrome_reaper(child).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process {pid} was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn headless_managed_lifecycle_launches_reuses_and_relaunches() {
         let state = tempfile::tempdir().unwrap();
@@ -581,6 +642,7 @@ mod tests {
             .unwrap();
         assert!(reused.reused);
         assert_eq!(reused.cdp_endpoint, first.cdp_endpoint);
+        assert_eq!(reused.executable, first.executable);
 
         terminate_process(first.pid.expect("direct launch should return a pid"));
         wait_until_unhealthy(&first.cdp_endpoint).await;
@@ -602,14 +664,30 @@ mod tests {
 
     #[cfg(windows)]
     fn terminate_process(pid: u32) {
-        let status = Command::new("taskkill")
+        let output = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
+            .output()
             .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while windows_process_is_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
-            status.success(),
-            "failed to terminate managed Chrome pid {pid}"
+            !windows_process_is_alive(pid),
+            "failed to terminate managed Chrome pid {pid}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(windows)]
+    fn windows_process_is_alive(pid: u32) -> bool {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
     }
 
     async fn wait_until_unhealthy(endpoint: &str) {
