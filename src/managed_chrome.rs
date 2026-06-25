@@ -272,6 +272,22 @@ fn chrome_arguments(config: &RuntimeConfig, launch_mode: BrowserLaunchMode) -> V
     if launch_mode == BrowserLaunchMode::Headless {
         args.push("--headless=new".into());
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        if launch_mode == BrowserLaunchMode::Visible && std::env::var_os("DISPLAY").is_some() {
+            args.push("--ozone-platform=x11".into());
+        }
+        if std::env::var_os("CI").is_some() {
+            args.extend([
+                "--disable-dev-shm-usage".into(),
+                "--disable-gpu".into(),
+                "--no-sandbox".into(),
+                "--v=1".into(),
+            ]);
+        }
+    }
+
     args.push(STARTUP_PAGE.into());
     args
 }
@@ -329,11 +345,6 @@ fn launch_direct(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("CI").is_some() {
-        command.arg("--disable-dev-shm-usage").arg("--no-sandbox");
-    }
 
     let child = command.spawn().with_context(|| {
         format!(
