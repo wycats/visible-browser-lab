@@ -397,15 +397,17 @@ fn should_include(node: &RawAxNode, mode: SnapshotMode) -> bool {
 
 fn snapshot_diff(previous: Option<&SnapshotResult>, current: &SnapshotResult) -> SnapshotDiff {
     let previous_lines = previous
-        .map(|snapshot| snapshot.tree.lines().collect::<HashSet<_>>())
+        .map(|snapshot| snapshot_line_counts(&snapshot.tree))
         .unwrap_or_default();
-    let current_lines = current.tree.lines().collect::<HashSet<_>>();
+    let current_lines = snapshot_line_counts(&current.tree);
     let mut changes = Vec::new();
-    for line in previous_lines.difference(&current_lines) {
-        changes.push(format!("- {line}"));
+    for (line, previous_count) in &previous_lines {
+        let removed = previous_count.saturating_sub(*current_lines.get(line).unwrap_or(&0));
+        changes.extend(std::iter::repeat_n(format!("- {line}"), removed));
     }
-    for line in current_lines.difference(&previous_lines) {
-        changes.push(format!("+ {line}"));
+    for (line, current_count) in &current_lines {
+        let added = current_count.saturating_sub(*previous_lines.get(line).unwrap_or(&0));
+        changes.extend(std::iter::repeat_n(format!("+ {line}"), added));
     }
     changes.sort();
     let changed_node_count = changes.len();
@@ -419,6 +421,14 @@ fn snapshot_diff(previous: Option<&SnapshotResult>, current: &SnapshotResult) ->
         changed_node_count,
         truncated,
     }
+}
+
+fn snapshot_line_counts(tree: &str) -> HashMap<&str, usize> {
+    let mut counts = HashMap::new();
+    for line in tree.lines() {
+        *counts.entry(line).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn quoted(value: &str) -> String {
@@ -572,5 +582,29 @@ mod tests {
             .unwrap();
         assert!(diff.changes.contains("Submit"));
         assert!(diff.changes.contains("Saved"));
+    }
+
+    #[test]
+    fn snapshot_diff_preserves_duplicate_line_counts() {
+        let previous = SnapshotResult {
+            snapshot_id: "snapshot_previous".to_string(),
+            document_revision: "loader-a".to_string(),
+            url: "https://example.test/".to_string(),
+            title: "Fixture".to_string(),
+            tree: "row\nrow".to_string(),
+            node_count: 2,
+            truncated: false,
+        };
+        let current = SnapshotResult {
+            snapshot_id: "snapshot_current".to_string(),
+            tree: "row".to_string(),
+            node_count: 1,
+            ..previous.clone()
+        };
+
+        let diff = snapshot_diff(Some(&previous), &current);
+
+        assert_eq!(diff.changes, "- row");
+        assert_eq!(diff.changed_node_count, 1);
     }
 }

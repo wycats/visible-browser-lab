@@ -175,7 +175,7 @@ impl VisibleBrowserLab {
 
     #[tool(
         name = "click",
-        description = "Click one referenced element, or an explicit CSS fallback, after ownership and actionability checks."
+        description = "Click one referenced element after ownership and actionability checks, or one explicit CSS selector after strict single-match and visibility checks."
     )]
     async fn click(&self, params: Parameters<ClickParams>) -> CallToolResult {
         self.call_broker("click", params.0).await

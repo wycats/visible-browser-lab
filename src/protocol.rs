@@ -150,15 +150,23 @@ pub struct ClickParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ElementTarget {
-    Reference {
-        #[serde(rename = "ref")]
-        reference: String,
-    },
-    Css {
-        css: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        frame_ref: Option<String>,
-    },
+    Reference(ElementReferenceTarget),
+    Css(CssElementTarget),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ElementReferenceTarget {
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CssElementTarget {
+    pub css: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -472,10 +480,10 @@ mod tests {
         let params = ClickParams {
             agent_session_id: AgentSessionId("session_test".to_string()),
             tab_id: TabId("tab_test".to_string()),
-            target: ElementTarget::Css {
+            target: ElementTarget::Css(CssElementTarget {
                 css: "#submit".to_string(),
                 frame_ref: None,
-            },
+            }),
             timeout_ms: Some(500),
             observe: Some(ObservationMode::Diff),
         };
@@ -486,6 +494,17 @@ mod tests {
         assert_eq!(value["target"]["css"], "#submit");
         assert_eq!(value["timeout_ms"], 500);
         assert_eq!(value["observe"], "diff");
+    }
+
+    #[test]
+    fn element_target_rejects_mixed_reference_and_css_fields() {
+        let error = serde_json::from_value::<ElementTarget>(json!({
+            "ref": "e_1",
+            "css": "#submit"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("did not match any variant"));
     }
 
     #[test]

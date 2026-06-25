@@ -810,7 +810,7 @@ impl BrowserMcpHarness {
             false,
         )?;
         let tree = field_str(&snapshot, "tree")?;
-        let reference = snapshot_element_ref(&tree, "textbox")?;
+        let reference = snapshot_element_ref(&tree, "textbox [ref=")?;
         self.client_mut().call_tool(
             "fill",
             json!({
@@ -963,10 +963,13 @@ fn assert_tool_error(value: &Value, expected: &str) -> Result<()> {
 }
 
 fn snapshot_element_ref(tree: &str, marker: &str) -> Result<String> {
-    let line = tree
-        .lines()
-        .find(|line| line.contains(marker))
+    let mut matches = tree.lines().filter(|line| line.contains(marker));
+    let line = matches
+        .next()
         .with_context(|| format!("snapshot omitted `{marker}`:\n{tree}"))?;
+    if matches.next().is_some() {
+        bail!("snapshot marker `{marker}` matched more than one node:\n{tree}");
+    }
     let start = line
         .find("[ref=")
         .map(|index| index + 5)

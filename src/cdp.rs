@@ -7,7 +7,7 @@ use chromiumoxide::{
             accessibility::{
                 AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
             },
-            dom::{BackendNodeId, ResolveNodeParams},
+            dom::{BackendNodeId, GetContentQuadsParams, ResolveNodeParams},
             input::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, InsertTextParams, MouseButton,
@@ -448,7 +448,7 @@ impl CdpClient {
         let object_id = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
-        let point = self
+        let actionability = self
             .call_on_element(
                 &page,
                 &connection,
@@ -469,7 +469,29 @@ impl CdpClient {
                 Vec::new(),
             )
             .await?;
-        let point = actionable_point(point)?;
+        actionable_state(actionability)?;
+        let quads = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    GetContentQuadsParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build(),
+                ),
+                "read referenced element content quad",
+            )
+            .await?;
+        let point = quads
+            .result
+            .quads
+            .first()
+            .ok_or_else(|| {
+                BrowserToolError::element_not_actionable(
+                    "element has no content quad in the top-level viewport",
+                )
+            })
+            .and_then(|quad| content_quad_point(quad.inner()))?;
         self.dispatch_click(&page, &connection, point).await
     }
 
@@ -865,7 +887,7 @@ impl CdpClient {
                 }
             };
 
-            if let Some(point) = click_point(result.value().cloned())? {
+            if let Some(point) = click_point(result.value().cloned(), selector)? {
                 return Ok(point);
             }
             sleep(remaining.min(Duration::from_millis(100))).await;
@@ -1123,17 +1145,20 @@ struct ClickPoint {
     y: f64,
 }
 
-fn click_point(value: Option<Value>) -> Result<Option<ClickPoint>, BrowserToolError> {
+fn click_point(
+    value: Option<Value>,
+    selector: &str,
+) -> Result<Option<ClickPoint>, BrowserToolError> {
     let Some(value) = value else {
         return Ok(None);
     };
     if let Some(count) = value.get("count").and_then(Value::as_u64) {
         if count == 0 {
-            return Err(BrowserToolError::element_not_found("CSS selector"));
+            return Err(BrowserToolError::element_not_found(selector));
         }
         if count > 1 {
             return Err(BrowserToolError::element_ambiguous(
-                "CSS selector",
+                selector,
                 count as usize,
             ));
         }
@@ -1158,17 +1183,17 @@ fn click_point(value: Option<Value>) -> Result<Option<ClickPoint>, BrowserToolEr
     Ok(Some(ClickPoint { x, y }))
 }
 
-fn actionable_point(value: Value) -> Result<ClickPoint, BrowserToolError> {
-    actionable_state(value.clone())?;
-    let x = value
-        .get("x")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| BrowserToolError::chrome_unavailable("element result omitted x"))?;
-    let y = value
-        .get("y")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| BrowserToolError::chrome_unavailable("element result omitted y"))?;
-    Ok(ClickPoint { x, y })
+fn content_quad_point(quad: &[f64]) -> Result<ClickPoint, BrowserToolError> {
+    if quad.len() != 8 {
+        return Err(BrowserToolError::chrome_unavailable(format!(
+            "element content quad contained {} coordinates instead of 8",
+            quad.len()
+        )));
+    }
+    Ok(ClickPoint {
+        x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0,
+        y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0,
+    })
 }
 
 fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
@@ -1585,37 +1610,55 @@ mod tests {
 
     #[test]
     fn parses_selector_click_point() {
-        let point = click_point(Some(json!({
-            "found": true,
-            "visible": true,
-            "x": 12.5,
-            "y": 30.0
-        })))
+        let point = click_point(
+            Some(json!({
+                "found": true,
+                "visible": true,
+                "x": 12.5,
+                "y": 30.0
+            })),
+            "#submit",
+        )
         .unwrap()
         .unwrap();
         assert_eq!(point, ClickPoint { x: 12.5, y: 30.0 });
 
-        let missing = click_point(Some(json!({
-            "found": false,
-            "visible": false,
-            "count": 0
-        })))
+        let missing = click_point(
+            Some(json!({
+                "found": false,
+                "visible": false,
+                "count": 0
+            })),
+            "#missing",
+        )
         .unwrap_err();
         assert_eq!(
             missing.code,
             crate::leases::BrowserToolErrorCode::ElementNotFound
         );
+        assert!(missing.message.contains("#missing"));
 
-        let ambiguous = click_point(Some(json!({
-            "found": true,
-            "visible": false,
-            "count": 2
-        })))
+        let ambiguous = click_point(
+            Some(json!({
+                "found": true,
+                "visible": false,
+                "count": 2
+            })),
+            ".duplicate",
+        )
         .unwrap_err();
         assert_eq!(
             ambiguous.code,
             crate::leases::BrowserToolErrorCode::ElementAmbiguous
         );
+        assert!(ambiguous.message.contains(".duplicate"));
+    }
+
+    #[test]
+    fn computes_content_quad_center_in_top_level_viewport() {
+        let point = content_quad_point(&[10.0, 20.0, 30.0, 20.0, 30.0, 40.0, 10.0, 40.0]).unwrap();
+
+        assert_eq!(point, ClickPoint { x: 20.0, y: 30.0 });
     }
 
     #[test]
