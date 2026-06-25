@@ -3057,8 +3057,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
+ "semver",
  "serde_json",
  "sha2",
+ "tempfile",
  "visible-browser-lab-test-support",
  "zip 6.0.0",
 ]
