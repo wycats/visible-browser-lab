@@ -1250,6 +1250,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let target = reqwest::Client::new()
+            .put(format!("{}/json/new?about:blank", chrome.cdp_endpoint()))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let target_id = target["id"].as_str().unwrap();
         let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
 
         let target = client
@@ -1257,8 +1268,8 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .next()
-            .expect("Chrome for Testing should expose its initial page");
+            .find(|target| target.id == target_id)
+            .expect("Chromiumoxide should register the pre-existing target");
         let result = client
             .evaluate(&target, "document.location.href")
             .await
