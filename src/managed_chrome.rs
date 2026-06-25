@@ -66,13 +66,7 @@ pub async fn ensure_managed_chrome(
             executable: config.chrome_path.clone().unwrap_or_default(),
         });
     }
-    if let Some(endpoint) = wait_for_profile_release(config).await? {
-        return Ok(ManagedChrome {
-            cdp_endpoint: endpoint,
-            reused: true,
-            executable: config.chrome_path.clone().unwrap_or_default(),
-        });
-    }
+    wait_for_profile_release(config).await?;
 
     remove_stale_active_port(&config.devtools_active_port_path).await?;
     let installation = discover_chrome(config.chrome_path.as_deref())?;
@@ -163,26 +157,23 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
     validate_endpoint(&endpoint).await.then_some(endpoint)
 }
 
-async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<Option<String>> {
+async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<()> {
     let profile_lock = config.chrome_profile_dir.join("SingletonLock");
     if !path_entry_exists(&profile_lock).await? {
-        return Ok(None);
+        return Ok(());
     }
 
     let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
     loop {
-        if let Some(endpoint) = healthy_active_endpoint(config).await {
-            return Ok(Some(endpoint));
-        }
         if !path_entry_exists(&profile_lock).await? {
-            return Ok(None);
+            return Ok(());
         }
         if Instant::now() >= deadline {
             tracing::warn!(
                 path = %profile_lock.display(),
                 "managed Chrome profile remained locked after its CDP endpoint stopped responding"
             );
-            return Ok(None);
+            return Ok(());
         }
         sleep(CHROME_START_RETRY).await;
     }
@@ -488,7 +479,7 @@ fn startup_diagnostics(log_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chromiumoxide::Browser;
+    use chromiumoxide::{Browser, cdp::browser_protocol::browser::CrashParams};
     use futures_util::StreamExt;
     use visible_browser_lab_test_support::chrome_for_testing_executable;
 
@@ -540,7 +531,7 @@ mod tests {
             tokio::fs::remove_file(lock_to_release).await.unwrap();
         });
 
-        assert_eq!(wait_for_profile_release(&config).await.unwrap(), None);
+        wait_for_profile_release(&config).await.unwrap();
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
     }
 
@@ -574,7 +565,7 @@ mod tests {
         assert!(reused.reused);
         assert_eq!(reused.cdp_endpoint, first.cdp_endpoint);
 
-        close_browser(&first.cdp_endpoint).await;
+        terminate_browser(&first.cdp_endpoint).await;
         wait_until_unhealthy(&first.cdp_endpoint).await;
         let replacement = ensure_managed_chrome(&config, BrowserLaunchMode::Headless)
             .await
@@ -582,11 +573,11 @@ mod tests {
         assert!(!replacement.reused);
         assert!(validate_endpoint(&replacement.cdp_endpoint).await);
 
-        close_browser(&replacement.cdp_endpoint).await;
+        terminate_browser(&replacement.cdp_endpoint).await;
     }
 
-    async fn close_browser(endpoint: &str) {
-        let (mut browser, mut handler) = Browser::connect(endpoint).await.unwrap();
+    async fn terminate_browser(endpoint: &str) {
+        let (browser, mut handler) = Browser::connect(endpoint).await.unwrap();
         let handler_task = tokio::spawn(async move {
             while let Some(result) = handler.next().await {
                 if result.is_err() {
@@ -594,7 +585,7 @@ mod tests {
                 }
             }
         });
-        let _ = browser.close().await;
+        let _ = browser.execute(CrashParams::default()).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), handler_task).await;
     }
 
