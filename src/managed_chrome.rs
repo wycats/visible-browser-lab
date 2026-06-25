@@ -33,6 +33,7 @@ pub struct ManagedChrome {
     pub cdp_endpoint: String,
     pub reused: bool,
     pub executable: PathBuf,
+    pub pid: Option<u32>,
 }
 
 pub async fn ensure_managed_chrome(
@@ -64,13 +65,14 @@ pub async fn ensure_managed_chrome(
             cdp_endpoint: endpoint,
             reused: true,
             executable: config.chrome_path.clone().unwrap_or_default(),
+            pid: None,
         });
     }
     wait_for_profile_release(config).await?;
 
     remove_stale_active_port(&config.devtools_active_port_path).await?;
     let installation = discover_chrome(config.chrome_path.as_deref())?;
-    launch_chrome(config, &installation, launch_mode)?;
+    let pid = launch_chrome(config, &installation, launch_mode)?;
 
     let deadline = Instant::now() + CHROME_START_TIMEOUT;
     loop {
@@ -79,6 +81,7 @@ pub async fn ensure_managed_chrome(
                 cdp_endpoint: endpoint,
                 reused: false,
                 executable: installation.executable,
+                pid,
             });
         }
         if Instant::now() >= deadline {
@@ -242,12 +245,13 @@ fn launch_chrome(
     config: &RuntimeConfig,
     installation: &ChromeInstallation,
     launch_mode: BrowserLaunchMode,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let args = chrome_arguments(config, launch_mode);
 
     #[cfg(target_os = "macos")]
     if launch_mode == BrowserLaunchMode::Visible {
-        return launch_macos_background(config, installation, &args);
+        launch_macos_background(config, installation, &args)?;
+        return Ok(None);
     }
 
     launch_direct(config, installation, &args, launch_mode)
@@ -311,7 +315,7 @@ fn launch_direct(
     installation: &ChromeInstallation,
     args: &[OsString],
     launch_mode: BrowserLaunchMode,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     #[cfg(target_os = "windows")]
     if launch_mode == BrowserLaunchMode::Visible {
         return launch_windows_background(installation, args);
@@ -343,11 +347,14 @@ fn launch_direct(
         mode = ?launch_mode,
         "launched managed Chrome"
     );
-    Ok(())
+    Ok(Some(child.id()))
 }
 
 #[cfg(target_os = "windows")]
-fn launch_windows_background(installation: &ChromeInstallation, args: &[OsString]) -> Result<()> {
+fn launch_windows_background(
+    installation: &ChromeInstallation,
+    args: &[OsString],
+) -> Result<Option<u32>> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::CloseHandle,
@@ -401,11 +408,12 @@ fn launch_windows_background(installation: &ChromeInstallation, args: &[OsString
             )
         });
     }
+    let pid = process.dwProcessId;
     unsafe {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
     }
-    Ok(())
+    Ok(Some(pid))
 }
 
 #[cfg(target_os = "windows")]
@@ -479,8 +487,6 @@ fn startup_diagnostics(log_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chromiumoxide::{Browser, cdp::browser_protocol::browser::CrashParams};
-    use futures_util::StreamExt;
     use visible_browser_lab_test_support::chrome_for_testing_executable;
 
     #[test]
@@ -565,7 +571,7 @@ mod tests {
         assert!(reused.reused);
         assert_eq!(reused.cdp_endpoint, first.cdp_endpoint);
 
-        terminate_browser(&first.cdp_endpoint).await;
+        terminate_process(first.pid.expect("direct launch should return a pid"));
         wait_until_unhealthy(&first.cdp_endpoint).await;
         let replacement = ensure_managed_chrome(&config, BrowserLaunchMode::Headless)
             .await
@@ -573,20 +579,26 @@ mod tests {
         assert!(!replacement.reused);
         assert!(validate_endpoint(&replacement.cdp_endpoint).await);
 
-        terminate_browser(&replacement.cdp_endpoint).await;
+        terminate_process(replacement.pid.expect("direct launch should return a pid"));
+        wait_until_unhealthy(&replacement.cdp_endpoint).await;
     }
 
-    async fn terminate_browser(endpoint: &str) {
-        let (browser, mut handler) = Browser::connect(endpoint).await.unwrap();
-        let handler_task = tokio::spawn(async move {
-            while let Some(result) = handler.next().await {
-                if result.is_err() {
-                    break;
-                }
-            }
-        });
-        let _ = browser.execute(CrashParams::default()).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), handler_task).await;
+    #[cfg(unix)]
+    fn terminate_process(pid: u32) {
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(result, 0, "failed to terminate managed Chrome pid {pid}");
+    }
+
+    #[cfg(windows)]
+    fn terminate_process(pid: u32) {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to terminate managed Chrome pid {pid}"
+        );
     }
 
     async fn wait_until_unhealthy(endpoint: &str) {
