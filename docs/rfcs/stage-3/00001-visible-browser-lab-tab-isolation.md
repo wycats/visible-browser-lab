@@ -38,7 +38,7 @@ Broker-backed MCP tools:
 - `console_messages`
 - `network_events`
 
-The `cargo xtask live-smoke --cdp-endpoint http://127.0.0.1:9222` smoke test launches `visible-browser-lab-mcp` over stdio and drives it against a visible Chrome CDP endpoint. It checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, PNG screenshot capture, page evaluation, CSS selector click, text input, key press, console diagnostics, network diagnostics, ownership errors, `target_owned` for owned-target claim attempts, release and claim transfer, close, and missing-target recovery after an external Chrome tab close.
+The `cargo xtask live-smoke --cdp-endpoint <url>` smoke test launches `visible-browser-lab-mcp` over stdio and drives it against a supplied visible Chrome CDP endpoint. It checks session creation, owned default listings, read-only target inventory, new tab creation, navigation, PNG screenshot capture, page evaluation, CSS selector click, text input, key press, console diagnostics, network diagnostics, ownership errors, `target_owned` for owned-target claim attempts, release and claim transfer, close, and missing-target recovery after an external Chrome tab close. RFC 00004 defines the managed browser lifecycle and installed-package validation path.
 
 ### Stage 3 Criteria
 
@@ -76,14 +76,21 @@ Expose one MCP server named `visible-browser-lab` from every plugin-facing MCP s
 {
   "mcpServers": {
     "visible-browser-lab": {
-      "command": "/Users/wycats/plugins/visible-browser-lab/scripts/visible-browser-lab-mcp.sh",
-      "args": ["--cdp-endpoint=http://127.0.0.1:9222"]
+      "command": "./bin/visible-browser-lab-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": [
+        "VISIBLE_BROWSER_LAB_STATE_DIR",
+        "VISIBLE_BROWSER_LAB_CHROME_PATH",
+        "VISIBLE_BROWSER_CDP_ENDPOINT",
+        "VISIBLE_BROWSER_CDP_PORT"
+      ]
     }
   }
 }
 ```
 
-The command is a repo-local wrapper script. In development it runs the Rust binary with `cargo run --manifest-path /Users/wycats/plugins/visible-browser-lab/Cargo.toml --bin visible-browser-lab-mcp -- "$@"`. A later packaged build may replace the script internals with an exec of a release binary, while `.mcp.json` keeps one facade entry.
+Installed packages contain one target-specific binary and resolve it from the plugin root. The source checkout uses `scripts/visible-browser-lab-mcp.sh` with the same facade entry and runtime environment overrides.
 
 The MCP server is a Rust facade over the visible Chrome CDP endpoint. It provides a session-scoped tab API. The facade owns the mapping between browser sessions, leased tabs, and Chrome `targetId`s. Browser tools validate ownership before touching a Chrome target.
 
@@ -109,7 +116,7 @@ Use these build choices:
 
 - MCP server: `rmcp` over stdio.
 - Async runtime: `tokio`.
-- CDP transport: direct websocket JSON using `tokio-tungstenite` and `serde_json`.
+- CDP client: `chromiumoxide` with a broker-owned browser connection and driven handler.
 - ID generation: `rand` or `uuid` with at least 128 bits of CSPRNG entropy.
 - Internal broker protocol: newline-delimited JSON request/response over local IPC using a small cross-platform abstraction. Unix platforms use local sockets. Windows uses the corresponding Windows local IPC transport. The wire format remains the same across platforms.
 
@@ -120,13 +127,13 @@ Use direct CDP for broker and tab actions. Browser automation dependencies that 
 The binary has two modes:
 
 ```text
-visible-browser-lab-mcp [--cdp-endpoint URL]
-visible-browser-lab-mcp broker --socket PATH --cdp-endpoint URL --state-dir PATH
+visible-browser-lab-mcp [--cdp-endpoint URL] [--state-dir PATH]
+visible-browser-lab-mcp broker --socket PATH [--cdp-endpoint URL] --state-dir PATH
 ```
 
 The default mode is the MCP stdio facade. It ensures a broker is running, connects to the broker socket, and translates MCP tool calls into broker requests.
 
-The broker mode owns CDP connections and lease state. It is a detached child process started by the first MCP facade process when no broker is listening.
+The broker mode owns browser selection, CDP connections, and lease state. It is a detached child process started by the first MCP facade process when no broker is listening.
 
 State paths:
 
@@ -149,19 +156,13 @@ Broker startup rules:
 
 The broker keeps lease state in memory. After broker restart, agents call `start_session` again and claim or create tabs again. Chrome tabs and browser profile state survive because Chrome owns them.
 
-## CDP Endpoint Selection
+## Browser Runtime Selection
 
-The broker resolves the Chrome endpoint in this order:
+An explicit `--cdp-endpoint`, `VISIBLE_BROWSER_CDP_ENDPOINT`, or `VISIBLE_BROWSER_CDP_PORT` selects external CDP mode. The broker validates and uses the supplied endpoint while the caller retains browser lifecycle ownership.
 
-1. `--cdp-endpoint` CLI argument.
-2. `VISIBLE_BROWSER_CDP_ENDPOINT` environment variable.
-3. `http://127.0.0.1:${VISIBLE_BROWSER_CDP_PORT:-9222}`.
+When external CDP configuration is absent, the broker selects managed mode. It discovers an installed Chromium-family browser, starts or reuses the persistent Visible Browser Lab profile with a dynamically assigned debugging port, reads `DevToolsActivePort`, and connects through the resolved endpoint. RFC 00004 defines browser discovery, platform launch behavior, runtime directories, focus behavior, and installed-package validation.
 
-The startup script passes the same endpoint policy to the MCP facade. The script may keep accepting a port through `VISIBLE_BROWSER_CDP_PORT`, and the facade and broker honor a supplied endpoint.
-
-To lease tabs, the broker validates that the endpoint responds to `/json/version`, exposes a browser websocket URL, and reports a Chrome-compatible browser. CDP endpoint metadata lacks reliable Chrome profile identity, so the selected endpoint is the broker's Chrome endpoint for the plugin session. If another Chrome is already listening on the chosen endpoint, the broker will use it. The startup script reports endpoint reuse so the user can identify an unintended endpoint before automation begins.
-
-Chrome startup is handled by `scripts/start-visible-browser.sh`. The broker connects to the configured CDP endpoint. When the broker connection to that endpoint fails, every browser tool fails with the endpoint it tried and the startup command to run.
+Both modes validate `/json/version` and establish a Chromiumoxide browser connection before serving owned-tab operations. Broker status reports the selected runtime mode and resolved endpoint.
 
 ## State Model
 
@@ -437,16 +438,16 @@ This RFC governs the MCP surfaces owned by this plugin. Other locally installed 
 
 The visible-browser-lab skill uses the broker workflow:
 
-1. Start or verify visible Chrome with `scripts/start-visible-browser.sh`.
-2. Call `start_session` before browser work.
-3. Reuse the returned `agent_session_id` for the whole workflow.
-4. Use only owned `tab_id`s for browser actions.
-5. Use `global_readonly` listing only for target identification or explicit user-directed tab transfer.
+1. Call `start_session` to start or reuse the selected browser runtime and create the browser session.
+2. Reuse the returned `agent_session_id` for the whole workflow.
+3. Use only owned `tab_id`s for browser actions.
+4. Use `global_readonly` listing only for target identification or explicit user-directed tab transfer.
+5. Use `focus_tab` as the explicit transition before native click or key input when the broker returns `focus_required`.
 6. Use the facade MCP server for this workflow.
 
 ## Failure Modes
 
-When Chrome is unavailable, every browser tool fails with `chrome_unavailable`, the CDP endpoint it tried, and the startup command to run.
+When managed Chrome is unavailable, browser tools fail with `chrome_unavailable` and diagnostics that identify browser discovery or startup failure. When an external endpoint is unavailable, the error identifies the configured endpoint and connection failure.
 
 If the broker restarts, existing Chrome tabs remain open but leases are lost. The agent must start a new session and claim or create tabs.
 
@@ -474,17 +475,18 @@ The Chrome profile is shared by all browser sessions in this RFC.
 
 Available components:
 
-1. Root Rust package, `visible-browser-lab-mcp` binary, and repo wrapper script.
-2. Endpoint resolution and CDP availability checks.
+1. Root Rust package, `visible-browser-lab-mcp` binary, and source-checkout wrapper script.
+2. Managed and external runtime selection, browser discovery, platform launch adapters, runtime directories, and CDP availability checks.
 3. Detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
 4. Cross-platform broker IPC using local IPC transport so release binaries can be built for macOS, Linux, and Windows.
 5. Session and lease registries with opaque bearer IDs and ownership checks shared by owned-tab action tools.
-6. CDP target discovery, target creation, target activation, navigation, screenshot capture, target close, page evaluation, CSS selector click, text input, key press, console buffering, and network buffering.
+6. Broker-owned Chromiumoxide connections and handlers for target discovery, target creation, target activation, navigation, screenshot capture, target close, page evaluation, CSS selector click, text input, key press, console buffering, and network buffering.
 7. MCP tools: `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, `close_tab`, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events`.
 8. Plugin-facing MCP surfaces for the `visible-browser-lab` facade.
 9. Skill text for the explicit session, owned-tab action, and diagnostics workflow.
 10. Live MCP smoke test through `cargo xtask live-smoke`.
-11. Real-browser MCP regression test through `cargo test --test headless_mcp`.
+11. Real-browser MCP regression tests through `cargo test --test headless_mcp` and managed-runtime lifecycle tests through `cargo test --test managed_runtime`.
+12. Installed Codex package validation through `cargo xtask install-smoke` and the release dry-run workflow.
 
 ## Test Plan
 
@@ -509,7 +511,9 @@ Broker contract tests with a fake CDP transport:
 
 Live Chrome smoke tests:
 
-- Bootstrap a visible Chrome instance through `scripts/start-visible-browser.sh` and verify endpoint precedence respects CLI and environment overrides.
+- Drive a supplied visible Chrome endpoint through `cargo xtask live-smoke --cdp-endpoint <url>` and verify explicit endpoint selection.
+- Start, reuse, close, and relaunch managed Chrome through the production runtime manager.
+- Verify macOS managed launch and background-safe actions preserve the frontmost application until an explicit focus operation.
 - Start two sessions, create one tab in each, and verify default `list_tabs` returns only the caller's tab.
 - Verify `global_readonly` lists both tabs, groups them by owner, and returns usable `tab_id`s only for caller-owned tabs.
 - Verify ownership errors for focus, navigate, screenshot, evaluate, click, type_text, press_key, console_messages, network_events, release, and close against another session's tab.
@@ -517,6 +521,7 @@ Live Chrome smoke tests:
 - Verify closing a Chrome tab through Chrome UI or another client marks the lease `missing` and produces `target_missing` on the next action.
 - Verify the plugin exposes exactly one MCP server: `visible-browser-lab`.
 - Verify `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events` against a local HTTP fixture.
+- Install a packaged Codex archive in a disposable Codex home and verify MCP discovery, managed browser startup, the owned-tab lifecycle, and cleanup.
 
 ## Validation Contract
 
