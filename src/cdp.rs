@@ -604,7 +604,7 @@ impl CdpRuntime {
         }
 
         let endpoint = self.endpoint.origin().as_str().to_string();
-        let (browser, mut handler) = Browser::connect_with_config(
+        let (mut browser, mut handler) = Browser::connect_with_config(
             endpoint.clone(),
             HandlerConfig {
                 viewport: None,
@@ -617,13 +617,17 @@ impl CdpRuntime {
                 "failed to connect Chromiumoxide to `{endpoint}`: {error}"
             ))
         })?;
-        let browser = Arc::new(browser);
         let handler_task = tokio::spawn(async move {
             while let Some(result) = handler.next().await {
                 result.map_err(|error| error.to_string())?;
             }
             Err("Chromiumoxide handler ended".to_string())
         });
+        if let Err(error) = browser.fetch_targets().await {
+            handler_task.abort();
+            return Err(map_cdp_error("register existing Chrome targets", &error));
+        }
+        let browser = Arc::new(browser);
         state.generation += 1;
         let generation = state.generation;
         state.connection = Some(ConnectedBrowser {
@@ -1238,5 +1242,29 @@ mod tests {
             error.code,
             crate::leases::BrowserToolErrorCode::ChromeUnavailable
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registers_targets_that_predate_the_runtime_connection() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+
+        let target = client
+            .page_targets()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("Chrome for Testing should expose its initial page");
+        let result = client
+            .evaluate(&target, "document.location.href")
+            .await
+            .unwrap();
+
+        assert!(result.value.is_some());
+        chrome.shutdown();
     }
 }
