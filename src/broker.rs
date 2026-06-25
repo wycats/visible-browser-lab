@@ -29,8 +29,8 @@ use crate::{
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
         ClaimTabParams, ClickParams, CloseTabResult, ConsoleMessage, ConsoleMessagesResult,
-        DiagnosticsParams, ElementTarget, EvaluateParams, EvaluateResult, FillParams,
-        ListTabsParams, ListTabsResult, ListTabsScope, NavigateParams, NetworkEvent,
+        DiagnosticsParams, ElementReferenceTarget, ElementTarget, EvaluateParams, EvaluateResult,
+        FillParams, ListTabsParams, ListTabsResult, ListTabsScope, NavigateParams, NetworkEvent,
         NetworkEventsResult, NewTabParams, Observation, ObservationMode, PageActionResult,
         PressKeyParams, PressKeyResult, ReleaseTabResult, ScreenshotParams, ScreenshotResult,
         SnapshotMode, SnapshotParams, SnapshotResult, StartSessionParams, StartSessionResult,
@@ -1523,7 +1523,7 @@ async fn resolve_element_target(
     element_target: &ElementTarget,
 ) -> Result<ResolvedElementTarget, BrowserToolError> {
     match element_target {
-        ElementTarget::Reference { reference } => {
+        ElementTarget::Reference(ElementReferenceTarget { reference }) => {
             let document_revision = state.browser.document_revision(target).await?;
             let element = state.references().lock().unwrap().resolve(
                 agent_session_id,
@@ -1536,7 +1536,9 @@ async fn resolve_element_target(
             }
             Ok(ResolvedElementTarget::Reference(element))
         }
-        ElementTarget::Css { css, frame_ref } => {
+        ElementTarget::Css(css_target) => {
+            let css = &css_target.css;
+            let frame_ref = &css_target.frame_ref;
             if frame_ref.is_some() {
                 return Err(BrowserToolError::invalid_input(
                     "frame_ref CSS fallback is not available in the semantic prototype",
@@ -2471,9 +2473,9 @@ mod tests {
             Ok(FillParams {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
-                target: ElementTarget::Reference {
+                target: ElementTarget::Reference(ElementReferenceTarget {
                     reference: "e_3".to_string(),
-                },
+                }),
                 value: "person@example.test".to_string(),
                 timeout_ms: None,
                 observe: Some(ObservationMode::None),
@@ -2487,9 +2489,9 @@ mod tests {
             Ok(ClickParams {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
-                target: ElementTarget::Reference {
+                target: ElementTarget::Reference(ElementReferenceTarget {
                     reference: "e_2".to_string(),
-                },
+                }),
                 timeout_ms: None,
                 observe: Some(ObservationMode::None),
             }),
@@ -2542,9 +2544,9 @@ mod tests {
             Ok(ClickParams {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
-                target: ElementTarget::Reference {
+                target: ElementTarget::Reference(ElementReferenceTarget {
                     reference: "e_2".to_string(),
-                },
+                }),
                 timeout_ms: None,
                 observe: Some(ObservationMode::None),
             }),

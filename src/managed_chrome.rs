@@ -594,6 +594,7 @@ fn startup_diagnostics(log_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use visible_browser_lab_test_support::chrome_for_testing_executable;
 
     #[test]
@@ -698,6 +699,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn headless_managed_lifecycle_launches_reuses_and_relaunches() {
         let state = tempfile::tempdir().unwrap();
@@ -730,7 +732,7 @@ mod tests {
         wait_until_unhealthy(&replacement.cdp_endpoint).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn terminate_managed_browser(config: &RuntimeConfig, _chrome: &ManagedChrome) {
         let profile_lock = config.chrome_profile_dir.join("SingletonLock");
         let pid = profile_lock_pid(&profile_lock)
@@ -749,35 +751,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    async fn terminate_managed_browser(_config: &RuntimeConfig, chrome: &ManagedChrome) {
-        let pid = chrome.pid.expect("direct launch should return a pid");
-        let output = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output()
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while windows_process_is_alive(pid) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            !windows_process_is_alive(pid),
-            "failed to terminate managed Chrome pid {pid}: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[cfg(windows)]
-    fn windows_process_is_alive(pid: u32) -> bool {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-            .unwrap();
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
-    }
-
+    #[cfg(target_os = "linux")]
     async fn wait_until_unhealthy(endpoint: &str) {
         let deadline = Instant::now() + CHROME_START_TIMEOUT;
         while validate_endpoint(endpoint).await {

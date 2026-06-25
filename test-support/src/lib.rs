@@ -6,6 +6,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -22,6 +23,30 @@ use tempfile::TempDir;
 pub const BINARY_NAME: &str = "visible-browser-lab-mcp";
 pub const BROWSER_MODE_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_BROWSER_MODE";
 pub const CFT_CACHE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_CFT_CACHE_DIR";
+
+static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
+
+struct RealBrowserPermit;
+
+impl RealBrowserPermit {
+    fn acquire() -> Self {
+        loop {
+            if REAL_BROWSER_IN_USE
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Self;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for RealBrowserPermit {
+    fn drop(&mut self) {
+        REAL_BROWSER_IN_USE.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserMode {
@@ -45,6 +70,7 @@ impl BrowserMode {
 }
 
 pub struct RealBrowser {
+    _exclusive: RealBrowserPermit,
     child: Child,
     profile_dir: TempDir,
     cdp_endpoint: String,
@@ -56,6 +82,7 @@ impl RealBrowser {
     }
 
     pub fn launch(mode: BrowserMode) -> Result<Self> {
+        let exclusive = RealBrowserPermit::acquire();
         let chrome_executable = chrome_for_testing_executable()?;
         let profile_dir = tempfile::Builder::new()
             .prefix("visible-browser-lab-cft-profile-")
@@ -95,6 +122,7 @@ impl RealBrowser {
         let cdp_endpoint = wait_for_devtools_endpoint(profile_dir.path())?;
 
         Ok(Self {
+            _exclusive: exclusive,
             child,
             profile_dir,
             cdp_endpoint,
@@ -407,8 +435,9 @@ pub fn run_live_smoke(
     )?;
     let tree = field_str(&snapshot, "tree")?;
     let button_ref = snapshot_ref(&tree, "button \"Click\"")?;
-    let textbox_ref = snapshot_ref(&tree, "textbox")?;
+    let textbox_ref = snapshot_ref(&tree, "textbox [ref=")?;
     let frame_textbox_ref = snapshot_ref(&tree, "textbox \"Frame value\"")?;
+    let frame_button_ref = snapshot_ref(&tree, "button \"Frame click\"")?;
 
     let fill_result = client.call_tool(
         "fill",
@@ -468,6 +497,34 @@ pub fn run_live_smoke(
     )?;
     if frame_value.get("value").and_then(Value::as_str) != Some("inside frame") {
         bail!("fill did not resolve the iframe element reference: {frame_value}");
+    }
+
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": frame_button_ref },
+            "observe": "none",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let frame_clicked = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
+        bail!(
+            "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
+        );
     }
 
     client.call_tool(
@@ -1036,7 +1093,8 @@ fn handle_fixture_connection(mut stream: TcpStream) {
             "text/html; charset=utf-8",
             r#"<!doctype html>
 <title>Frame Fixture</title>
-<label>Frame value <input id="frame-entry" /></label>"#
+<label>Frame value <input id="frame-entry" /></label>
+<button id="frame-click" onclick="document.body.dataset.clicked='yes'">Frame click</button>"#
                 .to_string(),
         ),
         _ => (
@@ -1473,10 +1531,13 @@ pub fn field_str(value: &Value, field: &str) -> Result<String> {
 }
 
 fn snapshot_ref(tree: &str, marker: &str) -> Result<String> {
-    let line = tree
-        .lines()
-        .find(|line| line.contains(marker))
+    let mut matches = tree.lines().filter(|line| line.contains(marker));
+    let line = matches
+        .next()
         .with_context(|| format!("snapshot omitted `{marker}`:\n{tree}"))?;
+    if matches.next().is_some() {
+        bail!("snapshot marker `{marker}` matched more than one node:\n{tree}");
+    }
     let start = line
         .find("[ref=")
         .map(|index| index + 5)
