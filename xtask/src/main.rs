@@ -3,8 +3,8 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, Output},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,12 @@ use zip::{
 const BINARY_NAME: &str = "visible-browser-lab-mcp";
 const DEFAULT_OUT_DIR: &str = "out/packages";
 const RELEASE_VERSION_ENV: &str = "VISIBLE_BROWSER_LAB_RELEASE_VERSION";
+const RUNTIME_ENV_VARS: &[&str] = &[
+    "VISIBLE_BROWSER_LAB_STATE_DIR",
+    "VISIBLE_BROWSER_LAB_CHROME_PATH",
+    "VISIBLE_BROWSER_CDP_ENDPOINT",
+    "VISIBLE_BROWSER_CDP_PORT",
+];
 const SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -75,6 +81,7 @@ fn main() -> Result<()> {
         "package" => package(PackageArgs::parse(args.collect())?),
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
+        "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -91,6 +98,7 @@ usage:
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
   cargo xtask checksums [--dir <dir>]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>]
+  cargo xtask install-smoke [--archive <path>] [--codex <path>] [--chrome-path <path>] [--invoke-codex] [--auth-source <path>] [--keep-temp]
 "
     );
 }
@@ -229,6 +237,74 @@ impl LiveSmokeArgs {
             cdp_endpoint,
             binary,
             state_dir,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct InstallSmokeArgs {
+    archive: Option<PathBuf>,
+    codex: PathBuf,
+    chrome_path: Option<PathBuf>,
+    invoke_codex: bool,
+    auth_source: Option<PathBuf>,
+    keep_temp: bool,
+}
+
+impl InstallSmokeArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut archive = None;
+        let mut codex = PathBuf::from("codex");
+        let mut chrome_path = None;
+        let mut invoke_codex = false;
+        let mut auth_source = None;
+        let mut keep_temp = false;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--archive" => {
+                    index += 1;
+                    archive = Some(PathBuf::from(
+                        args.get(index).context("missing value after --archive")?,
+                    ));
+                }
+                "--codex" => {
+                    index += 1;
+                    codex = PathBuf::from(args.get(index).context("missing value after --codex")?);
+                }
+                "--chrome-path" => {
+                    index += 1;
+                    chrome_path = Some(PathBuf::from(
+                        args.get(index)
+                            .context("missing value after --chrome-path")?,
+                    ));
+                }
+                "--invoke-codex" => invoke_codex = true,
+                "--auth-source" => {
+                    index += 1;
+                    auth_source = Some(PathBuf::from(
+                        args.get(index)
+                            .context("missing value after --auth-source")?,
+                    ));
+                }
+                "--keep-temp" => keep_temp = true,
+                arg => bail!("unknown install-smoke argument `{arg}`"),
+            }
+            index += 1;
+        }
+
+        if auth_source.is_some() && !invoke_codex {
+            bail!("--auth-source requires --invoke-codex");
+        }
+
+        Ok(Self {
+            archive,
+            codex,
+            chrome_path,
+            invoke_codex,
+            auth_source,
+            keep_temp,
         })
     }
 }
@@ -396,6 +472,606 @@ fn live_smoke(args: LiveSmokeArgs) -> Result<()> {
         summary.tool_count, summary.screenshot_bytes, summary.global_groups
     );
     Ok(())
+}
+
+fn install_smoke(args: InstallSmokeArgs) -> Result<()> {
+    let root = repo_root()?;
+    let codex = resolve_command(&args.codex)?;
+    let temp_root = if cfg!(windows) {
+        env::temp_dir()
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("vbl-is-")
+        .tempdir_in(temp_root)
+        .context("failed to create disposable install-smoke root")?;
+    let result = (|| -> Result<()> {
+        let smoke_root = temp.path();
+        let home = smoke_root.join("home");
+        let codex_home = smoke_root.join("codex-home");
+        let codex_sqlite_home = smoke_root.join("codex-sqlite-home");
+        let marketplace = smoke_root.join("marketplace");
+        let marketplace_plugin = marketplace.join("plugin");
+        let workspace = smoke_root.join("workspace");
+        let state_dir = smoke_root.join("state");
+        for directory in [
+            &home,
+            &codex_home,
+            &codex_sqlite_home,
+            &marketplace_plugin,
+            &workspace,
+            &state_dir,
+        ] {
+            fs::create_dir_all(directory)
+                .with_context(|| format!("failed to create `{}`", directory.display()))?;
+        }
+
+        if let Some(auth_source) = args.auth_source.as_deref() {
+            copy_codex_auth(auth_source, &codex_home)?;
+        }
+
+        let archive = match args.archive.as_deref() {
+            Some(path) => path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve Codex package `{}`", path.display()))?,
+            None => build_disposable_codex_package(&root, smoke_root)?,
+        };
+        validate_plugin_archive(&archive)?;
+        let package_manifest = read_zip_json(&archive, "package-manifest.json")?;
+        if package_manifest["host"].as_str() != Some("codex") {
+            bail!("install-smoke requires a Codex host package");
+        }
+        let version = package_manifest["version"]
+            .as_str()
+            .context("package manifest omitted version")?
+            .to_string();
+        let target = package_manifest["target"]
+            .as_str()
+            .context("package manifest omitted target")?
+            .to_string();
+        extract_zip(&archive, &marketplace_plugin)?;
+        write_isolated_marketplace(&marketplace)?;
+
+        let environment = IsolatedCodexEnvironment {
+            home,
+            codex_home,
+            codex_sqlite_home,
+            workspace,
+        };
+        let host_default_state_dir = environment.default_visible_browser_state_dir();
+        let marketplace_output = run_checked(
+            isolated_codex_command(&codex, ["plugin", "marketplace", "add"], &environment)
+                .arg(&marketplace),
+            "add disposable Codex marketplace",
+        )?;
+        let marketplace_stdout = String::from_utf8(marketplace_output.stdout)
+            .context("Codex marketplace output was not UTF-8")?;
+        if !marketplace_stdout.contains("visible-browser-lab-isolated") {
+            bail!("Codex did not report the disposable marketplace: {marketplace_stdout}");
+        }
+
+        let add_output = run_checked(
+            &mut isolated_codex_command(
+                &codex,
+                [
+                    "plugin",
+                    "add",
+                    "visible-browser-lab@visible-browser-lab-isolated",
+                ],
+                &environment,
+            ),
+            "install visible-browser-lab into disposable Codex home",
+        )?;
+        let add_stdout =
+            String::from_utf8(add_output.stdout).context("Codex plugin output was not UTF-8")?;
+        let installed_root = installed_plugin_root(&add_stdout)?;
+        let installed_root = installed_root.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve installed plugin root `{}`",
+                installed_root.display()
+            )
+        })?;
+        let canonical_codex_home = environment.codex_home.canonicalize()?;
+        if !installed_root.starts_with(canonical_codex_home.join("plugins/cache")) {
+            bail!(
+                "Codex installed the plugin outside the disposable cache: {}",
+                installed_root.display()
+            );
+        }
+
+        let list_output = run_checked(
+            &mut isolated_codex_command(
+                &codex,
+                [
+                    "plugin",
+                    "list",
+                    "--marketplace",
+                    "visible-browser-lab-isolated",
+                ],
+                &environment,
+            ),
+            "list the disposable Codex plugin installation",
+        )?;
+        let list_stdout =
+            String::from_utf8(list_output.stdout).context("Codex plugin list was not UTF-8")?;
+        if !list_stdout.contains("visible-browser-lab")
+            || !list_stdout.contains("installed, enabled")
+            || !list_stdout.contains(&version)
+        {
+            bail!("Codex plugin list did not report the installed package: {list_stdout}");
+        }
+
+        let (installed_binary, installed_cwd) =
+            validate_installed_codex_package(&installed_root, &version, &target)?;
+        let version_output = run_checked(
+            Command::new(&installed_binary).arg("--version"),
+            "run the installed visible-browser-lab binary",
+        )?;
+        let reported_version = String::from_utf8(version_output.stdout)
+            .context("installed binary version output was not UTF-8")?;
+        let expected_version = format!("{BINARY_NAME} {version}");
+        if reported_version.trim() != expected_version {
+            bail!(
+                "installed binary version mismatch: expected `{expected_version}`, got `{}`",
+                reported_version.trim()
+            );
+        }
+
+        let chrome_path = match args.chrome_path.as_deref() {
+            Some(path) => path.canonicalize().with_context(|| {
+                format!("failed to resolve Chrome executable `{}`", path.display())
+            })?,
+            None => visible_browser_lab_test_support::chrome_for_testing_executable()?
+                .canonicalize()
+                .context("failed to resolve Chrome for Testing executable")?,
+        };
+        let _cleanup = InstalledSmokeCleanup {
+            state_dirs: vec![state_dir.clone(), host_default_state_dir.clone()],
+        };
+        let title = run_installed_facade_lifecycle(
+            &installed_binary,
+            &installed_cwd,
+            &state_dir,
+            &chrome_path,
+        )?;
+
+        if args.invoke_codex {
+            run_model_invocation(&codex, &environment, &state_dir, &chrome_path)?;
+            if host_default_state_dir.exists() {
+                bail!(
+                    "Codex did not pass the isolated runtime environment to the installed MCP server: {}",
+                    host_default_state_dir.display()
+                );
+            }
+        }
+
+        let active_port = state_dir.join("chrome-profile/DevToolsActivePort");
+        if !active_port.is_file() {
+            bail!(
+                "managed Chrome did not use the disposable profile at `{}`",
+                active_port.display()
+            );
+        }
+        if !state_dir.join("broker-v2.pid").is_file() {
+            bail!(
+                "broker did not use the disposable state directory `{}`",
+                state_dir.display()
+            );
+        }
+
+        println!(
+            "install smoke passed: version={version}, target={target}, title={title}, cache={}",
+            installed_root.display()
+        );
+        Ok(())
+    })();
+
+    if args.auth_source.is_some() {
+        let _ = fs::remove_file(temp.path().join("codex-home/auth.json"));
+    }
+    if args.keep_temp {
+        let retained = temp.keep();
+        println!(
+            "retained disposable install-smoke root at {}",
+            retained.display()
+        );
+    }
+    result
+}
+
+fn build_disposable_codex_package(root: &Path, smoke_root: &Path) -> Result<PathBuf> {
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--bin", BINARY_NAME])
+        .current_dir(root)
+        .status()
+        .context("failed to build release binary for install smoke")?;
+    if !status.success() {
+        bail!("cargo build --release --bin {BINARY_NAME} failed");
+    }
+
+    let target = host_target()?;
+    ensure_supported_target(&target)?;
+    let version = release_version(root, None)?;
+    let binary = binary_path(root, &target, None)?;
+    let archive = smoke_root.join(format!("visible-browser-lab-codex-{version}-{target}.zip"));
+    write_plugin_archive(root, &AGENT_HOSTS[0], &target, &version, &binary, &archive)?;
+    Ok(archive)
+}
+
+fn resolve_command(command: &Path) -> Result<PathBuf> {
+    if command.components().count() == 1 && !command.is_file() {
+        return Ok(command.to_path_buf());
+    }
+    command
+        .canonicalize()
+        .with_context(|| format!("failed to resolve executable `{}`", command.display()))
+}
+
+fn read_zip_json(archive_path: &Path, entry_name: &str) -> Result<Value> {
+    let mut archive = open_zip(archive_path)?;
+    let mut entry = archive.by_name(entry_name).with_context(|| {
+        format!(
+            "archive `{}` is missing `{entry_name}`",
+            archive_path.display()
+        )
+    })?;
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents)?;
+    serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "archive `{}` has invalid JSON in `{entry_name}`",
+            archive_path.display()
+        )
+    })
+}
+
+fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
+    let mut archive = open_zip(archive_path)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let relative = entry.enclosed_name().with_context(|| {
+            format!(
+                "archive `{}` contains unsafe path `{}`",
+                archive_path.display(),
+                entry.name()
+            )
+        })?;
+        let output = destination.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(&output)?;
+        std::io::copy(&mut entry, &mut file)?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_isolated_marketplace(root: &Path) -> Result<()> {
+    let manifest_path = root.join(".agents/plugins/marketplace.json");
+    fs::create_dir_all(
+        manifest_path
+            .parent()
+            .context("marketplace manifest omitted parent")?,
+    )?;
+    let manifest = json!({
+        "name": "visible-browser-lab-isolated",
+        "interface": { "displayName": "Visible Browser Lab Isolated" },
+        "plugins": [{
+            "name": "visible-browser-lab",
+            "source": { "source": "local", "path": "./plugin" },
+            "policy": {
+                "installation": "AVAILABLE",
+                "authentication": "ON_INSTALL"
+            },
+            "category": "Developer Tools"
+        }]
+    });
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
+}
+
+struct IsolatedCodexEnvironment {
+    home: PathBuf,
+    codex_home: PathBuf,
+    codex_sqlite_home: PathBuf,
+    workspace: PathBuf,
+}
+
+impl IsolatedCodexEnvironment {
+    fn default_visible_browser_state_dir(&self) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            self.home.join("Library/Caches").join("visible-browser-lab")
+        } else if cfg!(windows) {
+            self.home.join("AppData/Local").join("visible-browser-lab")
+        } else {
+            self.home.join(".cache").join("visible-browser-lab")
+        }
+    }
+}
+
+fn isolated_codex_command<I, S>(
+    codex: &Path,
+    args: I,
+    environment: &IsolatedCodexEnvironment,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = Command::new(codex);
+    command
+        .args(args)
+        .current_dir(&environment.workspace)
+        .env("HOME", &environment.home)
+        .env("USERPROFILE", &environment.home)
+        .env("XDG_CONFIG_HOME", environment.home.join(".config"))
+        .env("XDG_CACHE_HOME", environment.home.join(".cache"))
+        .env("LOCALAPPDATA", environment.home.join("AppData/Local"))
+        .env("APPDATA", environment.home.join("AppData/Roaming"))
+        .env("CODEX_HOME", &environment.codex_home)
+        .env("CODEX_SQLITE_HOME", &environment.codex_sqlite_home)
+        .env_remove("CODEX_MANAGED_CONFIG_PATH");
+    command
+}
+
+fn run_checked(command: &mut Command, operation: &str) -> Result<Output> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to {operation}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to {operation}: status={}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn installed_plugin_root(stdout: &str) -> Result<PathBuf> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Installed plugin root: "))
+        .map(PathBuf::from)
+        .context("Codex plugin add output omitted the installed plugin root")
+}
+
+fn validate_installed_codex_package(
+    installed_root: &Path,
+    version: &str,
+    target: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(installed_root.join(".codex-plugin/plugin.json"))?)?;
+    if manifest["version"].as_str() != Some(version) {
+        bail!("installed Codex manifest version does not match `{version}`");
+    }
+    let package_manifest: Value =
+        serde_json::from_slice(&fs::read(installed_root.join("package-manifest.json"))?)?;
+    if package_manifest["version"].as_str() != Some(version)
+        || package_manifest["target"].as_str() != Some(target)
+        || package_manifest["host"].as_str() != Some("codex")
+    {
+        bail!("installed package manifest does not match the selected Codex archive");
+    }
+
+    let mcp: Value = serde_json::from_slice(&fs::read(installed_root.join(".mcp.json"))?)?;
+    let server = &mcp["mcpServers"]["visible-browser-lab"];
+    let command = server["command"]
+        .as_str()
+        .context("installed MCP config omitted command")?;
+    let cwd = server["cwd"]
+        .as_str()
+        .context("installed MCP config omitted cwd")?;
+    if Path::new(command).is_absolute() || Path::new(cwd).is_absolute() {
+        bail!("installed Codex MCP config must resolve from the plugin root");
+    }
+    if server["env_vars"] != json!(RUNTIME_ENV_VARS) {
+        bail!("installed Codex MCP config omitted runtime environment overrides");
+    }
+    let installed_root = installed_root.canonicalize()?;
+    let resolved_cwd = installed_root.join(cwd).canonicalize()?;
+    if !resolved_cwd.starts_with(&installed_root) {
+        bail!("installed MCP cwd escaped the plugin root");
+    }
+    let binary = resolved_cwd
+        .join(command.strip_prefix("./").unwrap_or(command))
+        .canonicalize()?;
+    if !binary.starts_with(&installed_root) || !binary.is_file() {
+        bail!("installed MCP command did not resolve to the packaged binary");
+    }
+    Ok((binary, resolved_cwd))
+}
+
+fn run_installed_facade_lifecycle(
+    binary: &Path,
+    installed_cwd: &Path,
+    state_dir: &Path,
+    chrome_path: &Path,
+) -> Result<String> {
+    use visible_browser_lab_test_support::{McpClient, OpenTab, field_str};
+
+    let expected_title = "Visible Browser Lab Installed Smoke";
+    let mut client =
+        McpClient::spawn_managed_from_environment(binary, state_dir, installed_cwd, chrome_path)?;
+    client.initialize("visible-browser-lab-install-smoke")?;
+    let session = client.call_tool(
+        "start_session",
+        json!({
+            "label": "installed-package-smoke",
+            "start_url": visible_browser_lab_test_support::data_url(expected_title, expected_title),
+            "focus": false
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = OpenTab::from_summary(
+        &session_id,
+        session.get("tab").context("start_session omitted tab")?,
+    )?;
+    let owned = client.call_tool(
+        "list_tabs",
+        json!({ "agent_session_id": session_id }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let tabs = owned
+        .get("tabs")
+        .and_then(Value::as_array)
+        .context("list_tabs omitted tabs")?;
+    if !tabs.iter().any(|candidate| {
+        candidate.get("tab_id").and_then(Value::as_str) == Some(tab.tab_id.as_str())
+    }) {
+        bail!("default list_tabs omitted the installed smoke tab");
+    }
+    let evaluation = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "expression": "document.title"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let title = evaluation["value"]
+        .as_str()
+        .context("evaluate omitted document.title")?
+        .to_string();
+    if title != expected_title {
+        bail!("installed facade returned unexpected title `{title}`");
+    }
+    client.call_tool(
+        "close_tab",
+        json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    client.shutdown();
+    Ok(title)
+}
+
+fn copy_codex_auth(source: &Path, codex_home: &Path) -> Result<()> {
+    let source = if source.is_dir() {
+        source.join("auth.json")
+    } else {
+        source.to_path_buf()
+    };
+    if !source.is_file() {
+        bail!("Codex auth source does not contain `{}`", source.display());
+    }
+    fs::copy(&source, codex_home.join("auth.json"))
+        .with_context(|| format!("failed to copy Codex auth from `{}`", source.display()))?;
+    Ok(())
+}
+
+fn run_model_invocation(
+    codex: &Path,
+    environment: &IsolatedCodexEnvironment,
+    state_dir: &Path,
+    chrome_path: &Path,
+) -> Result<()> {
+    let prompt = "Use only the visible-browser-lab MCP tools. Call start_session with focus false and a data: page whose title is Visible Browser Lab Codex Smoke. Call default list_tabs with the returned agent_session_id, evaluate document.title with the returned tab_id, then close_tab. Return the observed title and confirm the tab was closed. Do not use shell commands or browser fallbacks.";
+    let mut command = isolated_codex_command(
+        codex,
+        [
+            "exec",
+            "--ephemeral",
+            "--json",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+        ],
+        environment,
+    );
+    command
+        .arg(&environment.workspace)
+        .arg(prompt)
+        .env("VISIBLE_BROWSER_LAB_STATE_DIR", state_dir)
+        .env("VISIBLE_BROWSER_LAB_CHROME_PATH", chrome_path);
+    let output = run_checked(&mut command, "run isolated Codex MCP invocation")?;
+    let events = String::from_utf8(output.stdout).context("Codex JSONL output was not UTF-8")?;
+    let events_path = environment.workspace.join("codex-exec.jsonl");
+    fs::write(&events_path, &events)?;
+    validate_codex_invocation_events(&events)
+        .with_context(|| format!("Codex events: {}", events_path.display()))?;
+    if !events.contains("Visible Browser Lab Codex Smoke") {
+        bail!("Codex invocation did not report the expected page title");
+    }
+    Ok(())
+}
+
+fn validate_codex_invocation_events(events: &str) -> Result<()> {
+    let mut completed_tools = Vec::new();
+    for line in events.lines().filter(|line| !line.trim().is_empty()) {
+        let event: Value = serde_json::from_str(line).context("Codex emitted invalid JSONL")?;
+        let Some(item) = event.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if item_type == "command_execution" {
+            bail!("Codex used command execution during the MCP-only invocation");
+        }
+        if item_type != "mcp_tool_call" || event["type"].as_str() != Some("item.completed") {
+            continue;
+        }
+        if item["server"].as_str() != Some("visible-browser-lab") {
+            bail!("Codex called a non-facade MCP server: {item}");
+        }
+        if !item["error"].is_null() || item["status"].as_str() != Some("completed") {
+            bail!("Codex facade tool call did not complete: {item}");
+        }
+        completed_tools.push(
+            item["tool"]
+                .as_str()
+                .context("Codex MCP event omitted tool name")?
+                .to_string(),
+        );
+    }
+
+    let expected = ["start_session", "list_tabs", "evaluate", "close_tab"];
+    if completed_tools != expected {
+        bail!("Codex completed facade tool sequence {completed_tools:?}; expected {expected:?}");
+    }
+    Ok(())
+}
+
+fn managed_endpoint(state_dir: &Path) -> Result<String> {
+    let active_port = fs::read_to_string(state_dir.join("chrome-profile/DevToolsActivePort"))?;
+    let port = active_port
+        .lines()
+        .next()
+        .context("DevToolsActivePort omitted port")?
+        .trim()
+        .parse::<u16>()?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+struct InstalledSmokeCleanup {
+    state_dirs: Vec<PathBuf>,
+}
+
+impl Drop for InstalledSmokeCleanup {
+    fn drop(&mut self) {
+        for state_dir in &self.state_dirs {
+            visible_browser_lab_test_support::stop_broker(state_dir);
+            if let Ok(endpoint) = managed_endpoint(state_dir) {
+                let _ = visible_browser_lab_test_support::close_browser_via_cdp(&endpoint);
+            }
+        }
+    }
 }
 
 fn unix_millis() -> Result<u128> {
@@ -587,13 +1263,17 @@ fn mcp_config_bytes(host: &AgentHost, binary_name: &str) -> Result<Vec<u8>> {
             "${CLAUDE_PLUGIN_ROOT}".to_string(),
         ),
     };
+    let mut server = json!({
+        "command": command,
+        "args": [],
+        "cwd": cwd,
+    });
+    if host.plugin_format == PluginFormat::Codex {
+        server["env_vars"] = json!(RUNTIME_ENV_VARS);
+    }
     let config = json!({
         "mcpServers": {
-            "visible-browser-lab": {
-                "command": command,
-                "args": [],
-                "cwd": cwd,
-            }
+            "visible-browser-lab": server
         }
     });
     Ok(serde_json::to_vec_pretty(&config)?)
@@ -649,8 +1329,9 @@ fn validate_source_package_contract(root: &Path) -> Result<()> {
     let server = &mcp["mcpServers"]["visible-browser-lab"];
     if server["command"].as_str() != Some("./scripts/visible-browser-lab-mcp.sh")
         || server["cwd"].as_str() != Some(".")
+        || server["env_vars"] != json!(RUNTIME_ENV_VARS)
     {
-        bail!("source MCP config must resolve its launcher from the plugin root");
+        bail!("source MCP config must preserve plugin-root and runtime environment contracts");
     }
     Ok(())
 }
@@ -830,6 +1511,15 @@ fn validate_plugin_archive(path: &Path) -> Result<()> {
             "archive `{}` does not resolve its MCP binary from the installed plugin root",
             path.display(),
         );
+    }
+    match host.plugin_format {
+        PluginFormat::Codex if server["env_vars"] != json!(RUNTIME_ENV_VARS) => {
+            bail!("Codex archive does not pass through runtime environment overrides");
+        }
+        PluginFormat::Claude if server.get("env_vars").is_some() => {
+            bail!("Claude-format archive contains unsupported Codex env_vars");
+        }
+        _ => {}
     }
 
     Ok(())
@@ -1088,6 +1778,7 @@ mod tests {
         let codex_server = &codex["mcpServers"]["visible-browser-lab"];
         assert_eq!(codex_server["command"], "./bin/visible-browser-lab-mcp");
         assert_eq!(codex_server["cwd"], ".");
+        assert_eq!(codex_server["env_vars"], json!(RUNTIME_ENV_VARS));
 
         for host in &AGENT_HOSTS[1..] {
             let config: Value =
@@ -1124,5 +1815,52 @@ mod tests {
             .join(format!("visible-browser-lab-mcp-{version}-{target}.zip"));
         write_binary_archive(target, version, &binary, &binary_archive).unwrap();
         validate_archives(output.path()).unwrap();
+    }
+
+    #[test]
+    fn install_smoke_auth_requires_model_invocation() {
+        let error = InstallSmokeArgs::parse(vec![
+            "--auth-source".to_string(),
+            "/tmp/codex-auth".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("requires --invoke-codex"));
+
+        let args = InstallSmokeArgs::parse(vec![
+            "--invoke-codex".to_string(),
+            "--auth-source".to_string(),
+            "/tmp/codex-auth".to_string(),
+            "--keep-temp".to_string(),
+        ])
+        .unwrap();
+        assert!(args.invoke_codex);
+        assert!(args.keep_temp);
+        assert_eq!(args.auth_source, Some(PathBuf::from("/tmp/codex-auth")));
+    }
+
+    #[test]
+    fn codex_invocation_requires_only_the_expected_facade_sequence() {
+        let events = ["start_session", "list_tabs", "evaluate", "close_tab"]
+            .map(|tool| {
+                json!({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "visible-browser-lab",
+                        "tool": tool,
+                        "status": "completed",
+                        "error": null
+                    }
+                })
+                .to_string()
+            })
+            .join("\n");
+        validate_codex_invocation_events(&events).unwrap();
+
+        let command = json!({
+            "type": "item.completed",
+            "item": { "type": "command_execution", "status": "completed" }
+        });
+        assert!(validate_codex_invocation_events(&format!("{events}\n{command}")).is_err());
     }
 }

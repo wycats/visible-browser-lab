@@ -93,7 +93,7 @@ The broker's `focused` field describes focus changes issued through the facade a
 
 Each host package contains one target-specific `visible-browser-lab-mcp` binary. Host MCP configuration resolves that binary from the installed plugin root rather than the invoking workspace.
 
-For Codex, the generated MCP server entry sets `cwd` to `.`; Codex resolves a relative plugin MCP working directory against the installed plugin root. The command remains `./bin/visible-browser-lab-mcp` or its Windows executable form. The server advertises the `codex/sandbox-state-meta` experimental capability. Codex then supplies the active turn working directory independently on each tool request at `_meta["codex/sandbox-state-meta"]["sandboxCwd"]`. Plugin-root resolution therefore does not repurpose the workspace value.
+For Codex, the generated MCP server entry sets `cwd` to `.`; Codex resolves a relative plugin MCP working directory against the installed plugin root. The command remains `./bin/visible-browser-lab-mcp` or its Windows executable form. The entry passes through `VISIBLE_BROWSER_LAB_STATE_DIR`, `VISIBLE_BROWSER_LAB_CHROME_PATH`, `VISIBLE_BROWSER_CDP_ENDPOINT`, and `VISIBLE_BROWSER_CDP_PORT` when the invoking environment defines them. The server advertises the `codex/sandbox-state-meta` experimental capability. Codex then supplies the active turn working directory independently on each tool request at `_meta["codex/sandbox-state-meta"]["sandboxCwd"]`. Plugin-root resolution therefore does not repurpose the workspace value.
 
 Claude Code and VS Code packages use the Claude plugin format. Their MCP command and working directory use `${CLAUDE_PLUGIN_ROOT}`, which both hosts expand to the installed plugin root. Package validation checks each host's generated manifest path, MCP command, and working directory.
 
@@ -103,7 +103,7 @@ Codex applies the user's configured MCP approval policy when the facade invokes 
 
 # Installation Validation
 
-`cargo xtask install-smoke` validates a built or downloaded host package in a disposable environment. The Codex path:
+`cargo xtask install-smoke` validates a built or downloaded Codex package in a disposable environment. `--archive` selects a release archive; without it, the command builds and packages the current host binary. The command:
 
 1. creates isolated `HOME`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, workspace, broker state, and Chrome profile directories;
 2. installs the package through a local temporary marketplace;
@@ -111,9 +111,11 @@ Codex applies the user's configured MCP approval policy when the facade invokes 
 4. runs the packaged MCP binary through the host configuration;
 5. starts a session, lists the owned tab, evaluates a deterministic page title, and closes the tab;
 6. confirms the managed browser used the isolated profile and state directory;
-7. removes the disposable environment after retaining sanitized diagnostics for failures.
+7. terminates the broker and managed Chrome, then removes the disposable environment. `--keep-temp` retains the isolated files for inspection.
 
-The test accepts a preauthenticated isolated Codex home for model-driven invocation. Package-root resolution, MCP startup, managed browser launch, and the deterministic facade lifecycle are validated without model participation.
+`--invoke-codex --auth-source <path>` copies only `auth.json` from the selected Codex home into the disposable Codex home and runs an ephemeral model invocation with `--dangerously-bypass-approvals-and-sandbox`. The copied credential file is removed before retained diagnostics are exposed. The JSONL event stream must contain completed `start_session`, default `list_tabs`, `evaluate`, and `close_tab` calls through `visible-browser-lab` in that order. Command execution and calls to another MCP server fail the smoke. Package-root resolution, MCP startup, managed browser launch, and the deterministic facade lifecycle are validated without model participation.
+
+The release dry run downloads a pinned standalone Codex package from the `openai/codex` GitHub release, verifies it against `codex-package_SHA256SUMS`, and runs the Linux package smoke under Xvfb. The smoke runs before release assets are uploaded or published.
 
 # Implementation Map
 

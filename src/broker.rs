@@ -794,9 +794,10 @@ async fn wait_for_broker(config: &RuntimeConfig, timeout: Duration) -> Result<Br
                     .unwrap_or_else(|read_error| {
                         format!("failed to read broker diagnostics: {read_error}")
                     });
+                let connection_error = format!("{error:#}");
                 return Err(error).with_context(|| {
                     format!(
-                        "timed out waiting for broker socket `{}`; broker diagnostics: {}",
+                        "timed out waiting for broker socket `{}`; last connection error: {connection_error}; broker diagnostics: {}",
                         config.ipc_endpoint,
                         diagnostics.trim()
                     )
@@ -1468,7 +1469,7 @@ fn process_is_alive(pid: u32) -> bool {
             return true;
         }
 
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     #[cfg(windows)]
@@ -1505,6 +1506,7 @@ impl BrokerStartLock {
     fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)
@@ -2101,11 +2103,12 @@ mod tests {
         .await
         .unwrap();
 
-        let fake = fake.lock().unwrap();
-        assert!(fake.was_clicked("#submit"));
-        assert_eq!(fake.typed_text(), &["hello".to_string()]);
-        assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
-        drop(fake);
+        {
+            let fake = fake.lock().unwrap();
+            assert!(fake.was_clicked("#submit"));
+            assert_eq!(fake.typed_text(), &["hello".to_string()]);
+            assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
+        }
 
         let foreign_error = broker_evaluate(
             &state,

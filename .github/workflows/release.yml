@@ -20,6 +20,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CODEX_CLI_VERSION: "0.136.0"
 
 jobs:
   release-version:
@@ -217,6 +218,39 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Cache Chrome for Testing
+        uses: actions/cache@v6
+        with:
+          path: target/chrome-for-testing
+          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install visible browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Download trusted Codex CLI package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/codex
+          asset="codex-package-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "rust-v${CODEX_CLI_VERSION}" \
+            --repo openai/codex \
+            --pattern "$asset" \
+            --pattern codex-package_SHA256SUMS \
+            --dir dist/codex
+          (
+            cd dist/codex
+            grep "  ${asset}$" codex-package_SHA256SUMS | sha256sum --check -
+            tar -xzf "$asset"
+          )
+          dist/codex/bin/codex --version
+
       - name: Download binary artifacts
         uses: actions/download-artifact@v8
         with:
@@ -248,6 +282,15 @@ jobs:
 
           cargo xtask checksums
           cargo xtask validate
+
+      - name: Verify installed Codex package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="out/packages/visible-browser-lab-codex-${VISIBLE_BROWSER_LAB_RELEASE_VERSION}-x86_64-unknown-linux-musl.zip"
+          xvfb-run -a cargo xtask install-smoke \
+            --archive "$archive" \
+            --codex dist/codex/bin/codex
 
       - name: Upload release assets artifact
         uses: actions/upload-artifact@v7

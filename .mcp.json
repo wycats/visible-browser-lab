@@ -3,7 +3,13 @@
     "visible-browser-lab": {
       "command": "./scripts/visible-browser-lab-mcp.sh",
       "args": [],
-      "cwd": "."
+      "cwd": ".",
+      "env_vars": [
+        "VISIBLE_BROWSER_LAB_STATE_DIR",
+        "VISIBLE_BROWSER_LAB_CHROME_PATH",
+        "VISIBLE_BROWSER_CDP_ENDPOINT",
+        "VISIBLE_BROWSER_CDP_PORT"
+      ]
     }
   }
 }
