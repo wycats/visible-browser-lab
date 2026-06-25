@@ -116,7 +116,7 @@ The catalog uses these agent-facing descriptions and MCP annotations:
 | `release_tab` | End ownership while leaving the Chrome target open and claimable. | false | true | true | true |
 | `focus_tab` | Bring an owned tab to the foreground before trusted pointer or keyboard input. | false | false | true | true |
 | `close_tab` | Close an owned Chrome target and its lease. | false | true | true | true |
-| `snapshot` | Inspect user-perceivable page structure and obtain element references for later actions. | true | false | true | true |
+| `snapshot` | Inspect user-perceivable page structure and obtain element references for later actions. | true | false | false | true |
 | `navigate` | Change the owned tab's URL or session history and observe the resulting document. | false | false | false | true |
 | `wait_for` | Wait for page text, element state, URL, load state, expression, or a bounded delay. | true | false | true | true |
 | `click` | Activate one referenced or explicitly selected element after focus and actionability checks. | false | true | false | true |
@@ -124,7 +124,7 @@ The catalog uses these agent-facing descriptions and MCP annotations:
 | `fill_form` | Apply two or more typed field updates and report partial completion on failure. | false | true | true | true |
 | `type_text` | Insert text at an editable target's current selection without activating Chrome. | false | true | false | true |
 | `press_key` | Dispatch one native key sequence after the owned document has focus. | false | true | false | true |
-| `screenshot` | Capture visual page state as MCP image content and an owned artifact. | true | false | true | true |
+| `screenshot` | Capture visual page state as MCP image content and an owned artifact. | false | false | false | true |
 | `evaluate` | Read or modify page state with JavaScript when the semantic tools do not expose it. | false | true | false | true |
 | `interact` | Perform a specialized user interaction such as hover, drag, upload, dialog handling, scrolling, or coordinate input. | false | true | false | true |
 | `console` | List, inspect, or clear console diagnostics collected for an owned tab. | false | true | true | true |
@@ -399,7 +399,7 @@ wait_for({
     | { kind: "element"; target: ElementTarget; state: "attached" | "detached" | "visible" | "hidden" | "enabled" | "disabled" | "editable" | "checked" | "unchecked" }
     | { kind: "url"; value: string; match?: "exact" | "substring" | "regex" }
     | { kind: "load"; state: "dom_content_loaded" | "load" | "network_idle" }
-    | { kind: "expression"; expression: string },
+    | { kind: "expression"; expression: string }
   timeout_ms?: number,
   observe?: ObservationMode
 }) -> WaitResult
@@ -578,6 +578,8 @@ Element operations use `ElementTarget`. Upload paths resolve inside the active w
 - `set_cpu`
 - `set_geolocation`
 - `set_media`
+- `set_user_agent`
+- `set_headers`
 - `reset`
 
 Emulation state belongs to the owned target. Responses state the effective values.
@@ -590,7 +592,7 @@ Analyzer sidecars receive an artifact path and bounded analysis parameters. They
 
 ## Audit
 
-`audit` runs named accessibility, best-practices, SEO, and agentic-browsing checks against an owned tab. It accepts desktop or mobile presentation and navigation or snapshot mode. Results contain category scores, findings, affected element references where available, and concrete remediation text.
+`audit` uses the `run` operation to execute named accessibility, best-practices, SEO, and agentic-browsing checks against an owned tab. It accepts desktop or mobile presentation and navigation or snapshot mode. Results contain category scores, findings, affected element references where available, and concrete remediation text.
 
 ## Memory
 
@@ -683,6 +685,7 @@ type PerformanceInput = PageScope & (
 );
 
 type AuditInput = PageScope & {
+  operation: "run";
   categories?: Array<"accessibility" | "seo" | "best_practices" |
     "agentic_browsing">;
   mode?: "navigation" | "snapshot";
@@ -792,6 +795,7 @@ type PerformanceResult =
         summary: string; evidence?: JsonValue }> };
 
 type AuditResult = {
+  operation: "run";
   scores: Record<string, number | null>;
   findings: Array<{ id: string; category: string; title: string;
     description: string; refs?: ElementRef[] }>;

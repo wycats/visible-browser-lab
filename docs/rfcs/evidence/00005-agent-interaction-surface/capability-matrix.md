@@ -145,9 +145,9 @@ checks. AgentChrome and chrome-agent provide design evidence for compact
 accessibility snapshots and backend-node references; Visible Browser Lab keeps
 those references subordinate to its tab leases.
 
-## Contract Adjustments Required Before Stage 2
+## Capability Matrix Requirements
 
-The operation inventory identifies these schema requirements for RFC `00005`:
+The operation inventory establishes these schema requirements in RFC `00005`:
 
 - `wait_for` includes a bounded delay condition.
 - `navigate` includes before-unload handling and a next-document init script.
