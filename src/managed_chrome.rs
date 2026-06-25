@@ -599,7 +599,7 @@ mod tests {
     }
 
     async fn wait_until_unhealthy(endpoint: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CHROME_START_TIMEOUT;
         while validate_endpoint(endpoint).await {
             assert!(Instant::now() < deadline, "managed Chrome did not stop");
             sleep(Duration::from_millis(50)).await;
