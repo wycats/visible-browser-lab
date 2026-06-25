@@ -93,11 +93,13 @@ The broker's `focused` field describes focus changes issued through the facade a
 
 Each host package contains one target-specific `visible-browser-lab-mcp` binary. Host MCP configuration resolves that binary from the installed plugin root rather than the invoking workspace.
 
-For Codex, the generated MCP server entry sets `cwd` to `.`; Codex resolves a relative plugin MCP working directory against the installed plugin root. The command remains `./bin/visible-browser-lab-mcp` or its Windows executable form. Host-specific package validation applies the equivalent supported root-resolution mechanism for Claude Code and VS Code.
+For Codex, the generated MCP server entry sets `cwd` to `.`; Codex resolves a relative plugin MCP working directory against the installed plugin root. The command remains `./bin/visible-browser-lab-mcp` or its Windows executable form. The server advertises the `codex/sandbox-state-meta` experimental capability. Codex then supplies the active turn working directory independently on each tool request at `_meta["codex/sandbox-state-meta"]["sandboxCwd"]`. Plugin-root resolution therefore does not repurpose the workspace value.
 
-The generated package manifests use the release version supplied by the release workflow. The Codex, Claude Code, and VS Code manifests, `package-manifest.json`, archive names, Git tag, and binary `--version` output identify the same release version.
+Claude Code and VS Code packages use the Claude plugin format. Their MCP command and working directory use `${CLAUDE_PLUGIN_ROOT}`, which both hosts expand to the installed plugin root. Package validation checks each host's generated manifest path, MCP command, and working directory.
 
-The Codex MCP entry declares the tool approval policy required for an installed automation invocation to call the facade's browser tools. Users can override that policy through normal Codex plugin configuration.
+The release workflow removes the `v` prefix from a release tag and supplies the resulting semantic version while compiling and packaging. Pull-request dry runs use the Cargo package version. The Codex, Claude Code, and VS Code manifests, `package-manifest.json`, archive names, Git tag, and binary `--version` output identify the same release version.
+
+Codex applies the user's configured MCP approval policy when the facade invokes browser tools. The installed package preserves that policy rather than overriding it.
 
 # Installation Validation
 

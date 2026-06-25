@@ -1,11 +1,16 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use rmcp::{
-    ServerHandler, ServiceExt,
+    RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, JsonObject, Meta, ServerCapabilities, ServerInfo},
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
+
+const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 use serde::Serialize;
 use serde_json::Value;
 
@@ -85,7 +90,14 @@ impl VisibleBrowserLab {
         name = "start_session",
         description = "Start a visible-browser session and optionally create the first leased tab."
     )]
-    async fn start_session(&self, params: Parameters<StartSessionParams>) -> CallToolResult {
+    async fn start_session(
+        &self,
+        context: RequestContext<RoleServer>,
+        params: Parameters<StartSessionParams>,
+    ) -> CallToolResult {
+        if let Some(workspace) = codex_workspace_cwd(&context.meta) {
+            tracing::debug!(workspace, "received Codex workspace context");
+        }
         self.call_broker("start_session", params.0).await
     }
 
@@ -205,7 +217,12 @@ impl VisibleBrowserLab {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for VisibleBrowserLab {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        capabilities.experimental = Some(BTreeMap::from([(
+            CODEX_SANDBOX_STATE_META_CAPABILITY.to_string(),
+            JsonObject::new(),
+        )]));
+        ServerInfo::new(capabilities)
             .with_instructions("Use start_session first. Reuse the returned agent_session_id and act only through owned tab_id values.")
     }
 }
@@ -224,4 +241,36 @@ fn structured_browser_error(error: BrowserToolError) -> CallToolResult {
         })
     });
     CallToolResult::structured_error(value)
+}
+
+fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
+    meta.0
+        .get(CODEX_SANDBOX_STATE_META_CAPABILITY)?
+        .get("sandboxCwd")?
+        .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_and_reads_codex_workspace_metadata() {
+        let config = RuntimeConfig::managed(std::path::PathBuf::from("/tmp/vbl-mcp"), None);
+        let info = VisibleBrowserLab::new(config).get_info();
+        assert!(
+            info.capabilities
+                .experimental
+                .as_ref()
+                .is_some_and(|capabilities| {
+                    capabilities.contains_key(CODEX_SANDBOX_STATE_META_CAPABILITY)
+                })
+        );
+
+        let meta = Meta(serde_json::Map::from_iter([(
+            CODEX_SANDBOX_STATE_META_CAPABILITY.to_string(),
+            serde_json::json!({ "sandboxCwd": "/workspace/project" }),
+        )]));
+        assert_eq!(codex_workspace_cwd(&meta), Some("/workspace/project"));
+    }
 }

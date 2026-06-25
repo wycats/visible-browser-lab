@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zip::{
@@ -17,6 +18,7 @@ use zip::{
 
 const BINARY_NAME: &str = "visible-browser-lab-mcp";
 const DEFAULT_OUT_DIR: &str = "out/packages";
+const RELEASE_VERSION_ENV: &str = "VISIBLE_BROWSER_LAB_RELEASE_VERSION";
 const SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -31,6 +33,13 @@ struct AgentHost {
     id: &'static str,
     display_name: &'static str,
     manifest_path: &'static str,
+    plugin_format: PluginFormat,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PluginFormat {
+    Codex,
+    Claude,
 }
 
 const AGENT_HOSTS: &[AgentHost] = &[
@@ -38,16 +47,19 @@ const AGENT_HOSTS: &[AgentHost] = &[
         id: "codex",
         display_name: "Codex",
         manifest_path: ".codex-plugin/plugin.json",
+        plugin_format: PluginFormat::Codex,
     },
     AgentHost {
         id: "claude-code",
         display_name: "Claude Code",
         manifest_path: ".claude-plugin/plugin.json",
+        plugin_format: PluginFormat::Claude,
     },
     AgentHost {
         id: "vscode",
         display_name: "VS Code",
-        manifest_path: ".vscode-plugin/plugin.json",
+        manifest_path: ".claude-plugin/plugin.json",
+        plugin_format: PluginFormat::Claude,
     },
 ];
 
@@ -76,7 +88,7 @@ fn print_usage() {
         "\
 usage:
   cargo xtask validate
-  cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>]
+  cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
   cargo xtask checksums [--dir <dir>]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>]
 "
@@ -88,6 +100,7 @@ struct PackageArgs {
     target: String,
     binary: Option<PathBuf>,
     out_dir: PathBuf,
+    version: Option<String>,
 }
 
 impl PackageArgs {
@@ -95,6 +108,7 @@ impl PackageArgs {
         let mut target = None;
         let mut binary = None;
         let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
+        let mut version = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -118,6 +132,14 @@ impl PackageArgs {
                     out_dir =
                         PathBuf::from(args.get(index).context("missing value after --out-dir")?);
                 }
+                "--version" => {
+                    index += 1;
+                    version = Some(
+                        args.get(index)
+                            .context("missing value after --version")?
+                            .to_string(),
+                    );
+                }
                 arg => bail!("unknown package argument `{arg}`"),
             }
 
@@ -131,6 +153,7 @@ impl PackageArgs {
             target,
             binary,
             out_dir,
+            version,
         })
     }
 }
@@ -224,6 +247,7 @@ fn validate() -> Result<()> {
             bail!("required source file is missing: {}", path.display());
         }
     }
+    validate_source_package_contract(&root)?;
 
     for forbidden in [
         "package.json",
@@ -256,6 +280,7 @@ fn validate() -> Result<()> {
 
 fn package(args: PackageArgs) -> Result<()> {
     let root = repo_root()?;
+    let version = release_version(&root, args.version.as_deref())?;
     let binary = binary_path(&root, &args.target, args.binary.as_deref())?;
     let out_dir = root.join(args.out_dir);
     fs::create_dir_all(&out_dir)
@@ -264,15 +289,18 @@ fn package(args: PackageArgs) -> Result<()> {
     let mut archives = Vec::new();
     for host in AGENT_HOSTS {
         let archive = out_dir.join(format!(
-            "visible-browser-lab-{}-{}.zip",
-            host.id, args.target
+            "visible-browser-lab-{}-{}-{}.zip",
+            host.id, version, args.target
         ));
-        write_plugin_archive(&root, host, &args.target, &binary, &archive)?;
+        write_plugin_archive(&root, host, &args.target, &version, &binary, &archive)?;
         archives.push(archive);
     }
 
-    let binary_archive = out_dir.join(format!("visible-browser-lab-mcp-{}.zip", args.target));
-    write_binary_archive(&args.target, &binary, &binary_archive)?;
+    let binary_archive = out_dir.join(format!(
+        "visible-browser-lab-mcp-{}-{}.zip",
+        version, args.target
+    ));
+    write_binary_archive(&args.target, &version, &binary, &binary_archive)?;
     archives.push(binary_archive);
 
     for archive in &archives {
@@ -418,6 +446,7 @@ fn write_plugin_archive(
     root: &Path,
     host: &AgentHost,
     target: &str,
+    version: &str,
     binary: &Path,
     archive: &Path,
 ) -> Result<()> {
@@ -425,9 +454,9 @@ fn write_plugin_archive(
         .with_context(|| format!("failed to create archive `{}`", archive.display()))?;
     let mut zip = ZipWriter::new(file);
     let binary_name = binary_file_name(target);
-    let mcp_config = mcp_config_bytes(&binary_name)?;
-    let manifest = host_manifest_bytes(root, host, target, &binary_name)?;
-    let package_manifest = package_manifest_bytes(host, target, &binary_name)?;
+    let mcp_config = mcp_config_bytes(host, &binary_name)?;
+    let manifest = host_manifest_bytes(root, host, target, version, &binary_name)?;
+    let package_manifest = package_manifest_bytes(host, target, version, &binary_name)?;
 
     add_bytes(&mut zip, host.manifest_path, &manifest, 0o644)?;
     add_bytes(&mut zip, ".mcp.json", &mcp_config, 0o644)?;
@@ -451,7 +480,7 @@ fn write_plugin_archive(
     Ok(())
 }
 
-fn write_binary_archive(target: &str, binary: &Path, archive: &Path) -> Result<()> {
+fn write_binary_archive(target: &str, version: &str, binary: &Path, archive: &Path) -> Result<()> {
     let file = File::create(archive)
         .with_context(|| format!("failed to create archive `{}`", archive.display()))?;
     let mut zip = ZipWriter::new(file);
@@ -461,6 +490,7 @@ fn write_binary_archive(target: &str, binary: &Path, archive: &Path) -> Result<(
 visible-browser-lab MCP broker
 
 target: {target}
+version: {version}
 binary: {binary_name}
 
 This archive is for debugging or manual installation. Plugin hosts should use
@@ -515,13 +545,15 @@ fn host_manifest_bytes(
     root: &Path,
     host: &AgentHost,
     target: &str,
+    version: &str,
     binary_name: &str,
 ) -> Result<Vec<u8>> {
-    if host.id == "codex" {
+    if host.plugin_format == PluginFormat::Codex {
         let source = fs::read_to_string(root.join(".codex-plugin/plugin.json"))
             .context("failed to read Codex plugin manifest")?;
         let mut manifest: Value =
             serde_json::from_str(&source).context("invalid Codex manifest JSON")?;
+        manifest["version"] = Value::String(version.to_string());
         manifest["mcpServers"] = Value::String("./.mcp.json".to_string());
         manifest["packaging"] = json!({
             "kind": "trusted-binary-release",
@@ -533,7 +565,7 @@ fn host_manifest_bytes(
 
     let manifest = json!({
         "name": "visible-browser-lab",
-        "version": plugin_version(root)?,
+        "version": version,
         "displayName": format!("Visible Browser Lab ({})", host.display_name),
         "description": "Visible Chrome automation through a shared CDP endpoint",
         "skills": "./skills/",
@@ -547,21 +579,35 @@ fn host_manifest_bytes(
     Ok(serde_json::to_vec_pretty(&manifest)?)
 }
 
-fn mcp_config_bytes(binary_name: &str) -> Result<Vec<u8>> {
+fn mcp_config_bytes(host: &AgentHost, binary_name: &str) -> Result<Vec<u8>> {
+    let (command, cwd) = match host.plugin_format {
+        PluginFormat::Codex => (format!("./bin/{binary_name}"), ".".to_string()),
+        PluginFormat::Claude => (
+            format!("${{CLAUDE_PLUGIN_ROOT}}/bin/{binary_name}"),
+            "${CLAUDE_PLUGIN_ROOT}".to_string(),
+        ),
+    };
     let config = json!({
         "mcpServers": {
             "visible-browser-lab": {
-                "command": format!("./bin/{binary_name}"),
-                "args": []
+                "command": command,
+                "args": [],
+                "cwd": cwd,
             }
         }
     });
     Ok(serde_json::to_vec_pretty(&config)?)
 }
 
-fn package_manifest_bytes(host: &AgentHost, target: &str, binary_name: &str) -> Result<Vec<u8>> {
+fn package_manifest_bytes(
+    host: &AgentHost,
+    target: &str,
+    version: &str,
+    binary_name: &str,
+) -> Result<Vec<u8>> {
     let manifest = json!({
         "name": "visible-browser-lab",
+        "version": version,
         "host": host.id,
         "target": target,
         "binary": format!("bin/{binary_name}"),
@@ -571,15 +617,66 @@ fn package_manifest_bytes(host: &AgentHost, target: &str, binary_name: &str) -> 
     Ok(serde_json::to_vec_pretty(&manifest)?)
 }
 
-fn plugin_version(root: &Path) -> Result<String> {
-    let source = fs::read_to_string(root.join(".codex-plugin/plugin.json"))
-        .context("failed to read Codex plugin manifest")?;
-    let manifest: Value = serde_json::from_str(&source).context("invalid Codex manifest JSON")?;
-    manifest
-        .get("version")
-        .and_then(Value::as_str)
+fn release_version(root: &Path, explicit: Option<&str>) -> Result<String> {
+    let configured = explicit
         .map(ToOwned::to_owned)
-        .context("Codex plugin manifest is missing string `version`")
+        .or_else(|| env::var(RELEASE_VERSION_ENV).ok())
+        .map(|version| version.trim_start_matches('v').to_string());
+    let candidate = match configured {
+        Some(version) => version,
+        None => cargo_package_version(root)?,
+    };
+    Version::parse(&candidate)
+        .with_context(|| format!("release version `{candidate}` is not valid semantic version"))?;
+    Ok(candidate)
+}
+
+fn validate_source_package_contract(root: &Path) -> Result<()> {
+    let package_version = cargo_package_version(root)?;
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(root.join(".codex-plugin/plugin.json"))
+            .context("failed to read Codex plugin manifest")?,
+    )
+    .context("invalid Codex plugin manifest JSON")?;
+    if manifest["version"].as_str() != Some(&package_version) {
+        bail!("Codex source manifest version must match Cargo package version `{package_version}`");
+    }
+
+    let mcp: Value = serde_json::from_slice(
+        &fs::read(root.join(".mcp.json")).context("failed to read source MCP config")?,
+    )
+    .context("invalid source MCP config JSON")?;
+    let server = &mcp["mcpServers"]["visible-browser-lab"];
+    if server["command"].as_str() != Some("./scripts/visible-browser-lab-mcp.sh")
+        || server["cwd"].as_str() != Some(".")
+    {
+        bail!("source MCP config must resolve its launcher from the plugin root");
+    }
+    Ok(())
+}
+
+fn cargo_package_version(root: &Path) -> Result<String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .context("failed to run cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let metadata: Value =
+        serde_json::from_slice(&output.stdout).context("cargo metadata returned invalid JSON")?;
+    metadata["packages"]
+        .as_array()
+        .context("cargo metadata omitted packages")?
+        .iter()
+        .find(|package| package["name"] == "visible-browser-lab")
+        .and_then(|package| package["version"].as_str())
+        .map(ToOwned::to_owned)
+        .context("cargo metadata omitted the visible-browser-lab package version")
 }
 
 fn validate_archives(dir: &Path) -> Result<()> {
@@ -605,7 +702,9 @@ fn validate_archives(dir: &Path) -> Result<()> {
 fn validate_plugin_archive(path: &Path) -> Result<()> {
     let mut archive = open_zip(path)?;
     let mut names = Vec::new();
-    let mut mcp_config = None;
+    let mut mcp_config: Option<Value> = None;
+    let mut package_manifest: Option<Value> = None;
+    let mut host_manifests = Vec::new();
 
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
@@ -617,10 +716,20 @@ fn validate_plugin_archive(path: &Path) -> Result<()> {
             );
         }
 
-        if name == ".mcp.json" {
+        if name == ".mcp.json"
+            || name == "package-manifest.json"
+            || AGENT_HOSTS.iter().any(|host| host.manifest_path == name)
+        {
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
-            mcp_config = Some(contents);
+            let json: Value = serde_json::from_str(&contents).with_context(|| {
+                format!("archive `{}` has invalid JSON in `{name}`", path.display())
+            })?;
+            match name.as_str() {
+                ".mcp.json" => mcp_config = Some(json),
+                "package-manifest.json" => package_manifest = Some(json),
+                _ => host_manifests.push((name.clone(), json)),
+            }
         }
 
         names.push(name);
@@ -647,26 +756,79 @@ fn validate_plugin_archive(path: &Path) -> Result<()> {
         }
     }
 
-    let has_host_manifest = AGENT_HOSTS
-        .iter()
-        .any(|host| names.iter().any(|name| name == host.manifest_path));
-    if !has_host_manifest {
+    if host_manifests.len() != 1 {
         bail!(
-            "archive `{}` is missing a host plugin manifest",
-            path.display()
+            "archive `{}` must contain exactly one host plugin manifest, found {}",
+            path.display(),
+            host_manifests.len()
         );
+    }
+
+    let package_manifest = package_manifest.with_context(|| {
+        format!(
+            "archive `{}` is missing package-manifest.json",
+            path.display()
+        )
+    })?;
+    let host_id = package_manifest["host"]
+        .as_str()
+        .context("package manifest omitted host")?;
+    let host = AGENT_HOSTS
+        .iter()
+        .find(|host| host.id == host_id)
+        .with_context(|| format!("package manifest has unknown host `{host_id}`"))?;
+    let version = package_manifest["version"]
+        .as_str()
+        .context("package manifest omitted version")?;
+    Version::parse(version).context("package manifest version is not semantic version")?;
+    let target = package_manifest["target"]
+        .as_str()
+        .context("package manifest omitted target")?;
+    let binary_name = binary_file_name(target);
+    let expected_binary = format!("bin/{binary_name}");
+    if package_manifest["binary"].as_str() != Some(&expected_binary) {
+        bail!("package manifest binary does not match target `{target}`");
+    }
+    let archive_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let expected_archive = format!("visible-browser-lab-{host_id}-{version}-{target}.zip");
+    if archive_name != expected_archive {
+        bail!("archive `{archive_name}` does not match package identity `{expected_archive}`");
+    }
+
+    let (manifest_path, host_manifest) = &host_manifests[0];
+    if manifest_path != host.manifest_path {
+        bail!(
+            "archive `{}` uses `{manifest_path}` for host `{host_id}`; expected `{}`",
+            path.display(),
+            host.manifest_path
+        );
+    }
+    if host_manifest["version"].as_str() != Some(version) {
+        bail!("host manifest version does not match package version `{version}`");
     }
 
     let mcp_config =
         mcp_config.with_context(|| format!("archive `{}` is missing .mcp.json", path.display()))?;
-    if mcp_config.contains("npx")
-        || mcp_config.contains("node")
-        || mcp_config.contains("cargo")
-        || !mcp_config.contains("./bin/visible-browser-lab-mcp")
+    let server = &mcp_config["mcpServers"]["visible-browser-lab"];
+    let (expected_command, expected_cwd) = match host.plugin_format {
+        PluginFormat::Codex => (format!("./bin/{binary_name}"), ".".to_string()),
+        PluginFormat::Claude => (
+            format!("${{CLAUDE_PLUGIN_ROOT}}/bin/{binary_name}"),
+            "${CLAUDE_PLUGIN_ROOT}".to_string(),
+        ),
+    };
+    if server["command"].as_str() != Some(&expected_command)
+        || server["cwd"].as_str() != Some(&expected_cwd)
+        || server["args"]
+            .as_array()
+            .is_none_or(|args| !args.is_empty())
     {
         bail!(
-            "archive `{}` has an invalid generated MCP config",
-            path.display()
+            "archive `{}` does not resolve its MCP binary from the installed plugin root",
+            path.display(),
         );
     }
 
@@ -676,11 +838,12 @@ fn validate_plugin_archive(path: &Path) -> Result<()> {
 fn validate_binary_archive(path: &Path) -> Result<()> {
     let mut archive = open_zip(path)?;
     let mut binary_count = 0;
+    let mut readme = None;
 
     for index in 0..archive.len() {
-        let file = archive.by_index(index)?;
-        let name = file.name();
-        if forbidden_archive_path(name) {
+        let mut file = archive.by_index(index)?;
+        let name = file.name().to_string();
+        if forbidden_archive_path(&name) {
             bail!(
                 "archive `{}` contains forbidden path `{name}`",
                 path.display()
@@ -690,6 +853,11 @@ fn validate_binary_archive(path: &Path) -> Result<()> {
         if name == BINARY_NAME || name == format!("{BINARY_NAME}.exe") {
             binary_count += 1;
         }
+        if name == "README.txt" {
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)?;
+            readme = Some(contents);
+        }
     }
 
     if binary_count != 1 {
@@ -697,6 +865,26 @@ fn validate_binary_archive(path: &Path) -> Result<()> {
             "archive `{}` must contain exactly one binary, found {binary_count}",
             path.display()
         );
+    }
+
+    let readme =
+        readme.with_context(|| format!("archive `{}` is missing README.txt", path.display()))?;
+    let target = readme
+        .lines()
+        .find_map(|line| line.strip_prefix("target: "))
+        .context("binary archive README omitted target")?;
+    let version = readme
+        .lines()
+        .find_map(|line| line.strip_prefix("version: "))
+        .context("binary archive README omitted version")?;
+    Version::parse(version).context("binary archive version is not semantic version")?;
+    let expected_archive = format!("visible-browser-lab-mcp-{version}-{target}.zip");
+    let archive_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if archive_name != expected_archive {
+        bail!("archive `{archive_name}` does not match binary identity `{expected_archive}`");
     }
 
     Ok(())
@@ -877,4 +1065,64 @@ fn git_head() -> Result<String> {
         .context("git rev-parse output was not UTF-8")?
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_version_normalizes_tag_prefix() {
+        let root = repo_root().unwrap();
+
+        assert_eq!(release_version(&root, Some("v1.2.3")).unwrap(), "1.2.3");
+        assert!(release_version(&root, Some("release-1")).is_err());
+    }
+
+    #[test]
+    fn host_mcp_configs_preserve_plugin_root_contracts() {
+        let codex: Value = serde_json::from_slice(
+            &mcp_config_bytes(&AGENT_HOSTS[0], "visible-browser-lab-mcp").unwrap(),
+        )
+        .unwrap();
+        let codex_server = &codex["mcpServers"]["visible-browser-lab"];
+        assert_eq!(codex_server["command"], "./bin/visible-browser-lab-mcp");
+        assert_eq!(codex_server["cwd"], ".");
+
+        for host in &AGENT_HOSTS[1..] {
+            let config: Value =
+                serde_json::from_slice(&mcp_config_bytes(host, "visible-browser-lab-mcp").unwrap())
+                    .unwrap();
+            let server = &config["mcpServers"]["visible-browser-lab"];
+            assert_eq!(
+                server["command"],
+                "${CLAUDE_PLUGIN_ROOT}/bin/visible-browser-lab-mcp"
+            );
+            assert_eq!(server["cwd"], "${CLAUDE_PLUGIN_ROOT}");
+        }
+    }
+
+    #[test]
+    fn generated_archives_validate_host_root_and_version_identity() {
+        let root = repo_root().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let binary = output.path().join(BINARY_NAME);
+        fs::write(&binary, b"test binary").unwrap();
+        let version = "1.2.3";
+        let target = "aarch64-apple-darwin";
+
+        for host in AGENT_HOSTS {
+            let archive = output.path().join(format!(
+                "visible-browser-lab-{}-{version}-{target}.zip",
+                host.id
+            ));
+            write_plugin_archive(&root, host, target, version, &binary, &archive).unwrap();
+        }
+
+        let binary_archive = output
+            .path()
+            .join(format!("visible-browser-lab-mcp-{version}-{target}.zip"));
+        write_binary_archive(target, version, &binary, &binary_archive).unwrap();
+        validate_archives(output.path()).unwrap();
+    }
 }

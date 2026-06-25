@@ -1,11 +1,9 @@
 {
   "mcpServers": {
     "visible-browser-lab": {
-      "command": "/Users/wycats/plugins/visible-browser-lab/scripts/visible-browser-lab-mcp.sh",
-      "args": [
-        "--cdp-endpoint",
-        "http://127.0.0.1:9222"
-      ]
+      "command": "./scripts/visible-browser-lab-mcp.sh",
+      "args": [],
+      "cwd": "."
     }
   }
 }

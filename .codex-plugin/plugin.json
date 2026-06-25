@@ -1,6 +1,6 @@
 {
   "name": "visible-browser-lab",
-  "version": "0.1.0+codex.20260620214718",
+  "version": "0.1.0",
   "description": "Visible Chrome automation through a tab-lease MCP facade",
   "author": {
     "name": "Local developer"

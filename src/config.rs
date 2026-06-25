@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub const DEFAULT_CDP_ORIGIN: &str = "http://127.0.0.1";
+pub const RELEASE_VERSION: &str = match option_env!("VISIBLE_BROWSER_LAB_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 const CDP_ENDPOINT_ENV: &str = "VISIBLE_BROWSER_CDP_ENDPOINT";
 const CDP_PORT_ENV: &str = "VISIBLE_BROWSER_CDP_PORT";
 const STATE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_STATE_DIR";
@@ -15,7 +19,7 @@ pub const CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_PATH";
 #[derive(Debug, Parser)]
 #[command(
     name = "visible-browser-lab-mcp",
-    version,
+    version = RELEASE_VERSION,
     about = "MCP facade for a shared visible Chrome browser",
     long_about = "Runs the Visible Browser Lab MCP facade or its local broker over a shared visible Chrome CDP endpoint."
 )]
@@ -207,7 +211,12 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn cli_reports_the_compiled_release_version() {
+        assert_eq!(Cli::command().get_version(), Some(RELEASE_VERSION));
+    }
 
     #[test]
     fn absent_endpoint_selects_managed_runtime() {
