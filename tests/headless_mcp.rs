@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use visible_browser_lab_test_support::{
     BROWSER_MODE_ENV, EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser,
-    cleanup_open_tabs, close_target_via_cdp, data_url, field_str, run_live_smoke, stop_broker,
+    cleanup_open_tabs, close_target_via_cdp, field_str, run_live_smoke, stop_broker,
     tabs_include_id,
 };
 
@@ -162,7 +162,8 @@ fn explicit_focus_contract() -> Result<()> {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": open_tab.tab_id,
-                "selector": "#clicker"
+                "target": { "css": "#clicker" },
+                "observe": "none"
             }),
         ),
         (
@@ -200,7 +201,8 @@ fn explicit_focus_contract() -> Result<()> {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": open_tab.tab_id,
-                "selector": "#clicker"
+                "target": { "css": "#clicker" },
+                "observe": "none"
             }),
             Duration::from_secs(20),
             false,
@@ -311,6 +313,7 @@ enum Transition {
     ExternalCloseThenFocus { owner: Actor, tab: usize },
     Navigate { owner: Actor, tab: usize },
     Evaluate { owner: Actor, tab: usize },
+    SemanticFill { owner: Actor, tab: usize },
 }
 
 struct OwnershipModel;
@@ -342,6 +345,7 @@ impl ReferenceStateMachine for OwnershipModel {
                 (Some(owner), ModelTabState::Active) => {
                     choices.push(Just(Transition::Navigate { owner, tab }).boxed());
                     choices.push(Just(Transition::Evaluate { owner, tab }).boxed());
+                    choices.push(Just(Transition::SemanticFill { owner, tab }).boxed());
                     choices.push(Just(Transition::Release { owner, tab }).boxed());
                     choices.push(Just(Transition::Close { owner, tab }).boxed());
                     choices.push(Just(Transition::ExternalCloseThenFocus { owner, tab }).boxed());
@@ -397,7 +401,9 @@ impl ReferenceStateMachine for OwnershipModel {
             Transition::ExternalCloseThenFocus { tab, .. } => {
                 state.tabs[tab].state = ModelTabState::Missing;
             }
-            Transition::Navigate { .. } | Transition::Evaluate { .. } => {}
+            Transition::Navigate { .. }
+            | Transition::Evaluate { .. }
+            | Transition::SemanticFill { .. } => {}
         }
         state
     }
@@ -420,7 +426,8 @@ impl ReferenceStateMachine for OwnershipModel {
             | Transition::Close { owner, tab }
             | Transition::ExternalCloseThenFocus { owner, tab }
             | Transition::Navigate { owner, tab }
-            | Transition::Evaluate { owner, tab } => state
+            | Transition::Evaluate { owner, tab }
+            | Transition::SemanticFill { owner, tab } => state
                 .tabs
                 .get(tab)
                 .is_some_and(|tab| tab.state == ModelTabState::Active && tab.owner == Some(owner)),
@@ -545,6 +552,7 @@ impl BrowserMcpHarness {
             }
             Transition::Navigate { owner, tab } => self.navigate(owner, tab),
             Transition::Evaluate { owner, tab } => self.evaluate(owner, tab),
+            Transition::SemanticFill { owner, tab } => self.semantic_fill(owner, tab),
         }
     }
 
@@ -750,12 +758,13 @@ impl BrowserMcpHarness {
     fn navigate(&mut self, owner: Actor, tab: usize) -> Result<()> {
         let session_id = self.session(owner)?;
         let tab_id = self.tabs[tab].tab_id.clone();
+        let url = self.fixture.url("/page?property-navigation=1");
         let result = self.client_mut().call_tool(
             "navigate",
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab_id,
-                "url": data_url("VBL Property", "VBL Property"),
+                "url": url,
                 "timeout_ms": 10000
             }),
             Duration::from_secs(30),
@@ -783,6 +792,49 @@ impl BrowserMcpHarness {
         )?;
         if result.get("value").and_then(Value::as_i64) != Some(2) {
             bail!("evaluate returned an unexpected value: {result}");
+        }
+        Ok(())
+    }
+
+    fn semantic_fill(&mut self, owner: Actor, tab: usize) -> Result<()> {
+        let session_id = self.session(owner)?;
+        let tab_id = self.tabs[tab].tab_id.clone();
+        let snapshot = self.client_mut().call_tool(
+            "snapshot",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id,
+                "mode": "meaningful"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let tree = field_str(&snapshot, "tree")?;
+        let reference = snapshot_element_ref(&tree, "textbox")?;
+        self.client_mut().call_tool(
+            "fill",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id,
+                "target": { "ref": reference },
+                "value": "property value",
+                "observe": "diff"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let result = self.client_mut().call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id,
+                "expression": "document.querySelector('#entry').value"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        if result.get("value").and_then(Value::as_str) != Some("property value") {
+            bail!("semantic fill did not update the property fixture: {result}");
         }
         Ok(())
     }
@@ -908,6 +960,22 @@ fn assert_tool_error(value: &Value, expected: &str) -> Result<()> {
         bail!("expected tool error `{expected}`, got `{code}` in {value}");
     }
     Ok(())
+}
+
+fn snapshot_element_ref(tree: &str, marker: &str) -> Result<String> {
+    let line = tree
+        .lines()
+        .find(|line| line.contains(marker))
+        .with_context(|| format!("snapshot omitted `{marker}`:\n{tree}"))?;
+    let start = line
+        .find("[ref=")
+        .map(|index| index + 5)
+        .context("snapshot node omitted an element reference")?;
+    let end = line[start..]
+        .find(']')
+        .map(|index| start + index)
+        .context("snapshot element reference omitted closing bracket")?;
+    Ok(line[start..end].to_string())
 }
 
 fn repo_root() -> PathBuf {

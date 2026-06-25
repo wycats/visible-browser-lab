@@ -127,6 +127,8 @@ pub enum RecoveryAction {
     ReleaseTab,
     FocusTab,
     StartChrome,
+    Snapshot,
+    WaitFor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +170,10 @@ pub enum BrowserToolErrorCode {
     InvalidInput,
     OperationTimeout,
     FocusRequired,
+    ElementNotFound,
+    ElementAmbiguous,
+    ElementStale,
+    ElementNotActionable,
 }
 
 impl BrowserToolError {
@@ -227,6 +233,40 @@ impl BrowserToolError {
             code: BrowserToolErrorCode::TargetOwned,
             message: format!("Chrome target `{target_id}` is already leased"),
             recovery: Some(RecoveryAction::ListTabs),
+        }
+    }
+
+    pub fn element_not_found(target: &str) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ElementNotFound,
+            message: format!("no element matched `{target}`"),
+            recovery: Some(RecoveryAction::Snapshot),
+        }
+    }
+
+    pub fn element_ambiguous(target: &str, count: usize) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ElementAmbiguous,
+            message: format!("element target `{target}` matched {count} nodes"),
+            recovery: Some(RecoveryAction::Snapshot),
+        }
+    }
+
+    pub fn element_stale(reference: &str) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ElementStale,
+            message: format!(
+                "element reference `{reference}` is not valid for the active document"
+            ),
+            recovery: Some(RecoveryAction::Snapshot),
+        }
+    }
+
+    pub fn element_not_actionable(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ElementNotActionable,
+            message: message.into(),
+            recovery: Some(RecoveryAction::WaitFor),
         }
     }
 

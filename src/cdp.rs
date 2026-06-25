@@ -4,6 +4,10 @@ use chromiumoxide::{
     Browser,
     cdp::{
         browser_protocol::{
+            accessibility::{
+                AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
+            },
+            dom::{BackendNodeId, ResolveNodeParams},
             input::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, InsertTextParams, MouseButton,
@@ -15,14 +19,17 @@ use chromiumoxide::{
             },
             page::{
                 CaptureScreenshotFormat, CaptureScreenshotParams, EnableParams as PageEnableParams,
-                GetLayoutMetricsParams, Viewport,
+                Frame, FrameTree, GetFrameTreeParams, GetLayoutMetricsParams, Viewport,
             },
             target::{
                 ActivateTargetParams, CloseTargetParams, CreateTargetParams, GetTargetsParams,
                 TargetId,
             },
         },
-        js_protocol::runtime::{EnableParams as RuntimeEnableParams, EventConsoleApiCalled},
+        js_protocol::runtime::{
+            CallArgument, CallFunctionOnParams, EnableParams as RuntimeEnableParams,
+            EventConsoleApiCalled, RemoteObjectId,
+        },
     },
     error::CdpError,
     handler::HandlerConfig,
@@ -40,6 +47,7 @@ use url::Url;
 
 use crate::leases::{BrowserToolError, TabSnapshot};
 use crate::protocol::{EvaluateResult, NetworkEvent};
+use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
@@ -289,6 +297,83 @@ impl CdpClient {
         })
     }
 
+    pub async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let tree = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetFrameTreeParams::default()),
+                "read page frame tree",
+            )
+            .await?;
+        Ok(tree.result.frame_tree.frame.loader_id.as_ref().to_string())
+    }
+
+    pub async fn accessibility_snapshot(
+        &self,
+        target: &CdpTarget,
+        depth: usize,
+    ) -> Result<RawAxSnapshot, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(AccessibilityEnableParams::default()),
+                "enable accessibility snapshot",
+            )
+            .await?;
+        let frame_tree = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetFrameTreeParams::default()),
+                "read page frame tree",
+            )
+            .await?
+            .result
+            .frame_tree;
+        let mut frames = Vec::new();
+        flatten_frame_tree(&frame_tree, None, &mut frames);
+
+        let mut snapshot_frames = Vec::with_capacity(frames.len());
+        for (frame, parent_frame_id) in frames {
+            let response = self
+                .runtime
+                .page_command(
+                    &connection,
+                    page.execute(
+                        GetFullAxTreeParams::builder()
+                            .frame_id(frame.id.clone())
+                            .depth(depth as i64)
+                            .build(),
+                    ),
+                    "read accessibility tree",
+                )
+                .await?;
+            let frame_id = frame.id.as_ref().to_string();
+            snapshot_frames.push(RawAxFrame {
+                frame_id: frame_id.clone(),
+                parent_frame_id,
+                loader_id: frame.loader_id.as_ref().to_string(),
+                url: frame.url,
+                nodes: response
+                    .result
+                    .nodes
+                    .into_iter()
+                    .map(|node| raw_ax_node(node, &frame_id))
+                    .collect(),
+            });
+        }
+
+        let refreshed = self.page_target(&target.id).await?;
+        Ok(RawAxSnapshot {
+            title: refreshed.title,
+            url: refreshed.url,
+            frames: snapshot_frames,
+        })
+    }
+
     pub async fn has_focus(&self, target: &CdpTarget) -> Result<bool, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         match page
@@ -352,6 +437,132 @@ impl CdpClient {
         }
 
         Ok(())
+    }
+
+    pub async fn click_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let point = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  this.scrollIntoView({ block: "center", inline: "center" });
+  const rect = this.getBoundingClientRect();
+  const style = this.ownerDocument.defaultView.getComputedStyle(this);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return { state: "hidden" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = this.ownerDocument.elementFromPoint(x, y);
+  if (hit !== this && !this.contains(hit)) return { state: "obscured" };
+  return { state: "ready", found: true, visible: true, x, y };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        let point = actionable_point(point)?;
+        self.dispatch_click(&page, &connection, point).await
+    }
+
+    pub async fn fill_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let result = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                r#"function(value) {
+  if (!this.isConnected) return { state: "stale" };
+  const rect = this.getBoundingClientRect();
+  const style = this.ownerDocument.defaultView.getComputedStyle(this);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none") return { state: "hidden" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if (!(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable)) return { state: "not_editable" };
+  if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) {
+    const prototype = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value").set;
+    setter.call(this, value);
+  } else {
+    this.textContent = value;
+  }
+  this.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+  return { state: "ready" };
+}"#,
+                vec![CallArgument::builder().value(value).build()],
+            )
+            .await?;
+        actionable_state(result)
+    }
+
+    pub async fn fill_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        value: &str,
+    ) -> Result<(), BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let value_json = serde_json::to_string(value)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+  const selector = {selector_json};
+  const value = {value_json};
+  const matches = document.querySelectorAll(selector);
+  if (matches.length === 0) return {{ state: "not_found" }};
+  if (matches.length > 1) return {{ state: "ambiguous", count: matches.length }};
+  const element = matches[0];
+  if (!element.isConnected) return {{ state: "stale" }};
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none") return {{ state: "hidden" }};
+  if (element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") return {{ state: "disabled" }};
+  if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable)) return {{ state: "not_editable" }};
+  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {{
+    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, "value").set.call(element, value);
+  }} else {{
+    element.textContent = value;
+  }}
+  element.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+  element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  return {{ state: "ready" }};
+}})()"#
+        );
+        let (page, _connection) = self.page(&target.id).await?;
+        let result = page
+            .evaluate_expression(expression)
+            .await
+            .map_err(|error| map_cdp_error("fill CSS target", &error))?;
+        let result = result.value().cloned().ok_or_else(|| {
+            BrowserToolError::chrome_unavailable("fill CSS target omitted result")
+        })?;
+        match result.get("state").and_then(Value::as_str) {
+            Some("not_found") => Err(BrowserToolError::element_not_found(selector)),
+            Some("ambiguous") => Err(BrowserToolError::element_ambiguous(
+                selector,
+                result.get("count").and_then(Value::as_u64).unwrap_or(2) as usize,
+            )),
+            _ => actionable_state(result),
+        }
     }
 
     pub async fn type_text(&self, target: &CdpTarget, text: &str) -> Result<(), BrowserToolError> {
@@ -500,6 +711,111 @@ impl CdpClient {
         }
     }
 
+    async fn resolve_backend_node(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        backend_node_id: i64,
+    ) -> Result<RemoteObjectId, BrowserToolError> {
+        let resolved = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    ResolveNodeParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build(),
+                ),
+                "resolve element reference",
+            )
+            .await
+            .map_err(|error| match error.code {
+                crate::leases::BrowserToolErrorCode::ChromeUnavailable => {
+                    BrowserToolError::element_stale("resolved node")
+                }
+                _ => error,
+            })?;
+        resolved
+            .result
+            .object
+            .object_id
+            .ok_or_else(|| BrowserToolError::element_stale("resolved node"))
+    }
+
+    async fn call_on_element(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+        function: &str,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, BrowserToolError> {
+        let response = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    CallFunctionOnParams::builder()
+                        .function_declaration(function)
+                        .object_id(object_id)
+                        .arguments(arguments)
+                        .return_by_value(true)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "inspect referenced element",
+            )
+            .await?;
+        if let Some(exception) = response.result.exception_details {
+            return Err(BrowserToolError::element_not_actionable(format!(
+                "element operation failed: {}",
+                exception.text
+            )));
+        }
+        response.result.result.value.ok_or_else(|| {
+            BrowserToolError::chrome_unavailable("element operation omitted its result")
+        })
+    }
+
+    async fn dispatch_click(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        point: ClickPoint,
+    ) -> Result<(), BrowserToolError> {
+        for event in [
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::None)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(point.x)
+                .y(point.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+        ] {
+            self.runtime
+                .page_command(
+                    connection,
+                    page.execute(event.map_err(BrowserToolError::invalid_input)?),
+                    "dispatch mouse input",
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn selector_point(
         &self,
         page: &Page,
@@ -513,14 +829,15 @@ impl CdpClient {
         let expression = format!(
             r#"(() => {{
   const selector = {selector_json};
-  const element = document.querySelector(selector);
-  if (!element) return {{ found: false, visible: false }};
+  const matches = document.querySelectorAll(selector);
+  if (matches.length !== 1) return {{ found: matches.length > 0, visible: false, count: matches.length }};
+  const element = matches[0];
   element.scrollIntoView({{ block: "center", inline: "center" }});
   const rect = element.getBoundingClientRect();
   const style = window.getComputedStyle(element);
   const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") !== 0;
   if (!visible) return {{ found: true, visible: false }};
-  return {{ found: true, visible: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
+  return {{ found: true, visible: true, count: 1, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
 }})()"#
         );
         let end = Instant::now() + deadline;
@@ -810,6 +1127,17 @@ fn click_point(value: Option<Value>) -> Result<Option<ClickPoint>, BrowserToolEr
     let Some(value) = value else {
         return Ok(None);
     };
+    if let Some(count) = value.get("count").and_then(Value::as_u64) {
+        if count == 0 {
+            return Err(BrowserToolError::element_not_found("CSS selector"));
+        }
+        if count > 1 {
+            return Err(BrowserToolError::element_ambiguous(
+                "CSS selector",
+                count as usize,
+            ));
+        }
+    }
     if !value.get("found").and_then(Value::as_bool).unwrap_or(false)
         || !value
             .get("visible")
@@ -828,6 +1156,106 @@ fn click_point(value: Option<Value>) -> Result<Option<ClickPoint>, BrowserToolEr
         .and_then(Value::as_f64)
         .ok_or_else(|| BrowserToolError::chrome_unavailable("selector result omitted y"))?;
     Ok(Some(ClickPoint { x, y }))
+}
+
+fn actionable_point(value: Value) -> Result<ClickPoint, BrowserToolError> {
+    actionable_state(value.clone())?;
+    let x = value
+        .get("x")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| BrowserToolError::chrome_unavailable("element result omitted x"))?;
+    let y = value
+        .get("y")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| BrowserToolError::chrome_unavailable("element result omitted y"))?;
+    Ok(ClickPoint { x, y })
+}
+
+fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
+    match value.get("state").and_then(Value::as_str) {
+        Some("ready") => Ok(()),
+        Some("stale") => Err(BrowserToolError::element_stale("referenced element")),
+        Some("hidden") => Err(BrowserToolError::element_not_actionable(
+            "element is not visible",
+        )),
+        Some("disabled") => Err(BrowserToolError::element_not_actionable(
+            "element is disabled",
+        )),
+        Some("obscured") => Err(BrowserToolError::element_not_actionable(
+            "element is obscured at its action point",
+        )),
+        Some("not_editable") => Err(BrowserToolError::element_not_actionable(
+            "element is not editable",
+        )),
+        Some(state) => Err(BrowserToolError::chrome_unavailable(format!(
+            "element operation returned unknown state `{state}`"
+        ))),
+        None => Err(BrowserToolError::chrome_unavailable(
+            "element operation omitted its state",
+        )),
+    }
+}
+
+fn flatten_frame_tree(
+    tree: &FrameTree,
+    parent_frame_id: Option<String>,
+    output: &mut Vec<(Frame, Option<String>)>,
+) {
+    let frame_id = tree.frame.id.as_ref().to_string();
+    output.push((tree.frame.clone(), parent_frame_id));
+    if let Some(children) = &tree.child_frames {
+        for child in children {
+            flatten_frame_tree(child, Some(frame_id.clone()), output);
+        }
+    }
+}
+
+fn raw_ax_node(node: AxNode, containing_frame_id: &str) -> RawAxNode {
+    RawAxNode {
+        node_id: node.node_id.as_ref().to_string(),
+        parent_id: node.parent_id.map(|id| id.as_ref().to_string()),
+        child_ids: node
+            .child_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.as_ref().to_string())
+            .collect(),
+        backend_node_id: node.backend_dom_node_id.map(|id| *id.inner()),
+        frame_id: node
+            .frame_id
+            .map(|id| id.as_ref().to_string())
+            .unwrap_or_else(|| containing_frame_id.to_string()),
+        role: node
+            .role
+            .as_ref()
+            .and_then(ax_value_text)
+            .unwrap_or_default(),
+        name: node
+            .name
+            .as_ref()
+            .and_then(ax_value_text)
+            .unwrap_or_default(),
+        value: node.value.as_ref().and_then(ax_value_text),
+        properties: node
+            .properties
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|property| {
+                ax_value_text(&property.value)
+                    .map(|value| (property.name.as_ref().to_string(), value))
+            })
+            .collect(),
+        ignored: node.ignored,
+    }
+}
+
+fn ax_value_text(value: &AxValue) -> Option<String> {
+    match value.value.as_ref()? {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        other => serde_json::to_string(other).ok(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,6 +1594,28 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(point, ClickPoint { x: 12.5, y: 30.0 });
+
+        let missing = click_point(Some(json!({
+            "found": false,
+            "visible": false,
+            "count": 0
+        })))
+        .unwrap_err();
+        assert_eq!(
+            missing.code,
+            crate::leases::BrowserToolErrorCode::ElementNotFound
+        );
+
+        let ambiguous = click_point(Some(json!({
+            "found": true,
+            "visible": false,
+            "count": 2
+        })))
+        .unwrap_err();
+        assert_eq!(
+            ambiguous.code,
+            crate::leases::BrowserToolErrorCode::ElementAmbiguous
+        );
     }
 
     #[test]

@@ -395,12 +395,88 @@ pub fn run_live_smoke(
         bail!("evaluate did not return the expected JSON value: {evaluated}");
     }
 
+    let snapshot = client.call_tool(
+        "snapshot",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "mode": "meaningful"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let tree = field_str(&snapshot, "tree")?;
+    let button_ref = snapshot_ref(&tree, "button \"Click\"")?;
+    let textbox_ref = snapshot_ref(&tree, "textbox")?;
+    let frame_textbox_ref = snapshot_ref(&tree, "textbox \"Frame value\"")?;
+
+    let fill_result = client.call_tool(
+        "fill",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
+            "value": "semantic fill",
+            "observe": "diff"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if fill_result
+        .get("observation")
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_str)
+        != Some("diff")
+    {
+        bail!("fill did not return the requested accessibility diff: {fill_result}");
+    }
+    let filled = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "document.querySelector('#entry').value"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if filled.get("value").and_then(Value::as_str) != Some("semantic fill") {
+        bail!("fill did not update the referenced input: {filled}");
+    }
+
+    client.call_tool(
+        "fill",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": frame_textbox_ref },
+            "value": "inside frame",
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let frame_value = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "document.querySelector('iframe').contentDocument.querySelector('#frame-entry').value"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if frame_value.get("value").and_then(Value::as_str) != Some("inside frame") {
+        bail!("fill did not resolve the iframe element reference: {frame_value}");
+    }
+
     client.call_tool(
         "click",
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "selector": "#clicker",
+            "target": { "ref": button_ref },
+            "observe": "diff",
             "timeout_ms": 5000
         }),
         Duration::from_secs(20),
@@ -421,11 +497,49 @@ pub fn run_live_smoke(
     }
 
     client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "expression": "document.querySelector('#clicker').remove()"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let removed = client.call_tool(
         "click",
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "selector": "#entry",
+            "target": { "ref": button_ref },
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        true,
+    )?;
+    if field_str(&removed, "code")? != "element_stale" {
+        bail!("removed DOM node did not invalidate its element reference: {removed}");
+    }
+
+    client.call_tool(
+        "fill",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
+            "value": "",
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
+            "observe": "none",
             "timeout_ms": 5000
         }),
         Duration::from_secs(20),
@@ -486,9 +600,38 @@ pub fn run_live_smoke(
         "/data.json",
     )?;
 
+    client.call_tool(
+        "navigate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "url": fixture.url("/page?revision=2"),
+            "timeout_ms": 10000
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
+    let stale = client.call_tool(
+        "fill",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
+            "value": "stale",
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        true,
+    )?;
+    if field_str(&stale, "code")? != "element_stale" {
+        bail!("navigation did not invalidate the prior element reference: {stale}");
+    }
+
     for tool in [
+        "snapshot",
         "evaluate",
         "click",
+        "fill",
         "type_text",
         "press_key",
         "console_messages",
@@ -500,10 +643,22 @@ pub fn run_live_smoke(
                 "tab_id": second_open_tab.tab_id,
                 "expression": "1 + 1"
             }),
+            "snapshot" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id
+            }),
             "click" => json!({
                 "agent_session_id": first_session,
                 "tab_id": second_open_tab.tab_id,
-                "selector": "body"
+                "target": { "css": "body" },
+                "observe": "none"
+            }),
+            "fill" => json!({
+                "agent_session_id": first_session,
+                "tab_id": second_open_tab.tab_id,
+                "target": { "ref": textbox_ref },
+                "value": "x",
+                "observe": "none"
             }),
             "type_text" => json!({
                 "agent_session_id": first_session,
@@ -700,7 +855,9 @@ pub const EXPECTED_TOOLS: &[&str] = &[
     "navigate",
     "screenshot",
     "evaluate",
+    "snapshot",
     "click",
+    "fill",
     "type_text",
     "press_key",
     "console_messages",
@@ -875,12 +1032,20 @@ fn handle_fixture_connection(mut stream: TcpStream) {
 
     let (content_type, body) = match path {
         "/data.json" => ("application/json", r#"{"ok":true}"#.to_string()),
+        "/frame" => (
+            "text/html; charset=utf-8",
+            r#"<!doctype html>
+<title>Frame Fixture</title>
+<label>Frame value <input id="frame-entry" /></label>"#
+                .to_string(),
+        ),
         _ => (
             "text/html; charset=utf-8",
             r#"<!doctype html>
 <title>VBL Fixture</title>
 <button id="clicker" onclick="document.body.dataset.clicked='yes'; console.log('vbl-clicked')">Click</button>
 <input id="entry" />
+<iframe src="/frame" title="Embedded fixture"></iframe>
 <script>
 document.querySelector('#entry').addEventListener('keydown', (event) => {
   document.body.dataset.key = event.key;
@@ -1305,6 +1470,22 @@ pub fn field_str(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .with_context(|| format!("missing string field `{field}` in {value}"))
+}
+
+fn snapshot_ref(tree: &str, marker: &str) -> Result<String> {
+    let line = tree
+        .lines()
+        .find(|line| line.contains(marker))
+        .with_context(|| format!("snapshot omitted `{marker}`:\n{tree}"))?;
+    let start = line
+        .find("[ref=")
+        .map(|index| index + 5)
+        .with_context(|| format!("snapshot node `{marker}` omitted an element reference"))?;
+    let end = line[start..]
+        .find(']')
+        .map(|index| start + index)
+        .context("snapshot element reference omitted closing bracket")?;
+    Ok(line[start..end].to_string())
 }
 
 pub fn data_url(title: &str, body: &str) -> String {
