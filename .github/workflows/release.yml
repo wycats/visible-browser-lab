@@ -229,7 +229,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y openbox xvfb
 
       - name: Download trusted Codex CLI package
         shell: bash
@@ -287,10 +287,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="out/packages/visible-browser-lab-codex-${VISIBLE_BROWSER_LAB_RELEASE_VERSION}-x86_64-unknown-linux-musl.zip"
-          xvfb-run -a cargo xtask install-smoke \
-            --archive "$archive" \
-            --codex dist/codex/bin/codex
+          xvfb-run -a -s "-screen 0 1280x1024x24" bash -c '
+            set -euo pipefail
+            openbox --sm-disable >"$RUNNER_TEMP/openbox.log" 2>&1 &
+            openbox_pid=$!
+            trap "kill $openbox_pid 2>/dev/null || true" EXIT
+            archive="out/packages/visible-browser-lab-codex-${VISIBLE_BROWSER_LAB_RELEASE_VERSION}-x86_64-unknown-linux-musl.zip"
+            cargo xtask install-smoke \
+              --archive "$archive" \
+              --codex dist/codex/bin/codex
+          '
 
       - name: Upload release assets artifact
         uses: actions/upload-artifact@v7
