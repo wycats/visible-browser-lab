@@ -255,17 +255,16 @@ fn safe_workspace_destination(
     workspace_root: &Path,
     requested_path: &Path,
 ) -> Result<PathBuf, BrowserToolError> {
+    if requested_path.is_absolute() {
+        return Err(BrowserToolError::path_outside_workspace(requested_path));
+    }
     if requested_path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
         return Err(BrowserToolError::path_outside_workspace(requested_path));
     }
-    let destination = if requested_path.is_absolute() {
-        requested_path.to_path_buf()
-    } else {
-        workspace_root.join(requested_path)
-    };
+    let destination = workspace_root.join(requested_path);
     let parent = destination
         .parent()
         .ok_or_else(|| BrowserToolError::path_outside_workspace(requested_path))?;
@@ -348,6 +347,17 @@ mod tests {
                     &artifact.artifact_id,
                     workspace.path(),
                     Path::new("../outside.json"),
+                    false,
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .export(
+                    &session,
+                    &artifact.artifact_id,
+                    workspace.path(),
+                    &workspace.path().join("absolute.json"),
                     false,
                 )
                 .is_err()
