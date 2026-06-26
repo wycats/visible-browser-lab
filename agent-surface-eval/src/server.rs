@@ -28,6 +28,7 @@ pub struct EvaluationServer {
     log_path: Arc<PathBuf>,
     tools: Arc<Vec<Tool>>,
     calls: Arc<Mutex<Vec<LoggedCall>>>,
+    log_lock: Arc<Mutex<()>>,
 }
 
 impl EvaluationServer {
@@ -48,19 +49,22 @@ impl EvaluationServer {
             log_path: Arc::new(log_path),
             tools: Arc::new(tools),
             calls: Arc::new(Mutex::new(Vec::new())),
+            log_lock: Arc::new(Mutex::new(())),
         })
     }
 
     fn append_call(&self, call: &LoggedCall) -> Result<()> {
+        let _guard = self.log_lock.lock().expect("evaluation log lock poisoned");
         if let Some(parent) = self.log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut record = serde_json::to_vec(call)?;
+        record.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.log_path.as_ref())?;
-        serde_json::to_writer(&mut file, call)?;
-        file.write_all(b"\n")?;
+        file.write_all(&record)?;
         Ok(())
     }
 
@@ -548,5 +552,50 @@ mod tests {
         let call: LoggedCall =
             serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
         assert!(!call.backend_action);
+    }
+
+    #[test]
+    fn concurrent_log_appends_remain_complete_jsonl_records() {
+        let temp = tempdir().unwrap();
+        let log = temp.path().join("calls.jsonl");
+        let server = EvaluationServer::new("console-error-diagnosis", log.clone()).unwrap();
+        const WORKERS: usize = 8;
+        const RECORDS_PER_WORKER: usize = 25;
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let server = server.clone();
+                scope.spawn(move || {
+                    for record in 0..RECORDS_PER_WORKER {
+                        server
+                            .append_call(&LoggedCall {
+                                tool: format!("worker-{worker}-record-{record}"),
+                                operation: None,
+                                css_fallback: false,
+                                evaluate_fallback: false,
+                                foreign_attempt: false,
+                                backend_action: true,
+                                ownership_refused: false,
+                            })
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let contents = std::fs::read_to_string(log).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<LoggedCall>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), WORKERS * RECORDS_PER_WORKER);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.tool.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            WORKERS * RECORDS_PER_WORKER
+        );
     }
 }
