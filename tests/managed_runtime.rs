@@ -57,6 +57,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
+                "action": "url",
                 "url": fixture.url("/managed-navigation"),
                 "wait_until": "load"
             }),
@@ -78,7 +79,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
-                "expression": "document.querySelector('#entry').focus()"
+                "source": "document.querySelector('#entry').focus()"
             }),
             Duration::from_secs(20),
             false,
@@ -88,20 +89,21 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
                 "text": "managed background text"
             }),
             Duration::from_secs(20),
             false,
         )?;
         client.call_tool(
-            "console_messages",
-            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
+            "console",
+            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id, "operation": "list" }),
             Duration::from_secs(20),
             false,
         )?;
         client.call_tool(
-            "network_events",
-            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
+            "network",
+            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id, "operation": "list" }),
             Duration::from_secs(20),
             false,
         )?;
@@ -110,7 +112,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
-                "expression": "document.hasFocus() && document.visibilityState === 'visible'"
+                "source": "document.hasFocus() && document.visibilityState === 'visible'"
             }),
             Duration::from_secs(20),
             false,

@@ -663,7 +663,7 @@ fn install_smoke(args: InstallSmokeArgs) -> Result<()> {
                 active_port.display()
             );
         }
-        if !state_dir.join("broker-v2.pid").is_file() {
+        if !state_dir.join("broker-v3.pid").is_file() {
             bail!(
                 "broker did not use the disposable state directory `{}`",
                 state_dir.display()
@@ -951,7 +951,7 @@ fn run_installed_facade_lifecycle(
         json!({
             "agent_session_id": session_id,
             "tab_id": tab.tab_id,
-            "expression": "document.title"
+            "source": "document.title"
         }),
         Duration::from_secs(20),
         false,

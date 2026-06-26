@@ -3,10 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    catalog::DOMAIN_OPERATIONS,
-    fixtures::{ExpectedCall, Fixture},
-};
+use agent_surface_contract::DOMAIN_OPERATIONS;
+
+use crate::fixtures::{ExpectedCall, Fixture};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggedCall {

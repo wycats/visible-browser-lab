@@ -1,42 +1,72 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use anyhow::Result;
+use agent_surface_contract::{SERVER_INSTRUCTIONS, hybrid_catalog};
+use anyhow::{Context, Result};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, JsonObject, Meta, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResult, JsonObject, ListToolsResult, Meta,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    },
     service::RequestContext,
-    tool, tool_handler, tool_router,
     transport::stdio,
 };
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+
+use crate::{broker, config::RuntimeConfig, leases::BrowserToolError, protocol::BrokerResponse};
 
 const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-use serde::Serialize;
-use serde_json::Value;
+const PRODUCTION_TOOLS: &[&str] = &[
+    "start_session",
+    "list_tabs",
+    "new_tab",
+    "claim_tab",
+    "release_tab",
+    "focus_tab",
+    "close_tab",
+    "snapshot",
+    "navigate",
+    "wait_for",
+    "click",
+    "fill",
+    "fill_form",
+    "type_text",
+    "press_key",
+    "screenshot",
+    "evaluate",
+    "interact",
+    "console",
+    "network",
+    "emulation",
+    "performance",
+    "audit",
+    "memory",
+    "screencast",
+    "artifacts",
+    "help",
+];
 
-use crate::{
-    broker,
-    config::RuntimeConfig,
-    leases::BrowserToolError,
-    protocol::{
-        BrokerResponse, ClaimTabParams, ClickParams, DiagnosticsParams, EvaluateParams, FillParams,
-        ListTabsParams, NavigateParams, NewTabParams, PressKeyParams, ScreenshotParams,
-        SnapshotParams, StartSessionParams, TabActionParams, TypeTextParams,
-    },
-};
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct VisibleBrowserLab {
     config: RuntimeConfig,
-    tool_router: ToolRouter<Self>,
+    tools: Arc<Vec<Tool>>,
 }
 
 impl VisibleBrowserLab {
-    fn new(config: RuntimeConfig) -> Self {
-        Self {
+    fn new(config: RuntimeConfig) -> Result<Self> {
+        let tools = hybrid_catalog()
+            .into_iter()
+            .filter(|definition| PRODUCTION_TOOLS.contains(&definition.name.as_str()))
+            .map(|definition| {
+                serde_json::from_value(serde_json::to_value(definition)?)
+                    .context("agent surface definition is not a valid MCP tool")
+            })
+            .collect::<Result<Vec<Tool>>>()?;
+        Ok(Self {
             config,
-            tool_router: Self::tool_router(),
-        }
+            tools: Arc::new(tools),
+        })
     }
 
     async fn call_broker<P>(&self, method: &str, params: P) -> CallToolResult
@@ -82,155 +112,48 @@ impl VisibleBrowserLab {
                 ))
             })
     }
-}
 
-#[tool_router]
-impl VisibleBrowserLab {
-    #[tool(
-        name = "start_session",
-        description = "Start a visible-browser session and optionally create the first leased tab."
-    )]
-    async fn start_session(
-        &self,
-        context: RequestContext<RoleServer>,
-        params: Parameters<StartSessionParams>,
-    ) -> CallToolResult {
-        if let Some(workspace) = codex_workspace_cwd(&context.meta) {
-            tracing::debug!(workspace, "received Codex workspace context");
+    fn help(arguments: &Map<String, Value>) -> CallToolResult {
+        let topic = arguments
+            .get("topic")
+            .and_then(Value::as_str)
+            .unwrap_or("workflow");
+        let operation = arguments.get("operation").and_then(Value::as_str);
+        let (preferred_tools, guidance) = help_content(topic, operation);
+        let preferred_tool = preferred_tools.first().copied().unwrap_or("help");
+        let result_schema = hybrid_catalog()
+            .into_iter()
+            .find(|tool| tool.name == preferred_tool)
+            .map(|tool| tool.output_schema)
+            .unwrap_or_else(|| json!({}));
+        let preferred = operation.map_or_else(
+            || json!({"tool": preferred_tool, "reason": guidance}),
+            |operation| json!({"tool": preferred_tool, "operation": operation, "reason": guidance}),
+        );
+        let neighbors = preferred_tools
+            .iter()
+            .skip(1)
+            .map(|tool| json!({"tool": tool, "use_when": format!("Use `{tool}` when it is the narrowest operation for the task.")}))
+            .collect::<Vec<_>>();
+        let mut response = json!({
+            "topic": topic,
+            "task": guidance,
+            "preferred": preferred,
+            "neighbors": neighbors,
+            "example": {"tool": preferred_tool, "arguments": {}},
+            "result_schema": result_schema,
+            "errors": [
+                {"code":"focus_required", "recovery":"Call focus_tab for the owned tab and retry native input."},
+                {"code":"element_stale", "recovery":"Call snapshot and use a reference from the active document."}
+            ]
+        });
+        if let Some(operation) = operation {
+            response["operation"] = Value::String(operation.to_string());
         }
-        self.call_broker("start_session", params.0).await
-    }
-
-    #[tool(
-        name = "list_tabs",
-        description = "List tabs owned by this session by default, or request a read-only global inventory."
-    )]
-    async fn list_tabs(&self, params: Parameters<ListTabsParams>) -> CallToolResult {
-        self.call_broker("list_tabs", params.0).await
-    }
-
-    #[tool(
-        name = "new_tab",
-        description = "Create a new visible Chrome tab and lease it to this session."
-    )]
-    async fn new_tab(&self, params: Parameters<NewTabParams>) -> CallToolResult {
-        self.call_broker("new_tab", params.0).await
-    }
-
-    #[tool(
-        name = "claim_tab",
-        description = "Claim an unowned visible Chrome target. Set takeover only with explicit user instruction."
-    )]
-    async fn claim_tab(&self, params: Parameters<ClaimTabParams>) -> CallToolResult {
-        self.call_broker("claim_tab", params.0).await
-    }
-
-    #[tool(
-        name = "release_tab",
-        description = "Release an owned tab lease while leaving the Chrome tab open and claimable."
-    )]
-    async fn release_tab(&self, params: Parameters<TabActionParams>) -> CallToolResult {
-        self.call_broker("release_tab", params.0).await
-    }
-
-    #[tool(
-        name = "focus_tab",
-        description = "Focus an active tab owned by this session."
-    )]
-    async fn focus_tab(&self, params: Parameters<TabActionParams>) -> CallToolResult {
-        self.call_broker("focus_tab", params.0).await
-    }
-
-    #[tool(
-        name = "navigate",
-        description = "Navigate an active tab owned by this session and wait for page load."
-    )]
-    async fn navigate(&self, params: Parameters<NavigateParams>) -> CallToolResult {
-        self.call_broker("navigate", params.0).await
-    }
-
-    #[tool(
-        name = "screenshot",
-        description = "Capture a PNG screenshot from an active tab owned by this session."
-    )]
-    async fn screenshot(&self, params: Parameters<ScreenshotParams>) -> CallToolResult {
-        self.call_broker("screenshot", params.0).await
-    }
-
-    #[tool(
-        name = "evaluate",
-        description = "Evaluate JavaScript in an active tab owned by this session."
-    )]
-    async fn evaluate(&self, params: Parameters<EvaluateParams>) -> CallToolResult {
-        self.call_broker("evaluate", params.0).await
-    }
-
-    #[tool(
-        name = "snapshot",
-        description = "Inspect user-perceivable page structure and obtain lease-scoped element references."
-    )]
-    async fn snapshot(&self, params: Parameters<SnapshotParams>) -> CallToolResult {
-        self.call_broker("snapshot", params.0).await
-    }
-
-    #[tool(
-        name = "click",
-        description = "Click one referenced element after ownership and actionability checks, or one explicit CSS selector after strict single-match and visibility checks."
-    )]
-    async fn click(&self, params: Parameters<ClickParams>) -> CallToolResult {
-        self.call_broker("click", params.0).await
-    }
-
-    #[tool(
-        name = "fill",
-        description = "Replace the value of one referenced editable control without activating Chrome."
-    )]
-    async fn fill(&self, params: Parameters<FillParams>) -> CallToolResult {
-        self.call_broker("fill", params.0).await
-    }
-
-    #[tool(
-        name = "type_text",
-        description = "Insert text into the focused element in an active tab owned by this session."
-    )]
-    async fn type_text(&self, params: Parameters<TypeTextParams>) -> CallToolResult {
-        self.call_broker("type_text", params.0).await
-    }
-
-    #[tool(
-        name = "press_key",
-        description = "Dispatch one printable or common named key in an active tab owned by this session."
-    )]
-    async fn press_key(&self, params: Parameters<PressKeyParams>) -> CallToolResult {
-        self.call_broker("press_key", params.0).await
-    }
-
-    #[tool(
-        name = "console_messages",
-        description = "Read buffered console messages for an active tab owned by this session."
-    )]
-    async fn console_messages(&self, params: Parameters<DiagnosticsParams>) -> CallToolResult {
-        self.call_broker("console_messages", params.0).await
-    }
-
-    #[tool(
-        name = "network_events",
-        description = "Read buffered network events for an active tab owned by this session."
-    )]
-    async fn network_events(&self, params: Parameters<DiagnosticsParams>) -> CallToolResult {
-        self.call_broker("network_events", params.0).await
-    }
-
-    #[tool(
-        name = "close_tab",
-        description = "Close an owned Chrome tab and mark its lease closed."
-    )]
-    async fn close_tab(&self, params: Parameters<TabActionParams>) -> CallToolResult {
-        self.call_broker("close_tab", params.0).await
+        CallToolResult::structured(response)
     }
 }
 
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for VisibleBrowserLab {
     fn get_info(&self) -> ServerInfo {
         let mut capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -238,25 +161,70 @@ impl ServerHandler for VisibleBrowserLab {
             CODEX_SANDBOX_STATE_META_CAPABILITY.to_string(),
             JsonObject::new(),
         )]));
-        ServerInfo::new(capabilities)
-            .with_instructions("Use start_session first and retain its agent_session_id. Act only through tab_id values owned by that session. Inspect unfamiliar pages with snapshot, then pass its element references to click or fill. Use focus_tab before trusted pointer or keyboard input when an action returns focus_required.")
+        ServerInfo::new(capabilities).with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult::with_all_items(self.tools.as_ref().clone()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools.iter().find(|tool| tool.name == name).cloned()
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let name = request.name.as_ref();
+        if !self.tools.iter().any(|tool| tool.name == request.name) {
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "unsupported_operation",
+                "message": format!("unknown tool `{name}`"),
+                "recovery": "help",
+            })));
+        }
+
+        let mut arguments = request.arguments.unwrap_or_default();
+        if name == "help" {
+            return Ok(Self::help(&arguments));
+        }
+        if name == "start_session"
+            && let Some(workspace_root) = workspace_root(&context.meta)
+        {
+            arguments.insert("workspace_root".to_string(), Value::String(workspace_root));
+        }
+
+        Ok(self.call_broker(name, Value::Object(arguments)).await)
     }
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
-    let server = VisibleBrowserLab::new(config);
+    let server = VisibleBrowserLab::new(config)?;
     server.serve(stdio()).await?.waiting().await?;
     Ok(())
 }
 
 fn structured_browser_error(error: BrowserToolError) -> CallToolResult {
     let value = serde_json::to_value(error).unwrap_or_else(|serialization_error| {
-        serde_json::json!({
+        json!({
             "code": "invalid_input",
             "message": format!("failed to serialize browser error: {serialization_error}")
         })
     });
     CallToolResult::structured_error(value)
+}
+
+fn workspace_root(meta: &Meta) -> Option<String> {
+    codex_workspace_cwd(meta)
+        .map(ToOwned::to_owned)
+        .or_else(|| non_empty_env("CLAUDE_PROJECT_DIR"))
+        .or_else(|| non_empty_env("VISIBLE_BROWSER_LAB_WORKSPACE_ROOT"))
 }
 
 fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
@@ -266,27 +234,108 @@ fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
         .as_str()
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, String) {
+    let (tools, guidance) = match topic {
+        "tabs" => (
+            vec!["start_session", "list_tabs", "new_tab", "claim_tab"],
+            "Start one session, use its owned tab handles, and inspect global_readonly only when choosing a target to claim.",
+        ),
+        "snapshot" => (
+            vec!["snapshot"],
+            "Inspect the accessibility tree and retain its short element references for semantic actions.",
+        ),
+        "interaction" => (
+            vec!["click", "fill", "fill_form", "type_text", "press_key"],
+            "Use snapshot references for interaction. Focus the tab only when native pointer or keyboard input reports focus_required.",
+        ),
+        "navigation" => (
+            vec!["navigate", "wait_for"],
+            "Navigate by URL, history, or reload, then wait for the semantic state that completes the task.",
+        ),
+        "diagnostics" => (
+            vec!["console", "network"],
+            "Inspect structured console and network records by stable lease-scoped identifiers.",
+        ),
+        "emulation" => (
+            vec!["emulation"],
+            "Apply target-scoped emulation and use reset to restore normal browser behavior.",
+        ),
+        "performance" => (
+            vec!["performance"],
+            "Capture a trace or read web vitals, then analyze the resulting trace artifact.",
+        ),
+        "audit" => (
+            vec!["audit"],
+            "Run the requested accessibility, SEO, best-practices, or agentic-browsing checks.",
+        ),
+        "memory" => (
+            vec!["memory"],
+            "Capture a heap snapshot, query its bounded graph views, and close it when analysis is complete.",
+        ),
+        "screencast" => (
+            vec!["screencast"],
+            "Start and explicitly stop a silent WebM recording while the tab remains owned.",
+        ),
+        "artifacts" => (
+            vec!["artifacts"],
+            "Inspect session-owned artifact metadata, read bounded ranges, or export within the session workspace.",
+        ),
+        "errors" => (
+            vec!["help", "snapshot", "list_tabs"],
+            "Follow the structured recovery field, refreshing snapshots after stale references and listings after lease changes.",
+        ),
+        _ => (
+            vec!["start_session", "snapshot", "help"],
+            "Start a session, inspect the page semantically, choose the narrowest action tool, and close or release each owned tab.",
+        ),
+    };
+    let suffix = operation
+        .map(|operation| format!(" Requested operation: `{operation}`."))
+        .unwrap_or_default();
+    (tools, format!("{guidance}{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn advertises_and_reads_codex_workspace_metadata() {
+    fn advertises_core_contract_and_reads_codex_workspace_metadata() {
         let config = RuntimeConfig::managed(std::path::PathBuf::from("/tmp/vbl-mcp"), None);
-        let info = VisibleBrowserLab::new(config).get_info();
+        let server = VisibleBrowserLab::new(config).unwrap();
+        let info = server.get_info();
+        assert_eq!(server.tools.len(), 27);
+        assert_eq!(server.tools.len(), PRODUCTION_TOOLS.len());
         assert!(
-            info.capabilities
-                .experimental
-                .as_ref()
-                .is_some_and(|capabilities| {
-                    capabilities.contains_key(CODEX_SANDBOX_STATE_META_CAPABILITY)
-                })
+            PRODUCTION_TOOLS
+                .iter()
+                .all(|name| server.get_tool(name).is_some())
+        );
+        assert!(
+            info.capabilities.experimental.as_ref().is_some_and(
+                |capabilities| capabilities.contains_key(CODEX_SANDBOX_STATE_META_CAPABILITY)
+            )
         );
 
         let meta = Meta(serde_json::Map::from_iter([(
             CODEX_SANDBOX_STATE_META_CAPABILITY.to_string(),
-            serde_json::json!({ "sandboxCwd": "/workspace/project" }),
+            json!({ "sandboxCwd": "/workspace/project" }),
         )]));
         assert_eq!(codex_workspace_cwd(&meta), Some("/workspace/project"));
+    }
+
+    #[test]
+    fn help_routes_specialized_topics() {
+        let result = VisibleBrowserLab::help(&Map::from_iter([(
+            "topic".to_string(),
+            Value::String("performance".to_string()),
+        )]));
+        assert!(!result.is_error.unwrap_or(false));
     }
 }

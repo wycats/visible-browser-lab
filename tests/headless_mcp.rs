@@ -31,6 +31,415 @@ fn deterministic_real_browser_facade() -> Result<()> {
 }
 
 #[test]
+fn complete_v03_domain_surface() -> Result<()> {
+    let mut harness = BrowserMcpHarness::start("visible-browser-lab-v03-domains", true)?;
+    let workspace = harness.state_dir.path().to_path_buf();
+    let start_url = harness.fixture.url("/page");
+    let init_script_url = harness.fixture.url("/page?init-script=1");
+    std::fs::write(workspace.join("upload.txt"), b"visible browser lab upload")?;
+    let session = harness.client_mut().call_tool(
+        "start_session",
+        json!({
+            "label":"v03-domain-surface",
+            "start_url":start_url,
+            "focus":true,
+            "workspace_root":workspace
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = OpenTab::from_summary(
+        &session_id,
+        session.get("tab").context("start_session omitted tab")?,
+    )?;
+    let snapshot = harness.client_mut().call_tool(
+        "snapshot",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"mode":"meaningful"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let tree = field_str(&snapshot, "tree")?;
+    let select_ref = snapshot_element_ref(&tree, "combobox \"Choice\"")?;
+    let click_ref = snapshot_element_ref(&tree, "button \"Click\"")?;
+    let checkbox_ref = snapshot_element_ref(&tree, "checkbox \"Enabled\"")?;
+    let hover_ref = snapshot_element_ref(&tree, "button \"Hover target\"")?;
+    let drag_ref = snapshot_element_ref(&tree, "button \"Drag source\"")?;
+    let drop_ref = snapshot_element_ref(&tree, "button \"Drop target\"")?;
+    let file_drop_ref = snapshot_element_ref(&tree, "button \"File drop\"")?;
+    let upload_ref = snapshot_element_ref(&tree, "button \"Upload\"")
+        .or_else(|_| snapshot_element_ref(&tree, "button \"Choose File\""))?;
+    let dialog_ref = snapshot_element_ref(&tree, "button \"Dialog\"")?;
+    let iframe_ref = snapshot_element_ref(&tree, "Iframe \"Embedded fixture\"")?;
+
+    let targeted = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"ref":hover_ref},"source":"this.id","mode":"expression"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(targeted["value"], "hover");
+    let targeted_function = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"css":"#hover"},"source":"function(suffix){ return this.id + suffix; }","mode":"function","args":["-target"]}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(targeted_function["value"], "hover-target");
+    harness.client_mut().call_tool(
+        "fill",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"css":"#frame-entry","frame_ref":iframe_ref},"value":"framed CSS","observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let framed_value = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"css":"#frame-entry","frame_ref":iframe_ref},"source":"this.value"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(framed_value["value"], "framed CSS");
+    harness.client_mut().call_tool(
+        "click",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"ref":click_ref},"button":"left","count":2,"modifiers":["shift"],"observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let click_state = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"({button:document.body.dataset.clickButton,shift:document.body.dataset.clickShift,double:document.body.dataset.doubleClicked})"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(click_state["value"]["button"], "0");
+    assert_eq!(click_state["value"]["shift"], "true");
+    assert_eq!(click_state["value"]["double"], "yes");
+
+    for format in ["jpeg", "webp"] {
+        let screenshot = harness.client_mut().call_tool(
+            "screenshot",
+            json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"ref":hover_ref},"format":format,"quality":70}),
+            Duration::from_secs(20),
+            false,
+        )?;
+        assert!(screenshot["width"].as_u64().unwrap_or(0) > 0);
+        assert!(screenshot["height"].as_u64().unwrap_or(0) > 0);
+    }
+
+    for arguments in [
+        json!({"operation":"select_options","target":{"ref":select_ref},"values":["two"],"observe":"none"}),
+        json!({"operation":"set_checked","target":{"ref":checkbox_ref},"checked":true,"observe":"none"}),
+        json!({"operation":"hover","target":{"ref":hover_ref},"observe":"none"}),
+        json!({"operation":"drag","source":{"ref":drag_ref},"destination":{"ref":drop_ref},"observe":"none"}),
+        json!({"operation":"drop","target":{"ref":file_drop_ref},"paths":["upload.txt"],"data":{"text/plain":"fixture"},"observe":"none"}),
+        json!({"operation":"upload_files","target":{"ref":upload_ref},"paths":["upload.txt"],"observe":"none"}),
+        json!({"operation":"scroll","delta_y":120,"observe":"none"}),
+        json!({"operation":"click_at","x":2,"y":2,"button":"left","count":1,"observe":"none"}),
+    ] {
+        let mut arguments = arguments.as_object().cloned().unwrap();
+        arguments.insert("agent_session_id".to_string(), json!(session_id));
+        arguments.insert("tab_id".to_string(), json!(tab.tab_id));
+        harness.client_mut().call_tool(
+            "interact",
+            Value::Object(arguments),
+            Duration::from_secs(20),
+            false,
+        )?;
+    }
+    harness.client_mut().call_tool(
+        "fill_form",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "fields":[
+                {"kind":"select","target":{"css":"#choice"},"values":["one"]},
+                {"kind":"checked","target":{"css":"#checked"},"checked":false}
+            ],
+            "observe":"none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "click",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"target":{"ref":dialog_ref},"observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "interact",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"handle_dialog","action":"accept","observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"(async()=>{console.error('v03-console');await fetch('/data.json');return true})()"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let console = harness.client_mut().call_tool(
+        "console",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"list","levels":["error"]}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let message_id = console["messages"][0]["message_id"]
+        .as_str()
+        .context("console list omitted message id")?;
+    harness.client_mut().call_tool(
+        "console",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"get","message_id":message_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "console",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"clear"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let network = harness.client_mut().call_tool(
+        "network",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"list","url_pattern":"data\\.json"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let request_id = network["requests"][0]["request_id"]
+        .as_str()
+        .context("network list omitted request id")?;
+    harness.client_mut().call_tool(
+        "network",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"get","request_id":request_id,"include_response_body":true}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "network",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"clear"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    let baseline_user_agent = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"navigator.userAgent"}),
+        Duration::from_secs(20),
+        false,
+    )?["value"]
+        .clone();
+    for arguments in [
+        json!({"operation":"set_viewport","width":800,"height":600,"device_scale_factor":1,"mobile":false,"touch":false}),
+        json!({"operation":"set_network","preset":"offline"}),
+        json!({"operation":"set_cpu","slowdown":2}),
+        json!({"operation":"set_geolocation","latitude":37.77,"longitude":-122.42,"accuracy_meters":10}),
+        json!({"operation":"set_media","media":"screen","color_scheme":"dark","reduced_motion":"reduce"}),
+        json!({"operation":"set_user_agent","user_agent":"VisibleBrowserLab/0.3","platform":"test"}),
+        json!({"operation":"set_headers","headers":{"x-visible-browser-lab":"true"}}),
+        json!({"operation":"reset"}),
+    ] {
+        let mut arguments = arguments.as_object().cloned().unwrap();
+        arguments.insert("agent_session_id".to_string(), json!(session_id));
+        arguments.insert("tab_id".to_string(), json!(tab.tab_id));
+        harness.client_mut().call_tool(
+            "emulation",
+            Value::Object(arguments),
+            Duration::from_secs(20),
+            false,
+        )?;
+    }
+    let reset_user_agent = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"navigator.userAgent"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(reset_user_agent["value"], baseline_user_agent);
+
+    harness.client_mut().call_tool(
+        "performance",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"start_trace"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"(()=>{const end=performance.now()+60;while(performance.now()<end){};return true})()"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let stopped = harness.client_mut().call_tool(
+        "performance",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"stop_trace"}),
+        Duration::from_secs(30),
+        false,
+    )?;
+    let trace_id = field_str(&stopped["artifact"], "artifact_id")?;
+    harness.client_mut().call_tool(
+        "performance",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"vitals"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "performance",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"analyze","artifact_id":trace_id,"insight":"long_tasks"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    let audit = harness.client_mut().call_tool(
+        "audit",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"run","categories":["accessibility","seo","best_practices","agentic_browsing"]}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let audit_id = field_str(&audit["reports"][0], "artifact_id")?;
+
+    let capture = harness.client_mut().call_tool(
+        "memory",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"capture"}),
+        Duration::from_secs(60),
+        false,
+    )?;
+    let heap_id = field_str(&capture["artifact"], "artifact_id")?;
+    let summary = harness.client_mut().call_tool(
+        "memory",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"summary","artifact_id":heap_id}),
+        Duration::from_secs(60),
+        false,
+    )?;
+    let root_node = field_str(&summary["data"]["root"], "node_id")?;
+    for arguments in [
+        json!({"operation":"classes","artifact_id":heap_id,"limit":5}),
+        json!({"operation":"node","artifact_id":heap_id,"node_id":root_node}),
+        json!({"operation":"dominators","artifact_id":heap_id,"node_id":root_node,"limit":5}),
+        json!({"operation":"retainers","artifact_id":heap_id,"node_id":root_node,"limit":5}),
+        json!({"operation":"retaining_paths","artifact_id":heap_id,"node_id":root_node,"max_depth":4,"limit":5}),
+        json!({"operation":"edges","artifact_id":heap_id,"node_id":root_node,"direction":"outgoing","limit":5}),
+    ] {
+        let mut arguments = arguments.as_object().cloned().unwrap();
+        arguments.insert("agent_session_id".to_string(), json!(session_id));
+        arguments.insert("tab_id".to_string(), json!(tab.tab_id));
+        harness.client_mut().call_tool(
+            "memory",
+            Value::Object(arguments),
+            Duration::from_secs(60),
+            false,
+        )?;
+    }
+    harness.client_mut().call_tool(
+        "memory",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"close","artifact_id":heap_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    harness.client_mut().call_tool(
+        "screencast",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"start","fps":5,"quality":50,"max_duration_ms":3000}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "screencast",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"status"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"document.body.style.background='rgb(10,20,30)';true"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    std::thread::sleep(Duration::from_millis(800));
+    harness.client_mut().call_tool(
+        "screencast",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"stop"}),
+        Duration::from_secs(60),
+        false,
+    )?;
+
+    let listed = harness.client_mut().call_tool(
+        "artifacts",
+        json!({"agent_session_id":session_id,"operation":"list","limit":100}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert!(!listed["artifacts"].as_array().unwrap().is_empty());
+    harness.client_mut().call_tool(
+        "artifacts",
+        json!({"agent_session_id":session_id,"operation":"metadata","artifact_id":audit_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "artifacts",
+        json!({"agent_session_id":session_id,"operation":"read","artifact_id":audit_id,"offset":0,"length":1024}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "artifacts",
+        json!({"agent_session_id":session_id,"operation":"export","artifact_id":audit_id,"path":"audit-export.json"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert!(workspace.join("audit-export.json").is_file());
+    harness.client_mut().call_tool(
+        "artifacts",
+        json!({"agent_session_id":session_id,"operation":"delete","artifact_id":audit_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"window.onbeforeunload = () => 'leave'; true"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "navigate",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "action":"url",
+            "url":init_script_url,
+            "wait_until":"network_idle",
+            "before_unload":"accept",
+            "init_script":"window.__visibleBrowserLabInit = 'before-page-script';",
+            "observe":"none"
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
+    let init_script = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"window.__visibleBrowserLabInit"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(init_script["value"], "before-page-script");
+    harness.client_mut().call_tool(
+        "wait_for",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"condition":{"kind":"load","state":"network_idle"},"timeout_ms":5000,"observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+
+    harness.client_mut().call_tool(
+        "close_tab",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    Ok(())
+}
+
+#[test]
 fn explicit_focus_contract() -> Result<()> {
     let mut harness = BrowserMcpHarness::start("visible-browser-lab-focus-contract", true)?;
     let url = harness.fixture.url("/page");
@@ -68,6 +477,7 @@ fn explicit_focus_contract() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
+            "action": "url",
             "url": navigation_url,
             "wait_until": "load"
         }),
@@ -80,7 +490,7 @@ fn explicit_focus_contract() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
-            "expression": "document.title"
+            "source": "document.title"
         }),
         Duration::from_secs(20),
         false,
@@ -104,7 +514,7 @@ fn explicit_focus_contract() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
-            "expression": "document.querySelector('#entry').focus()"
+            "source": "document.querySelector('#entry').focus()"
         }),
         Duration::from_secs(20),
         false,
@@ -114,25 +524,28 @@ fn explicit_focus_contract() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
+            "target": { "css": "#entry" },
             "text": "background text"
         }),
         Duration::from_secs(20),
         false,
     )?;
     harness.client_mut().call_tool(
-        "console_messages",
+        "console",
         json!({
             "agent_session_id": session_id,
-            "tab_id": open_tab.tab_id
+            "tab_id": open_tab.tab_id,
+            "operation": "list"
         }),
         Duration::from_secs(20),
         false,
     )?;
     harness.client_mut().call_tool(
-        "network_events",
+        "network",
         json!({
             "agent_session_id": session_id,
-            "tab_id": open_tab.tab_id
+            "tab_id": open_tab.tab_id,
+            "operation": "list"
         }),
         Duration::from_secs(20),
         false,
@@ -143,7 +556,7 @@ fn explicit_focus_contract() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
-            "expression": "document.hasFocus() && document.visibilityState === 'visible'"
+            "source": "document.hasFocus() && document.visibilityState === 'visible'"
         }),
         Duration::from_secs(20),
         false,
@@ -603,6 +1016,7 @@ impl BrowserMcpHarness {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": open_tab.tab_id,
+                "action": "url",
                 "url": url,
                 "wait_until": "load"
             }),
@@ -777,15 +1191,15 @@ impl BrowserMcpHarness {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab_id,
+                "action": "url",
                 "url": url,
                 "timeout_ms": 10000
             }),
             Duration::from_secs(30),
             false,
         )?;
-        let returned_tab = result.get("tab").context("navigate omitted tab")?;
-        if field_str(returned_tab, "tab_id")? != self.tabs[tab].tab_id {
-            bail!("navigate returned a different tab_id");
+        if result.get("document_revision").is_none() {
+            bail!("navigate omitted document_revision");
         }
         Ok(())
     }
@@ -798,7 +1212,7 @@ impl BrowserMcpHarness {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab_id,
-                "expression": "1 + 1"
+                "source": "1 + 1"
             }),
             Duration::from_secs(20),
             false,
@@ -823,7 +1237,7 @@ impl BrowserMcpHarness {
             false,
         )?;
         let tree = field_str(&snapshot, "tree")?;
-        let reference = snapshot_element_ref(&tree, "textbox [ref=")?;
+        let reference = snapshot_element_ref(&tree, "textbox \"Entry\"")?;
         self.client_mut().call_tool(
             "fill",
             json!({
@@ -841,7 +1255,7 @@ impl BrowserMcpHarness {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab_id,
-                "expression": "document.querySelector('#entry').value"
+                "source": "document.querySelector('#entry').value"
             }),
             Duration::from_secs(20),
             false,

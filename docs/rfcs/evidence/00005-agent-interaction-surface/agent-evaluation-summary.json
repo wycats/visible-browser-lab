@@ -3,11 +3,11 @@
   "reasoning_effort": "medium",
   "total_trials": 30,
   "successful_trials": 29,
-  "correct_first_selections": 28,
+  "correct_first_selections": 29,
   "semantic_fallback_violations": 0,
   "unowned_backend_actions": 0,
   "task_success_rate": 0.9666666666666667,
-  "first_selection_rate": 0.9333333333333333,
+  "first_selection_rate": 0.9666666666666667,
   "passes": true,
   "trials": [
     {
@@ -117,7 +117,6 @@
       "tool_sequence": [
         "start_session",
         "snapshot",
-        "help:wait_for text",
         "wait_for",
         "close_tab"
       ]
@@ -134,7 +133,6 @@
       "tool_sequence": [
         "start_session",
         "snapshot",
-        "help:wait_for element hidden",
         "wait_for",
         "close_tab"
       ]
@@ -211,8 +209,8 @@
       "tool_sequence": [
         "start_session",
         "snapshot",
-        "snapshot",
         "fill",
+        "snapshot",
         "close_tab"
       ]
     },
@@ -246,10 +244,9 @@
       "tool_sequence": [
         "start_session",
         "snapshot",
-        "focus_tab",
         "click",
-        "help:handle_dialog",
         "interact:handle_dialog",
+        "snapshot",
         "close_tab"
       ]
     },
@@ -295,14 +292,12 @@
       "model": "gpt-5.5",
       "reasoning_effort": "medium",
       "success": true,
-      "correct_first_selection": false,
+      "correct_first_selection": true,
       "semantic_fallback_violation": false,
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
         "snapshot",
-        "focus_tab",
-        "click",
         "console",
         "console:list",
         "console:get",
@@ -335,7 +330,7 @@
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
-        "snapshot",
+        "help:network",
         "network",
         "network:list",
         "network:get",
@@ -354,6 +349,7 @@
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
+        "network",
         "network:get",
         "close_tab"
       ]
@@ -369,7 +365,6 @@
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
-        "help:vitals",
         "performance",
         "performance:vitals",
         "close_tab"
@@ -403,6 +398,7 @@
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
+        "help:set_viewport",
         "emulation:set_viewport",
         "close_tab"
       ]
@@ -419,6 +415,7 @@
       "tool_sequence": [
         "start_session",
         "help:set_network",
+        "emulation:set_network",
         "emulation:set_network",
         "emulation:reset",
         "close_tab"
@@ -482,9 +479,8 @@
       "unowned_backend_action": false,
       "tool_sequence": [
         "start_session",
-        "help:retaining_paths",
-        "memory",
         "memory:capture",
+        "help:retaining_paths",
         "memory:retaining_paths",
         "close_tab"
       ]
@@ -499,13 +495,9 @@
       "semantic_fallback_violation": false,
       "unowned_backend_action": false,
       "tool_sequence": [
-        "help:start_stop_export",
         "start_session",
         "screencast:start",
-        "screencast:status",
         "screencast:stop",
-        "help:export",
-        "artifacts:list",
         "artifacts:export",
         "close_tab"
       ]

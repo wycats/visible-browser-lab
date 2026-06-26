@@ -125,9 +125,9 @@ impl RuntimeConfig {
             runtime_mode: RuntimeMode::External,
             cdp_endpoint: Some(cdp_endpoint),
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
-            socket_path: state_dir.join("broker-v2.sock"),
-            lock_path: state_dir.join("broker-v2.lock"),
-            pid_path: state_dir.join("broker-v2.pid"),
+            socket_path: state_dir.join("broker-v3.sock"),
+            lock_path: state_dir.join("broker-v3.lock"),
+            pid_path: state_dir.join("broker-v3.pid"),
             log_dir: state_dir.join("logs"),
             devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
             chrome_lock_path: state_dir.join("chrome-launch.lock"),
@@ -143,9 +143,9 @@ impl RuntimeConfig {
             runtime_mode: RuntimeMode::Managed,
             cdp_endpoint: None,
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
-            socket_path: state_dir.join("broker-v2.sock"),
-            lock_path: state_dir.join("broker-v2.lock"),
-            pid_path: state_dir.join("broker-v2.pid"),
+            socket_path: state_dir.join("broker-v3.sock"),
+            lock_path: state_dir.join("broker-v3.lock"),
+            pid_path: state_dir.join("broker-v3.pid"),
             log_dir: state_dir.join("logs"),
             devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
             chrome_lock_path: state_dir.join("chrome-launch.lock"),
@@ -275,7 +275,7 @@ mod tests {
 
         assert_eq!(
             config.socket_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.sock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.sock")
         );
         if cfg!(windows) {
             assert!(config.ipc_endpoint.starts_with("visible-browser-lab-"));
@@ -283,16 +283,16 @@ mod tests {
         } else {
             assert_eq!(
                 config.ipc_endpoint,
-                "/tmp/visible-browser-lab-test/broker-v2.sock"
+                "/tmp/visible-browser-lab-test/broker-v3.sock"
             );
         }
         assert_eq!(
             config.lock_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.lock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.lock")
         );
         assert_eq!(
             config.pid_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v2.pid")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.pid")
         );
         assert_eq!(
             config.log_dir,

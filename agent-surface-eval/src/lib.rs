@@ -1,9 +1,8 @@
-pub mod catalog;
 pub mod fixtures;
 pub mod scoring;
 pub mod server;
 
-pub use catalog::{
+pub use agent_surface_contract::{
     CatalogMeasurement, ToolDefinition, catalog_measurement, hybrid_catalog,
     validate_catalog_contract,
 };

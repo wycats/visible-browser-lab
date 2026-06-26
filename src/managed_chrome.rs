@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -69,7 +69,7 @@ pub async fn ensure_managed_chrome(
             cdp_endpoint: endpoint,
             reused: true,
             executable,
-            pid: None,
+            pid: managed_chrome_pid(config),
         });
     }
     wait_for_profile_release(config).await?;
@@ -77,6 +77,10 @@ pub async fn ensure_managed_chrome(
     remove_stale_active_port(&config.devtools_active_port_path).await?;
     let installation = discover_chrome(config.chrome_path.as_deref())?;
     let pid = launch_chrome(config, &installation, launch_mode)?;
+    if let Some(pid) = pid {
+        fs::write(config.state_dir.join("managed-chrome.pid"), pid.to_string())
+            .context("failed to persist managed Chrome pid")?;
+    }
 
     let deadline = Instant::now() + CHROME_START_TIMEOUT;
     loop {
@@ -85,7 +89,7 @@ pub async fn ensure_managed_chrome(
                 cdp_endpoint: endpoint,
                 reused: false,
                 executable: Some(installation.executable),
-                pid,
+                pid: managed_chrome_pid(config).or(pid),
             });
         }
         if Instant::now() >= deadline {
@@ -102,29 +106,137 @@ pub async fn ensure_managed_chrome(
 }
 
 pub fn activate_managed_chrome(config: &RuntimeConfig) -> Result<()> {
-    let installation = discover_chrome(config.chrome_path.as_deref())?;
+    let pid = managed_chrome_pid(config).context("managed Chrome process id is unavailable")?;
 
     #[cfg(target_os = "macos")]
     {
-        let application_bundle = installation.application_bundle.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "managed Chrome focus on macOS requires an application bundle; `{}` is not inside a .app bundle",
-                installation.executable.display()
-            )
-        })?;
-        let status = Command::new("/usr/bin/open")
-            .arg("-a")
-            .arg(application_bundle)
-            .status()
-            .context("failed to invoke the macOS application activator")?;
-        if !status.success() {
-            bail!("failed to activate `{}`", application_bundle.display());
+        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+
+        let application =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t)
+                .with_context(|| {
+                    format!("managed Chrome process `{pid}` is not a running application")
+                })?;
+        if !application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
+            bail!("macOS refused to activate managed Chrome process `{pid}`");
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
-    let _ = installation;
+    #[cfg(target_os = "windows")]
+    activate_windows_process(pid)?;
 
+    #[cfg(target_os = "linux")]
+    activate_x11_process(pid)?;
+
+    Ok(())
+}
+
+pub fn managed_chrome_pid(config: &RuntimeConfig) -> Option<u32> {
+    #[cfg(unix)]
+    if let Ok(target) = fs::read_link(config.chrome_profile_dir.join("SingletonLock"))
+        && let Some(pid) = target
+            .to_string_lossy()
+            .rsplit_once('-')
+            .and_then(|(_, pid)| pid.parse::<u32>().ok())
+    {
+        return Some(pid);
+    }
+
+    fs::read_to_string(config.state_dir.join("managed-chrome.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "windows")]
+fn activate_windows_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SW_RESTORE,
+            SetForegroundWindow, ShowWindow,
+        },
+    };
+
+    struct Search {
+        pid: u32,
+        window: HWND,
+    }
+    unsafe extern "system" fn visit(window: HWND, state: LPARAM) -> i32 {
+        let state = unsafe { &mut *(state as *mut Search) };
+        let mut window_pid = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut window_pid) };
+        if window_pid == state.pid && unsafe { IsWindowVisible(window) } != 0 {
+            state.window = window;
+            return 0;
+        }
+        1
+    }
+
+    let mut search = Search {
+        pid,
+        window: std::ptr::null_mut(),
+    };
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
+    if search.window.is_null() {
+        bail!("managed Chrome process `{pid}` has no visible window");
+    }
+    unsafe { ShowWindow(search.window, SW_RESTORE) };
+    if unsafe { SetForegroundWindow(search.window) } == 0 {
+        bail!("Windows refused to activate managed Chrome process `{pid}`");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn activate_x11_process(pid: u32) -> Result<()> {
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{
+            AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask, Window,
+        },
+        wrapper::ConnectionExt as _,
+    };
+
+    let (connection, screen_number) = x11rb::connect(None).context("failed to connect to X11")?;
+    let root = connection.setup().roots[screen_number].root;
+    let pid_atom = connection.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+    let active_atom = connection
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+        .reply()?
+        .atom;
+    let mut pending = vec![root];
+    let mut managed_window = None;
+    while let Some(window) = pending.pop() {
+        if window != root {
+            let property = connection
+                .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)?
+                .reply()?;
+            if property.value32().and_then(|mut values| values.next()) == Some(pid) {
+                managed_window = Some(window);
+                break;
+            }
+        }
+        if let Ok(tree) = connection.query_tree(window)?.reply() {
+            pending.extend(tree.children);
+        }
+    }
+    let window: Window = managed_window
+        .with_context(|| format!("managed Chrome process `{pid}` has no X11 window"))?;
+    let event = ClientMessageEvent::new(
+        32,
+        window,
+        active_atom,
+        ClientMessageData::from([1, 0, 0, 0, 0]),
+    );
+    connection.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    connection.flush()?;
     Ok(())
 }
 
