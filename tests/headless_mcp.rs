@@ -313,10 +313,17 @@ fn complete_v03_domain_surface() -> Result<()> {
 
     let audit = harness.client_mut().call_tool(
         "audit",
-        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"run","categories":["accessibility","seo","best_practices","agentic_browsing"]}),
-        Duration::from_secs(20),
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"run","categories":["accessibility","seo","best_practices","agentic_browsing"],"mode":"navigation","device":"mobile"}),
+        Duration::from_secs(30),
         false,
     )?;
+    assert!(audit["findings"].as_array().is_some_and(|findings| {
+        findings.iter().any(|finding| {
+            finding["refs"]
+                .as_array()
+                .is_some_and(|refs| !refs.is_empty())
+        })
+    }));
     let audit_id = field_str(&audit["reports"][0], "artifact_id")?;
 
     let capture = harness.client_mut().call_tool(

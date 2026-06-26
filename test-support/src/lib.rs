@@ -1128,6 +1128,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
 <label><input id="checked" type="checkbox" /> Enabled</label>
 <div id="editable" contenteditable="true" aria-label="Editable value"></div>
 <button id="hover" onmouseenter="document.body.dataset.hovered='yes'">Hover target</button>
+<img id="missing-alt" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" />
 <div id="drag-source" role="button" tabindex="0" draggable="true">Drag source</div>
 <div id="drop-target" role="button" tabindex="0" ondragover="event.preventDefault()" ondrop="event.preventDefault(); document.body.dataset.dropped='yes'">Drop target</div>
 <label>Upload <input id="upload" type="file" /></label>
