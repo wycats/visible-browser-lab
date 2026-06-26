@@ -77,6 +77,22 @@ fn complete_v03_domain_surface() -> Result<()> {
         .or_else(|_| snapshot_element_ref(&tree, "button \"Choose File\""))?;
     let dialog_ref = snapshot_element_ref(&tree, "button \"Dialog\"")?;
     let iframe_ref = snapshot_element_ref(&tree, "Iframe \"Embedded fixture\"")?;
+    let rooted_snapshot = harness.client_mut().call_tool(
+        "snapshot",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "mode":"full",
+            "root":{"ref":hover_ref},
+            "include_bounds":true
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let rooted_tree = field_str(&rooted_snapshot, "tree")?;
+    assert!(rooted_tree.contains("Hover target"));
+    assert!(rooted_tree.contains("[bounds="));
+    assert!(!rooted_tree.contains("combobox \"Choice\""));
 
     let targeted = harness.client_mut().call_tool(
         "evaluate",

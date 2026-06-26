@@ -10,9 +10,9 @@ use chromiumoxide::{
                 AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
             },
             dom::{
-                BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetDocumentParams,
-                PushNodesByBackendIdsToFrontendParams, QuerySelectorAllParams, ResolveNodeParams,
-                SetFileInputFilesParams,
+                BackendNodeId, DescribeNodeParams, GetBoxModelParams, GetContentQuadsParams,
+                GetDocumentParams, PushNodesByBackendIdsToFrontendParams, QuerySelectorAllParams,
+                ResolveNodeParams, SetFileInputFilesParams,
             },
             emulation::{
                 ClearDeviceMetricsOverrideParams, MediaFeature, SetCpuThrottlingRateParams,
@@ -683,6 +683,49 @@ impl CdpClient {
         Ok(node.result.node.backend_node_id.inner().to_owned())
     }
 
+    pub async fn resolve_css_backend_node(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+    ) -> Result<i64, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let document = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetDocumentParams::builder().depth(1).pierce(true).build()),
+                "enable DOM tree for snapshot root",
+            )
+            .await?;
+        let matches = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(QuerySelectorAllParams::new(
+                    document.result.root.node_id,
+                    selector,
+                )),
+                "query snapshot root",
+            )
+            .await?
+            .result
+            .node_ids;
+        let node_id = match matches.as_slice() {
+            [] => return Err(BrowserToolError::element_not_found(selector)),
+            [node_id] => *node_id,
+            matches => return Err(BrowserToolError::element_ambiguous(selector, matches.len())),
+        };
+        let node = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(DescribeNodeParams::builder().node_id(node_id).build()),
+                "resolve snapshot root",
+            )
+            .await?;
+        Ok(*node.result.node.backend_node_id.inner())
+    }
+
     pub async fn evaluate_on_css(
         &self,
         target: &CdpTarget,
@@ -748,7 +791,8 @@ impl CdpClient {
     pub async fn accessibility_snapshot(
         &self,
         target: &CdpTarget,
-        depth: usize,
+        depth: Option<usize>,
+        include_bounds: bool,
     ) -> Result<RawAxSnapshot, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         self.runtime
@@ -777,27 +821,44 @@ impl CdpClient {
                 .runtime
                 .page_command(
                     &connection,
-                    page.execute(
-                        GetFullAxTreeParams::builder()
-                            .frame_id(frame.id.clone())
-                            .depth(depth as i64)
-                            .build(),
-                    ),
+                    page.execute(GetFullAxTreeParams {
+                        depth: depth.map(|value| value as i64),
+                        frame_id: Some(frame.id.clone()),
+                    }),
                     "read accessibility tree",
                 )
                 .await?;
             let frame_id = frame.id.as_ref().to_string();
+            let mut nodes = response
+                .result
+                .nodes
+                .into_iter()
+                .map(|node| raw_ax_node(node, &frame_id))
+                .collect::<Vec<_>>();
+            if include_bounds {
+                for node in &mut nodes {
+                    let Some(backend_node_id) = node.backend_node_id else {
+                        continue;
+                    };
+                    let Ok(response) = page
+                        .execute(
+                            GetBoxModelParams::builder()
+                                .backend_node_id(BackendNodeId::new(backend_node_id))
+                                .build(),
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    node.bounds = bounds_label(response.result.model.border.inner());
+                }
+            }
             snapshot_frames.push(RawAxFrame {
                 frame_id: frame_id.clone(),
                 parent_frame_id,
                 loader_id: frame.loader_id.as_ref().to_string(),
                 url: frame.url,
-                nodes: response
-                    .result
-                    .nodes
-                    .into_iter()
-                    .map(|node| raw_ax_node(node, &frame_id))
-                    .collect(),
+                nodes,
             });
         }
 
@@ -2916,7 +2977,36 @@ fn raw_ax_node(node: AxNode, containing_frame_id: &str) -> RawAxNode {
             })
             .collect(),
         ignored: node.ignored,
+        bounds: None,
     }
+}
+
+fn bounds_label(quad: &[f64]) -> Option<String> {
+    let points = quad.chunks_exact(2).collect::<Vec<_>>();
+    if points.len() != 4 || points.iter().any(|point| point.len() != 2) {
+        return None;
+    }
+    let min_x = points
+        .iter()
+        .map(|point| point[0])
+        .fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|point| point[0])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = points
+        .iter()
+        .map(|point| point[1])
+        .fold(f64::INFINITY, f64::min);
+    let max_y = points
+        .iter()
+        .map(|point| point[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some(format!(
+        "{min_x:.1},{min_y:.1},{:.1},{:.1}",
+        max_x - min_x,
+        max_y - min_y
+    ))
 }
 
 fn ax_value_text(value: &AxValue) -> Option<String> {

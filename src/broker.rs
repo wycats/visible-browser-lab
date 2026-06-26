@@ -495,6 +495,7 @@ impl FakeBrowser {
                         value: None,
                         properties: Vec::new(),
                         ignored: false,
+                        bounds: Some("0.0,0.0,800.0,600.0".to_string()),
                     },
                     RawAxNode {
                         node_id: "submit".to_string(),
@@ -507,6 +508,7 @@ impl FakeBrowser {
                         value: None,
                         properties: Vec::new(),
                         ignored: false,
+                        bounds: Some("20.0,20.0,80.0,30.0".to_string()),
                     },
                     RawAxNode {
                         node_id: "email".to_string(),
@@ -519,6 +521,7 @@ impl FakeBrowser {
                         value: None,
                         properties: Vec::new(),
                         ignored: false,
+                        bounds: Some("20.0,60.0,200.0,30.0".to_string()),
                     },
                 ],
             }],
@@ -994,6 +997,27 @@ impl BrowserBackend {
         }
     }
 
+    async fn resolve_css_backend_node(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+    ) -> Result<i64, BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(_) => match selector {
+                "#submit" => Ok(2),
+                "#email" => Ok(3),
+                _ => Err(BrowserToolError::element_not_found(selector)),
+            },
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .resolve_css_backend_node(target, selector)
+                    .await
+            }
+        }
+    }
+
     async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
         match self {
             #[cfg(test)]
@@ -1005,7 +1029,8 @@ impl BrowserBackend {
     async fn accessibility_snapshot(
         &self,
         target: &CdpTarget,
-        depth: usize,
+        depth: Option<usize>,
+        include_bounds: bool,
     ) -> Result<RawAxSnapshot, BrowserToolError> {
         match self {
             #[cfg(test)]
@@ -1013,7 +1038,7 @@ impl BrowserBackend {
             _ => {
                 self.cdp_client()
                     .await?
-                    .accessibility_snapshot(target, depth)
+                    .accessibility_snapshot(target, depth, include_bounds)
                     .await
             }
         }
@@ -2589,14 +2614,41 @@ async fn broker_snapshot(
 ) -> Result<SnapshotResult, BrowserToolError> {
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
+    let root_backend_node_id = match params.root.as_ref() {
+        Some(element_target) => Some(
+            match resolve_element_target(
+                state,
+                &params.agent_session_id,
+                &params.tab_id,
+                &target,
+                element_target,
+            )
+            .await?
+            {
+                ResolvedElementTarget::Reference(element) => element.backend_node_id,
+                ResolvedElementTarget::Css(selector) => {
+                    state
+                        .browser
+                        .resolve_css_backend_node(&target, &selector)
+                        .await?
+                }
+            },
+        ),
+        None => None,
+    };
     snapshot_for_target(
         state,
         &params.agent_session_id,
         &params.tab_id,
         &target,
-        params.mode.unwrap_or_default(),
-        params.depth.unwrap_or(8).clamp(1, 64),
-        params.max_nodes.unwrap_or(500).clamp(1, 5_000),
+        SnapshotRequest {
+            mode: params.mode.unwrap_or_default(),
+            root_backend_node_id,
+            depth: params.depth.unwrap_or(8).clamp(1, 64),
+            max_nodes: params.max_nodes.unwrap_or(500).clamp(1, 5_000),
+            include_hidden: params.include_hidden,
+            include_bounds: params.include_bounds,
+        },
     )
     .await
     .map(|(snapshot, _)| snapshot)
@@ -2862,24 +2914,49 @@ async fn resolve_element_target(
     }
 }
 
+struct SnapshotRequest {
+    mode: SnapshotMode,
+    root_backend_node_id: Option<i64>,
+    depth: usize,
+    max_nodes: usize,
+    include_hidden: bool,
+    include_bounds: bool,
+}
+
 async fn snapshot_for_target(
     state: &BrokerState,
     agent_session_id: &AgentSessionId,
     tab_id: &TabId,
     target: &CdpTarget,
-    mode: SnapshotMode,
-    depth: usize,
-    max_nodes: usize,
+    options: SnapshotRequest,
 ) -> Result<(SnapshotResult, crate::protocol::SnapshotDiff), BrowserToolError> {
-    let raw = state.browser.accessibility_snapshot(target, depth).await?;
+    let SnapshotRequest {
+        mode,
+        root_backend_node_id,
+        depth,
+        max_nodes,
+        include_hidden,
+        include_bounds,
+    } = options;
+    let raw = state
+        .browser
+        .accessibility_snapshot(
+            target,
+            root_backend_node_id.is_none().then_some(depth),
+            include_bounds,
+        )
+        .await?;
     state.references().lock().unwrap().build_snapshot(
         SnapshotBuildContext {
             agent_session_id,
             tab_id,
             target_id: &target.id,
             mode,
+            root_backend_node_id,
             depth,
             max_nodes,
+            include_hidden,
+            include_bounds,
         },
         raw,
     )
@@ -2908,9 +2985,14 @@ async fn post_action_observation(
                 agent_session_id,
                 tab_id,
                 target,
-                SnapshotMode::Meaningful,
-                8,
-                500,
+                SnapshotRequest {
+                    mode: SnapshotMode::Meaningful,
+                    root_backend_node_id: None,
+                    depth: 8,
+                    max_nodes: 500,
+                    include_hidden: false,
+                    include_bounds: false,
+                },
             )
             .await?;
             Ok(PageActionResult {
@@ -2924,9 +3006,14 @@ async fn post_action_observation(
                 agent_session_id,
                 tab_id,
                 target,
-                SnapshotMode::Meaningful,
-                8,
-                500,
+                SnapshotRequest {
+                    mode: SnapshotMode::Meaningful,
+                    root_backend_node_id: None,
+                    depth: 8,
+                    max_nodes: 500,
+                    include_hidden: false,
+                    include_bounds: false,
+                },
             )
             .await?;
             Ok(PageActionResult {
@@ -5393,8 +5480,11 @@ mod tests {
                 agent_session_id: owner.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
                 mode: Some(SnapshotMode::Meaningful),
+                root: None,
                 depth: None,
                 max_nodes: None,
+                include_hidden: false,
+                include_bounds: false,
             }),
         )
         .await
