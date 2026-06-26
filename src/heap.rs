@@ -100,10 +100,28 @@ impl HeapGraph {
         let edge_type_offset = edge_field("type")?;
         let edge_name_offset = edge_field("name_or_index")?;
         let edge_target_offset = edge_field("to_node")?;
-        let node_types = raw.snapshot.meta.node_types[type_offset]
+        let node_types = raw
+            .snapshot
+            .meta
+            .node_types
+            .get(type_offset)
+            .ok_or_else(|| {
+                BrowserToolError::artifact_error(
+                    "heap snapshot node type metadata does not match node fields",
+                )
+            })?
             .as_array()
             .ok_or_else(|| BrowserToolError::artifact_error("heap node types are not an array"))?;
-        let edge_types = raw.snapshot.meta.edge_types[edge_type_offset]
+        let edge_types = raw
+            .snapshot
+            .meta
+            .edge_types
+            .get(edge_type_offset)
+            .ok_or_else(|| {
+                BrowserToolError::artifact_error(
+                    "heap snapshot edge type metadata does not match edge fields",
+                )
+            })?
             .as_array()
             .ok_or_else(|| BrowserToolError::artifact_error("heap edge types are not an array"))?;
 
@@ -155,6 +173,11 @@ impl HeapGraph {
                 };
                 graph.add_edge(source, target, HeapEdge { edge_type, name });
             }
+        }
+        if graph.node_count() == 0 {
+            return Err(BrowserToolError::artifact_error(
+                "heap snapshot contains no nodes",
+            ));
         }
         let root = NodeIndex::new(0);
         let dominators = simple_fast(&graph, root);
@@ -351,4 +374,51 @@ fn dominator_depth(dominators: &Dominators<NodeIndex>, node: NodeIndex) -> usize
         .dominators(node)
         .map(Iterator::count)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::leases::BrowserToolErrorCode;
+
+    fn snapshot(node_types: Value, edge_types: Value, nodes: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "snapshot": {"meta": {
+                "node_fields": ["type", "name", "id", "self_size", "edge_count"],
+                "node_types": node_types,
+                "edge_fields": ["type", "name_or_index", "to_node"],
+                "edge_types": edge_types
+            }},
+            "nodes": nodes,
+            "edges": [],
+            "strings": [""]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_type_metadata_returns_artifact_error() {
+        let bytes = snapshot(json!([]), json!([]), json!([0, 0, 1, 0, 0]));
+
+        let error = HeapGraph::parse(&bytes).err().unwrap();
+
+        assert_eq!(error.code, BrowserToolErrorCode::ArtifactError);
+        assert!(error.message.contains("node type metadata"));
+    }
+
+    #[test]
+    fn empty_snapshot_returns_artifact_error() {
+        let bytes = snapshot(
+            json!([["hidden"], "string", "number", "number", "number"]),
+            json!([["context"], "string_or_number", "node"]),
+            json!([]),
+        );
+
+        let error = HeapGraph::parse(&bytes).err().unwrap();
+
+        assert_eq!(error.code, BrowserToolErrorCode::ArtifactError);
+        assert!(error.message.contains("contains no nodes"));
+    }
 }
