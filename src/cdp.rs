@@ -34,10 +34,10 @@ use chromiumoxide::{
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
                 CaptureScreenshotParams, EnableParams as PageEnableParams,
-                EventJavascriptDialogOpening, EventScreencastFrame, Frame, FrameTree,
-                GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
-                HandleJavaScriptDialogParams, NavigateParams as PageNavigateParams,
-                NavigateToHistoryEntryParams, ReloadParams,
+                EventDomContentEventFired, EventJavascriptDialogOpening, EventLoadEventFired,
+                EventScreencastFrame, Frame, FrameTree, GetFrameTreeParams, GetLayoutMetricsParams,
+                GetNavigationHistoryParams, HandleJavaScriptDialogParams,
+                NavigateParams as PageNavigateParams, NavigateToHistoryEntryParams, ReloadParams,
                 RemoveScriptToEvaluateOnNewDocumentParams, ScreencastFrameAckParams,
                 ScriptIdentifier, StartScreencastFormat, StartScreencastParams,
                 StopScreencastParams, Viewport,
@@ -243,29 +243,86 @@ impl CdpClient {
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         let navigation = async {
-            if wait_until == Some("none") {
-                self.runtime
-                    .page_command(
+            match wait_until.unwrap_or("load") {
+                "none" => self
+                    .start_page_navigation(&page, &connection, url)
+                    .await
+                    .map(|_| ()),
+                "dom_content_loaded" => {
+                    self.navigate_and_wait_for_event::<EventDomContentEventFired>(
+                        &page,
                         &connection,
-                        page.execute(PageNavigateParams::new(url)),
-                        "start page navigation",
+                        url,
+                        timeout_ms,
+                        "DOMContentLoaded",
                     )
-                    .await?;
-                return Ok(());
-            }
-            match timeout(Duration::from_millis(timeout_ms), page.goto(url)).await {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => Err(self
-                    .runtime
-                    .page_error(&connection, "navigate", error)
-                    .await),
-                Err(_) => Err(BrowserToolError::operation_timeout(format!(
-                    "timed out waiting for load after navigating to `{url}`"
+                    .await
+                }
+                "load" | "network_idle" => {
+                    self.navigate_and_wait_for_event::<EventLoadEventFired>(
+                        &page,
+                        &connection,
+                        url,
+                        timeout_ms,
+                        "load",
+                    )
+                    .await
+                }
+                wait_until => Err(BrowserToolError::invalid_input(format!(
+                    "unknown navigation wait state `{wait_until}`"
                 ))),
             }
         };
         self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
             .await
+    }
+
+    async fn start_page_navigation(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        url: &str,
+    ) -> Result<bool, BrowserToolError> {
+        let response = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(PageNavigateParams::new(url)),
+                "start page navigation",
+            )
+            .await?;
+        if let Some(error) = response.result.error_text {
+            return Err(BrowserToolError::chrome_unavailable(format!(
+                "navigation to `{url}` failed: {error}"
+            )));
+        }
+        Ok(response.result.loader_id.is_some())
+    }
+
+    async fn navigate_and_wait_for_event<T>(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        url: &str,
+        timeout_ms: u64,
+        event_name: &str,
+    ) -> Result<(), BrowserToolError>
+    where
+        T: chromiumoxide::cdp::IntoEventKind + Unpin,
+    {
+        let mut events = self.event_listener::<T>(page, connection).await?;
+        if !self.start_page_navigation(page, connection, url).await? {
+            return Ok(());
+        }
+        match timeout(Duration::from_millis(timeout_ms), events.next()).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(BrowserToolError::chrome_unavailable(format!(
+                "Chrome closed the {event_name} event stream while navigating to `{url}`"
+            ))),
+            Err(_) => Err(BrowserToolError::operation_timeout(format!(
+                "timed out waiting for {event_name} after navigating to `{url}`"
+            ))),
+        }
     }
 
     pub async fn add_init_script(
