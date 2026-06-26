@@ -2769,90 +2769,21 @@ async fn broker_fill_form(
     let timeout_ms = params.timeout_ms;
     let mut completed_fields = 0;
     for field in params.fields {
-        match field {
-            FormField::Text {
-                target: element_target,
-                value,
-            } => match resolve_element_target(
-                state,
-                &params.agent_session_id,
-                &params.tab_id,
-                &target,
-                &element_target,
-            )
-            .await?
-            {
-                ResolvedElementTarget::Reference(element) => {
-                    retry_element_action(timeout_ms, || {
-                        state
-                            .browser
-                            .fill_backend_node(&target, element.backend_node_id, &value)
-                    })
-                    .await?;
-                }
-                ResolvedElementTarget::Css(selector) => {
-                    retry_element_action(timeout_ms, || {
-                        state.browser.fill_css(&target, &selector, &value)
-                    })
-                    .await?;
-                }
-            },
-            FormField::Select {
-                target: element_target,
-                values,
-            } => match resolve_element_target(
-                state,
-                &params.agent_session_id,
-                &params.tab_id,
-                &target,
-                &element_target,
-            )
-            .await?
-            {
-                ResolvedElementTarget::Reference(element) => {
-                    retry_element_action(timeout_ms, || {
-                        state
-                            .browser
-                            .select_backend_node(&target, element.backend_node_id, &values)
-                    })
-                    .await?;
-                }
-                ResolvedElementTarget::Css(selector) => {
-                    retry_element_action(timeout_ms, || {
-                        state.browser.select_css(&target, &selector, &values)
-                    })
-                    .await?;
-                }
-            },
-            FormField::Checked {
-                target: element_target,
-                checked,
-            } => match resolve_element_target(
-                state,
-                &params.agent_session_id,
-                &params.tab_id,
-                &target,
-                &element_target,
-            )
-            .await?
-            {
-                ResolvedElementTarget::Reference(element) => {
-                    retry_element_action(timeout_ms, || {
-                        state.browser.set_checked_backend_node(
-                            &target,
-                            element.backend_node_id,
-                            checked,
-                        )
-                    })
-                    .await?;
-                }
-                ResolvedElementTarget::Css(selector) => {
-                    retry_element_action(timeout_ms, || {
-                        state.browser.set_checked_css(&target, &selector, checked)
-                    })
-                    .await?;
-                }
-            },
+        if let Err(mut error) = apply_form_field(
+            state,
+            &params.agent_session_id,
+            &params.tab_id,
+            &target,
+            field,
+            timeout_ms,
+        )
+        .await
+        {
+            error.message = format!(
+                "fill_form completed {completed_fields} of {total_fields} fields: {}",
+                error.message
+            );
+            return Err(error);
         }
         completed_fields += 1;
     }
@@ -2870,6 +2801,81 @@ async fn broker_fill_form(
         document_revision: action.document_revision,
         observation: action.observation,
     })
+}
+
+async fn apply_form_field(
+    state: &BrokerState,
+    agent_session_id: &AgentSessionId,
+    tab_id: &TabId,
+    target: &CdpTarget,
+    field: FormField,
+    timeout_ms: Option<u64>,
+) -> Result<(), BrowserToolError> {
+    match field {
+        FormField::Text {
+            target: element_target,
+            value,
+        } => match resolve_element_target(state, agent_session_id, tab_id, target, &element_target)
+            .await?
+        {
+            ResolvedElementTarget::Reference(element) => {
+                retry_element_action(timeout_ms, || {
+                    state
+                        .browser
+                        .fill_backend_node(target, element.backend_node_id, &value)
+                })
+                .await
+            }
+            ResolvedElementTarget::Css(selector) => {
+                retry_element_action(timeout_ms, || {
+                    state.browser.fill_css(target, &selector, &value)
+                })
+                .await
+            }
+        },
+        FormField::Select {
+            target: element_target,
+            values,
+        } => match resolve_element_target(state, agent_session_id, tab_id, target, &element_target)
+            .await?
+        {
+            ResolvedElementTarget::Reference(element) => {
+                retry_element_action(timeout_ms, || {
+                    state
+                        .browser
+                        .select_backend_node(target, element.backend_node_id, &values)
+                })
+                .await
+            }
+            ResolvedElementTarget::Css(selector) => {
+                retry_element_action(timeout_ms, || {
+                    state.browser.select_css(target, &selector, &values)
+                })
+                .await
+            }
+        },
+        FormField::Checked {
+            target: element_target,
+            checked,
+        } => match resolve_element_target(state, agent_session_id, tab_id, target, &element_target)
+            .await?
+        {
+            ResolvedElementTarget::Reference(element) => {
+                retry_element_action(timeout_ms, || {
+                    state
+                        .browser
+                        .set_checked_backend_node(target, element.backend_node_id, checked)
+                })
+                .await
+            }
+            ResolvedElementTarget::Css(selector) => {
+                retry_element_action(timeout_ms, || {
+                    state.browser.set_checked_css(target, &selector, checked)
+                })
+                .await
+            }
+        },
+    }
 }
 
 enum ResolvedElementTarget {
