@@ -5,7 +5,7 @@ use proptest::{
     prelude::*,
     sample::select,
     strategy::{BoxedStrategy, Union},
-    test_runner::Config,
+    test_runner::{Config, FileFailurePersistence},
 };
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 use serde_json::{Value, json};
@@ -253,6 +253,9 @@ fn property_config() -> Config {
         .unwrap_or(8);
     Config {
         cases,
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/headless_mcp.txt",
+        ))),
         ..Config::default()
     }
 }
@@ -596,6 +599,17 @@ impl BrowserMcpHarness {
         )?;
         let tab = result.get("tab").context("new_tab omitted tab")?;
         let open_tab = OpenTab::from_summary(&session_id, tab)?;
+        self.client_mut().call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "url": url,
+                "wait_until": "load"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
         self.tabs.push(ConcreteTab {
             owner: Some(actor),
             state: ModelTabState::Active,

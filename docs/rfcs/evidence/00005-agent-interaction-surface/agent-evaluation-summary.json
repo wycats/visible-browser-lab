@@ -1,0 +1,514 @@
+{
+  "model": "gpt-5.5",
+  "reasoning_effort": "medium",
+  "total_trials": 30,
+  "successful_trials": 29,
+  "correct_first_selections": 28,
+  "semantic_fallback_violations": 0,
+  "unowned_backend_actions": 0,
+  "task_success_rate": 0.9666666666666667,
+  "first_selection_rate": 0.9333333333333333,
+  "passes": true,
+  "trials": [
+    {
+      "fixture_id": "page-discovery-heading-navigation",
+      "category": "page_discovery",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "page-discovery-live-region",
+      "category": "page_discovery",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "form-fill-single",
+      "category": "forms",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "fill",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "form-fill-multiple",
+      "category": "forms",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "fill_form",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "form-select-checkbox",
+      "category": "forms",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "help:fill_form",
+        "fill_form",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "form-contenteditable",
+      "category": "forms",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "type_text",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "wait-text-appearance",
+      "category": "waits",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "help:wait_for text",
+        "wait_for",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "wait-element-disappearance",
+      "category": "waits",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "help:wait_for element hidden",
+        "wait_for",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "wait-url-transition",
+      "category": "waits",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "wait_for",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "navigate-url",
+      "category": "history",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "navigate",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "navigate-history-back",
+      "category": "history",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "navigate",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "navigate-reload",
+      "category": "history",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "navigate",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "frame-fill",
+      "category": "frames",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "snapshot",
+        "fill",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "nested-frame-click",
+      "category": "frames",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "snapshot",
+        "snapshot",
+        "click",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "dialog-confirm",
+      "category": "dialogs_files",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": false,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "focus_tab",
+        "click",
+        "help:handle_dialog",
+        "interact:handle_dialog",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "file-upload",
+      "category": "dialogs_files",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "help:upload_files",
+        "interact:upload_files",
+        "snapshot",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "file-drop",
+      "category": "dialogs_files",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "help:drop",
+        "interact:drop",
+        "snapshot",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "console-error-diagnosis",
+      "category": "diagnostics",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": false,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "focus_tab",
+        "click",
+        "console",
+        "console:list",
+        "console:get",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "console-message-detail",
+      "category": "diagnostics",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "console:get",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "network-failed-request",
+      "category": "diagnostics",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": false,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "snapshot",
+        "network",
+        "network:list",
+        "network:get",
+        "close_tab"
+      ],
+      "failure": "structured observation mismatch"
+    },
+    {
+      "fixture_id": "network-response-body",
+      "category": "diagnostics",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "network:get",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "performance-vitals",
+      "category": "performance",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "help:vitals",
+        "performance",
+        "performance:vitals",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "performance-trace-analysis",
+      "category": "performance",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "performance:start_trace",
+        "performance:stop_trace",
+        "performance:analyze",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "emulation-mobile-viewport",
+      "category": "emulation",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "emulation:set_viewport",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "emulation-offline-reset",
+      "category": "emulation",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "help:set_network",
+        "emulation:set_network",
+        "emulation:reset",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "ownership-foreign-action-refusal",
+      "category": "ownership",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "list_tabs",
+        "click",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "ownership-readonly-inventory",
+      "category": "ownership",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "list_tabs",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "audit-accessibility",
+      "category": "specialized",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "audit",
+        "audit:run",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "memory-retaining-path",
+      "category": "specialized",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "start_session",
+        "help:retaining_paths",
+        "memory",
+        "memory:capture",
+        "memory:retaining_paths",
+        "close_tab"
+      ]
+    },
+    {
+      "fixture_id": "screencast-artifact-export",
+      "category": "specialized",
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "success": true,
+      "correct_first_selection": true,
+      "semantic_fallback_violation": false,
+      "unowned_backend_action": false,
+      "tool_sequence": [
+        "help:start_stop_export",
+        "start_session",
+        "screencast:start",
+        "screencast:status",
+        "screencast:stop",
+        "help:export",
+        "artifacts:list",
+        "artifacts:export",
+        "close_tab"
+      ]
+    }
+  ]
+}
