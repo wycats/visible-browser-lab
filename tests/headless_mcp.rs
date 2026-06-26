@@ -591,7 +591,6 @@ impl BrowserMcpHarness {
             "new_tab",
             json!({
                 "agent_session_id": session_id,
-                "url": url,
                 "focus": true
             }),
             Duration::from_secs(45),
