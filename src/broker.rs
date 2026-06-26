@@ -61,6 +61,7 @@ const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
 const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
+const MAX_ANALYZABLE_TRACE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct BrokerState {
@@ -4262,6 +4263,12 @@ async fn broker_performance(
                 return Err(BrowserToolError::invalid_input(
                     "performance analyze requires a trace artifact",
                 ));
+            }
+            if artifact.size_bytes > MAX_ANALYZABLE_TRACE_BYTES {
+                return Err(BrowserToolError::artifact_error(format!(
+                    "trace artifact is {} bytes; in-process analysis accepts at most {} bytes",
+                    artifact.size_bytes, MAX_ANALYZABLE_TRACE_BYTES
+                )));
             }
             let bytes = state
                 .artifacts()
