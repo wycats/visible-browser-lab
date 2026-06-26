@@ -476,6 +476,38 @@ fn complete_v03_domain_surface() -> Result<()> {
         Duration::from_secs(20),
         false,
     )?;
+    for (action, url, wait_until) in [
+        (
+            "url",
+            Some(harness.fixture.url("/page?history=one")),
+            "dom_content_loaded",
+        ),
+        (
+            "url",
+            Some(harness.fixture.url("/page?history=two")),
+            "load",
+        ),
+        ("back", None, "load"),
+        ("forward", None, "dom_content_loaded"),
+        ("reload", None, "load"),
+    ] {
+        harness
+            .client_mut()
+            .call_tool(
+                "navigate",
+                json!({
+                    "agent_session_id":session_id,
+                    "tab_id":tab.tab_id,
+                    "action":action,
+                    "url":url,
+                    "wait_until":wait_until,
+                    "observe":"none"
+                }),
+                Duration::from_secs(20),
+                false,
+            )
+            .with_context(|| format!("navigate {action} with wait_until={wait_until}"))?;
+    }
 
     harness.client_mut().call_tool(
         "close_tab",

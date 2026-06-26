@@ -837,6 +837,7 @@ impl BrowserBackend {
         &self,
         target: &CdpTarget,
         direction: i64,
+        wait_until: Option<&str>,
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<CdpTarget, BrowserToolError> {
@@ -846,7 +847,7 @@ impl BrowserBackend {
             _ => {
                 let client = self.cdp_client().await?;
                 client
-                    .navigate_history(target, direction, timeout_ms, before_unload)
+                    .navigate_history(target, direction, wait_until, timeout_ms, before_unload)
                     .await?;
                 client.page_target(&target.id).await
             }
@@ -857,6 +858,7 @@ impl BrowserBackend {
         &self,
         target: &CdpTarget,
         ignore_cache: bool,
+        wait_until: Option<&str>,
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<CdpTarget, BrowserToolError> {
@@ -866,7 +868,7 @@ impl BrowserBackend {
             _ => {
                 let client = self.cdp_client().await?;
                 client
-                    .reload(target, ignore_cache, timeout_ms, before_unload)
+                    .reload(target, ignore_cache, wait_until, timeout_ms, before_unload)
                     .await?;
                 client.page_target(&target.id).await
             }
@@ -2218,13 +2220,25 @@ async fn broker_navigate_v3(
         NavigationAction::Back => {
             state
                 .browser
-                .navigate_history(&target, -1, timeout_ms, params.before_unload.as_deref())
+                .navigate_history(
+                    &target,
+                    -1,
+                    params.wait_until.as_deref(),
+                    timeout_ms,
+                    params.before_unload.as_deref(),
+                )
                 .await
         }
         NavigationAction::Forward => {
             state
                 .browser
-                .navigate_history(&target, 1, timeout_ms, params.before_unload.as_deref())
+                .navigate_history(
+                    &target,
+                    1,
+                    params.wait_until.as_deref(),
+                    timeout_ms,
+                    params.before_unload.as_deref(),
+                )
                 .await
         }
         NavigationAction::Reload => {
@@ -2233,6 +2247,7 @@ async fn broker_navigate_v3(
                 .reload(
                     &target,
                     params.ignore_cache,
+                    params.wait_until.as_deref(),
                     timeout_ms,
                     params.before_unload.as_deref(),
                 )
@@ -4233,7 +4248,13 @@ async fn broker_performance(
             {
                 state
                     .browser
-                    .reload(&target, false, DEFAULT_NAVIGATION_TIMEOUT_MS, None)
+                    .reload(
+                        &target,
+                        false,
+                        Some("load"),
+                        DEFAULT_NAVIGATION_TIMEOUT_MS,
+                        None,
+                    )
                     .await?;
             }
             Ok(json!({"operation":"start_trace", "recording":true}))
@@ -4513,7 +4534,13 @@ async fn broker_audit(
         if mode == "navigation" {
             state
                 .browser
-                .reload(&target, false, DEFAULT_NAVIGATION_TIMEOUT_MS, None)
+                .reload(
+                    &target,
+                    false,
+                    Some("load"),
+                    DEFAULT_NAVIGATION_TIMEOUT_MS,
+                    None,
+                )
                 .await?;
         }
         let (snapshot, _) = snapshot_for_target(
