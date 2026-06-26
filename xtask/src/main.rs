@@ -16,6 +16,8 @@ use zip::{
     write::{ExtendedFileOptions, FileOptions},
 };
 
+mod agent_eval;
+
 const BINARY_NAME: &str = "visible-browser-lab-mcp";
 const DEFAULT_OUT_DIR: &str = "out/packages";
 const RELEASE_VERSION_ENV: &str = "VISIBLE_BROWSER_LAB_RELEASE_VERSION";
@@ -82,6 +84,11 @@ fn main() -> Result<()> {
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
+        "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
+        "agent-eval" => agent_eval::agent_eval_command(
+            &repo_root()?,
+            agent_eval::AgentEvalArgs::parse(args.collect())?,
+        ),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -99,6 +106,8 @@ usage:
   cargo xtask checksums [--dir <dir>]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>]
   cargo xtask install-smoke [--archive <path>] [--codex <path>] [--chrome-path <path>] [--invoke-codex] [--auth-source <path>] [--keep-temp]
+  cargo xtask catalog-measurement
+  cargo xtask agent-eval --auth-source <path> [--codex <path>] [--model <model>] [--reasoning-effort <effort>] [--fixture <id>] [--resume <run-dir>]
 "
     );
 }
@@ -324,6 +333,7 @@ fn validate() -> Result<()> {
         }
     }
     validate_source_package_contract(&root)?;
+    agent_eval::validate_catalog()?;
 
     for forbidden in [
         "package.json",

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "test-support", "xtask"]
+members = [".", "agent-surface-eval", "test-support", "xtask"]
 exclude = ["spikes/chromiumoxide", "spikes/chromiumoxide-core"]
 resolver = "3"
 

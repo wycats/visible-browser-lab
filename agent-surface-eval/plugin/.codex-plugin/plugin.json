@@ -1,0 +1,15 @@
+{
+  "name": "visible-browser-lab",
+  "version": "0.3.0-eval",
+  "description": "Candidate v0.3 visible-browser interaction contract",
+  "interface": {
+    "displayName": "Visible Browser Lab Evaluation",
+    "shortDescription": "Evaluate the lease-scoped semantic browser contract.",
+    "longDescription": "A deterministic contract server for measuring the proposed Visible Browser Lab v0.3 agent interaction surface.",
+    "developerName": "Visible Browser Lab",
+    "category": "Developer Tools",
+    "capabilities": ["browser", "mcp"],
+    "defaultPrompt": "Use the visible browser lab workflow."
+  },
+  "mcpServers": "./.mcp.json"
+}

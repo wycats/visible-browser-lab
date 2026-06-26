@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "visible-browser-lab": {
+      "command": "./bin/visible-browser-lab-eval-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": [
+        "VISIBLE_BROWSER_LAB_EVAL_FIXTURE",
+        "VISIBLE_BROWSER_LAB_EVAL_LOG"
+      ]
+    }
+  }
+}

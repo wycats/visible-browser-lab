@@ -1,0 +1,11 @@
+{
+  "encoding": "o200k_base",
+  "hybrid_tools": 27,
+  "baseline_tools": 63,
+  "domain_operations": 45,
+  "hybrid_tokens": 15549,
+  "baseline_tokens": 26893,
+  "ratio": 0.5781801955899305,
+  "maximum_ratio": 0.6,
+  "passes": true
+}
