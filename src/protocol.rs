@@ -1,13 +1,15 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Map;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use crate::{
+    artifacts::ArtifactSummary,
     config::RuntimeMode,
     ipc::{BrokerEndpoint, BrokerStream},
     leases::{
@@ -16,7 +18,7 @@ use crate::{
     },
 };
 
-pub const BROKER_PROTOCOL_VERSION: u32 = 2;
+pub const BROKER_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerStatus {
@@ -36,6 +38,8 @@ pub struct StartSessionParams {
     pub start_url: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,18 +111,61 @@ pub struct NavigateParams {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationAction {
+    Url,
+    Back,
+    Forward,
+    Reload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct V3NavigateParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub action: NavigationAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub ignore_cache: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_unload: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ScreenshotParams {
     pub agent_session_id: AgentSessionId,
     pub tab_id: TabId,
     #[serde(default)]
     pub full_page: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ElementTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenshotResult {
-    pub mime_type: String,
-    pub data_base64: String,
+    pub artifact: ArtifactSummary,
+    pub image: ScreenshotImage,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotImage {
+    pub media_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -126,6 +173,21 @@ pub struct EvaluateParams {
     pub agent_session_id: AgentSessionId,
     pub tab_id: TabId,
     pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct V3EvaluateParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ElementTarget>,
+    #[serde(default = "default_true")]
+    pub await_promise: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +203,12 @@ pub struct ClickParams {
     pub agent_session_id: AgentSessionId,
     pub tab_id: TabId,
     pub target: ElementTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub button: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,6 +322,20 @@ pub struct TypeTextParams {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct V3TypeTextParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub target: ElementTarget,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeTextResult {
     pub typed: bool,
@@ -266,6 +348,118 @@ pub struct PressKeyParams {
     pub key: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct V3PressKeyParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ElementTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitCondition {
+    Delay {
+        duration_ms: u64,
+    },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    Element {
+        target: ElementTarget,
+        state: String,
+    },
+    Url {
+        value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        r#match: Option<String>,
+    },
+    Load {
+        state: String,
+    },
+    Expression {
+        expression: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WaitForParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub condition: WaitCondition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForResult {
+    pub matched: bool,
+    pub elapsed_ms: u64,
+    pub document_revision: String,
+    pub observation: Observation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FormField {
+    Text {
+        target: ElementTarget,
+        value: String,
+    },
+    Select {
+        target: ElementTarget,
+        values: Vec<String>,
+    },
+    Checked {
+        target: ElementTarget,
+        checked: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FillFormParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    pub fields: Vec<FormField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observe: Option<ObservationMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FillFormResult {
+    pub completed_fields: usize,
+    pub total_fields: usize,
+    pub document_revision: String,
+    pub observation: Observation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DomainParams {
+    pub agent_session_id: AgentSessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<TabId>,
+    pub operation: String,
+    #[serde(flatten)]
+    pub arguments: Map<String, Value>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,9 +489,17 @@ pub struct NetworkEvent {
     pub sequence: u64,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,6 +686,9 @@ mod tests {
                 css: "#submit".to_string(),
                 frame_ref: None,
             }),
+            button: Some("right".to_string()),
+            count: Some(2),
+            modifiers: vec!["shift".to_string()],
             timeout_ms: Some(500),
             observe: Some(ObservationMode::Diff),
         };

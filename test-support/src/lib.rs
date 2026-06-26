@@ -363,15 +363,15 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
+            "action": "url",
             "url": data_url("VBL Smoke Nav", "VBL Smoke Nav"),
             "timeout_ms": 10000
         }),
         Duration::from_secs(30),
         false,
     )?;
-    let navigated_tab = navigated.get("tab").context("navigate omitted tab")?;
-    if field_str(navigated_tab, "tab_id")? != transferable_tab.tab_id {
-        bail!("navigate returned a different tab_id");
+    if navigated.get("document_revision").is_none() {
+        bail!("navigate omitted the active document revision");
     }
 
     let screenshot = client.call_tool(
@@ -384,19 +384,24 @@ pub fn run_live_smoke(
         Duration::from_secs(30),
         false,
     )?;
-    if field_str(&screenshot, "mime_type")? != "image/png" {
+    if screenshot
+        .pointer("/image/media_type")
+        .and_then(Value::as_str)
+        != Some("image/png")
+    {
         bail!("screenshot returned a non-PNG mime type");
     }
-    let screenshot_data = field_str(&screenshot, "data_base64")?;
-    if !screenshot_data.starts_with("iVBOR") || screenshot_data.len() < 1000 {
-        bail!("screenshot payload does not look like a PNG");
-    }
+    let screenshot_bytes = screenshot
+        .pointer("/artifact/size_bytes")
+        .and_then(Value::as_u64)
+        .context("screenshot omitted artifact size")? as usize;
 
     client.call_tool(
         "navigate",
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
+            "action": "url",
             "url": fixture.url("/page"),
             "timeout_ms": 10000
         }),
@@ -409,7 +414,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "(async () => { console.log('vbl-console-ready'); await fetch('/data.json'); return { title: document.title, ready: true }; })()"
+            "source": "(async () => { console.log('vbl-console-ready'); await fetch('/data.json'); return { title: document.title, ready: true }; })()"
         }),
         Duration::from_secs(30),
         false,
@@ -435,7 +440,7 @@ pub fn run_live_smoke(
     )?;
     let tree = field_str(&snapshot, "tree")?;
     let button_ref = snapshot_ref(&tree, "button \"Click\"")?;
-    let textbox_ref = snapshot_ref(&tree, "textbox [ref=")?;
+    let textbox_ref = snapshot_ref(&tree, "textbox \"Entry\"")?;
     let frame_textbox_ref = snapshot_ref(&tree, "textbox \"Frame value\"")?;
     let frame_button_ref = snapshot_ref(&tree, "button \"Frame click\"")?;
 
@@ -464,7 +469,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "document.querySelector('#entry').value"
+            "source": "document.querySelector('#entry').value"
         }),
         Duration::from_secs(20),
         false,
@@ -490,7 +495,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "document.querySelector('iframe').contentDocument.querySelector('#frame-entry').value"
+            "source": "document.querySelector('iframe').contentDocument.querySelector('#frame-entry').value"
         }),
         Duration::from_secs(20),
         false,
@@ -516,7 +521,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
+            "source": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
         }),
         Duration::from_secs(20),
         false,
@@ -544,7 +549,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "document.body.dataset.clicked"
+            "source": "document.body.dataset.clicked"
         }),
         Duration::from_secs(20),
         false,
@@ -558,7 +563,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "document.querySelector('#clicker').remove()"
+            "source": "document.querySelector('#clicker').remove()"
         }),
         Duration::from_secs(20),
         false,
@@ -607,6 +612,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
             "text": "typed"
         }),
         Duration::from_secs(20),
@@ -627,7 +633,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
-            "expression": "({ value: document.querySelector('#entry').value, key: document.body.dataset.key })"
+            "source": "({ value: document.querySelector('#entry').value, key: document.body.dataset.key })"
         }),
         Duration::from_secs(20),
         false,
@@ -662,6 +668,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
+            "action": "url",
             "url": fixture.url("/page?revision=2"),
             "timeout_ms": 10000
         }),
@@ -691,14 +698,14 @@ pub fn run_live_smoke(
         "fill",
         "type_text",
         "press_key",
-        "console_messages",
-        "network_events",
+        "console",
+        "network",
     ] {
         let arguments = match tool {
             "evaluate" => json!({
                 "agent_session_id": first_session,
                 "tab_id": second_open_tab.tab_id,
-                "expression": "1 + 1"
+                "source": "1 + 1"
             }),
             "snapshot" => json!({
                 "agent_session_id": first_session,
@@ -720,6 +727,7 @@ pub fn run_live_smoke(
             "type_text" => json!({
                 "agent_session_id": first_session,
                 "tab_id": second_open_tab.tab_id,
+                "target": { "ref": textbox_ref },
                 "text": "x"
             }),
             "press_key" => json!({
@@ -727,9 +735,10 @@ pub fn run_live_smoke(
                 "tab_id": second_open_tab.tab_id,
                 "key": "Enter"
             }),
-            "console_messages" | "network_events" => json!({
+            "console" | "network" => json!({
                 "agent_session_id": first_session,
-                "tab_id": second_open_tab.tab_id
+                "tab_id": second_open_tab.tab_id,
+                "operation": "list"
             }),
             _ => unreachable!(),
         };
@@ -897,7 +906,7 @@ pub fn run_live_smoke(
 
     Ok(SmokeSummary {
         tool_count: tool_names.len(),
-        screenshot_bytes: screenshot_data.len() * 3 / 4,
+        screenshot_bytes,
         global_groups: groups.len(),
     })
 }
@@ -909,17 +918,27 @@ pub const EXPECTED_TOOLS: &[&str] = &[
     "claim_tab",
     "release_tab",
     "focus_tab",
-    "navigate",
-    "screenshot",
-    "evaluate",
+    "close_tab",
     "snapshot",
+    "navigate",
+    "wait_for",
     "click",
     "fill",
+    "fill_form",
     "type_text",
     "press_key",
-    "console_messages",
-    "network_events",
-    "close_tab",
+    "screenshot",
+    "evaluate",
+    "interact",
+    "console",
+    "network",
+    "emulation",
+    "performance",
+    "audit",
+    "memory",
+    "screencast",
+    "artifacts",
+    "help",
 ];
 
 pub fn advertised_tool_names(tools_response: &Value) -> Result<Vec<&str>> {
@@ -955,10 +974,11 @@ pub fn wait_for_console_message(
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let result = client.call_tool(
-            "console_messages",
+            "console",
             json!({
                 "agent_session_id": session_id,
-                "tab_id": tab_id
+                "tab_id": tab_id,
+                "operation": "list"
             }),
             Duration::from_secs(10),
             false,
@@ -980,7 +1000,7 @@ pub fn wait_for_console_message(
         thread::sleep(Duration::from_millis(100));
     }
 
-    bail!("console_messages did not include `{expected}`");
+    bail!("console list did not include `{expected}`");
 }
 
 pub fn wait_for_network_event(
@@ -992,16 +1012,17 @@ pub fn wait_for_network_event(
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let result = client.call_tool(
-            "network_events",
+            "network",
             json!({
                 "agent_session_id": session_id,
-                "tab_id": tab_id
+                "tab_id": tab_id,
+                "operation": "list"
             }),
             Duration::from_secs(10),
             false,
         )?;
         if result
-            .get("events")
+            .get("requests")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -1017,7 +1038,7 @@ pub fn wait_for_network_event(
         thread::sleep(Duration::from_millis(100));
     }
 
-    bail!("network_events did not include `{expected_url_fragment}`");
+    bail!("network list did not include `{expected_url_fragment}`");
 }
 
 pub struct FixtureServer {
@@ -1101,13 +1122,24 @@ fn handle_fixture_connection(mut stream: TcpStream) {
             "text/html; charset=utf-8",
             r#"<!doctype html>
 <title>VBL Fixture</title>
-<button id="clicker" onclick="document.body.dataset.clicked='yes'; console.log('vbl-clicked')">Click</button>
-<input id="entry" />
+<button id="clicker" onclick="document.body.dataset.clicked='yes'; document.body.dataset.clickButton=event.button; document.body.dataset.clickShift=event.shiftKey; console.log('vbl-clicked')" ondblclick="document.body.dataset.doubleClicked='yes'">Click</button>
+<label>Entry <input id="entry" /></label>
+<label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label>
+<label><input id="checked" type="checkbox" /> Enabled</label>
+<div id="editable" contenteditable="true" aria-label="Editable value"></div>
+<button id="hover" onmouseenter="document.body.dataset.hovered='yes'">Hover target</button>
+<div id="drag-source" role="button" tabindex="0" draggable="true">Drag source</div>
+<div id="drop-target" role="button" tabindex="0" ondragover="event.preventDefault()" ondrop="event.preventDefault(); document.body.dataset.dropped='yes'">Drop target</div>
+<label>Upload <input id="upload" type="file" /></label>
+<div id="file-drop" role="button" tabindex="0" ondragover="event.preventDefault()" ondrop="event.preventDefault(); document.body.dataset.files=event.dataTransfer.files.length">File drop</div>
+<div id="scroll-box" tabindex="0" style="height:40px;overflow:auto"><div style="height:200px">Scrollable content</div></div>
+<button id="dialog" onclick="document.body.dataset.dialog=confirm('Continue?')">Dialog</button>
 <iframe src="/frame" title="Embedded fixture"></iframe>
 <script>
 document.querySelector('#entry').addEventListener('keydown', (event) => {
   document.body.dataset.key = event.key;
 });
+document.querySelector('#drop-target').addEventListener('drop', () => document.body.dataset.dropped='yes');
 </script>"#
                 .to_string(),
         ),

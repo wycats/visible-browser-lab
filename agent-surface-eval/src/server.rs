@@ -16,8 +16,9 @@ use rmcp::{
 };
 use serde_json::{Map, Value, json};
 
+use agent_surface_contract::{DOMAIN_OPERATIONS, SERVER_INSTRUCTIONS, hybrid_catalog};
+
 use crate::{
-    catalog::{DOMAIN_OPERATIONS, SERVER_INSTRUCTIONS, hybrid_catalog},
     fixtures::{Fixture, fixtures},
     scoring::LoggedCall,
 };
@@ -397,7 +398,8 @@ fn artifact(id: &str, kind: &str, media_type: &str) -> Value {
         "media_type":media_type,
         "size_bytes":1024,
         "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "created_at_ms":1_782_449_108_000_u64
+        "created_at_ms":1_782_449_108_000_u64,
+        "retention":"session"
     })
 }
 

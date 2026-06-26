@@ -189,6 +189,7 @@ type ArtifactSummary = {
   size_bytes: number;
   sha256: string;
   created_at_ms: number;
+  retention: "session";
 };
 ```
 
@@ -588,7 +589,7 @@ Emulation state belongs to the owned target. Responses state the effective value
 
 `performance` operations are `start_trace`, `stop_trace`, `vitals`, and `analyze`. Trace capture occurs through the owned target's CDP session. Trace data becomes an artifact before analysis.
 
-Analyzer sidecars receive an artifact path and bounded analysis parameters. They never receive the Chrome endpoint, target ID, session bearer, tab bearer, or browser profile path. A sidecar is packaged only after its binary, checksum, license, supported targets, and deterministic output are verified in release CI.
+The performance analyzer runs inside `visible-browser-lab-mcp`. It reads a completed trace artifact and bounded analysis parameters without receiving the Chrome endpoint, target ID, session bearer, tab bearer, or browser profile path. It produces deterministic findings for long tasks, script execution, style and layout, paint, network activity, and dominant trace slices on all six release targets. The [analyzer feasibility record](../evidence/00005-agent-interaction-surface/analyzer-feasibility.md) defines the target evidence and output boundary.
 
 ## Audit
 
@@ -600,11 +601,11 @@ Analyzer sidecars receive an artifact path and bounded analysis parameters. They
 
 ## Screencast
 
-`screencast` operations are `start`, `stop`, and `status`. Recording remains bound to the owned target. Stop returns a video artifact.
+`screencast` operations are `start`, `stop`, and `status`. Recording remains bound to the owned target. Stop returns a silent AV1-in-WebM video artifact. The encoder runs inside `visible-browser-lab-mcp`; installed packages do not require a media runtime. Frame rate defaults to 10 and is capped at 30. Maximum duration defaults to 30 seconds and is capped at 5 minutes.
 
 ## Artifacts
 
-`artifacts` operations are `list`, `metadata`, `read`, `export`, and `delete`. Artifacts carry owner session, originating tab, kind, media type, size, checksum, creation time, and retention state.
+`artifacts` operations are `list`, `metadata`, `read`, `export`, and `delete`. Artifacts carry owner session, originating tab, kind, media type, size, checksum, creation time, and `session` retention. A broker generation removes artifacts whose owning sessions can no longer be reached.
 
 Inline reads are bounded. Export paths are relative to the active workspace root supplied by the MCP host. The broker rejects paths that escape that root.
 
@@ -710,8 +711,8 @@ type MemoryInput = PageScope & (
 );
 
 type ScreencastInput = PageScope & (
-  | { operation: "start"; format?: "webm" | "mp4"; fps?: number;
-      quality?: number; max_duration_ms?: number }
+  | { operation: "start"; fps?: number; quality?: number;
+      max_duration_ms?: number }
   | { operation: "stop" }
   | { operation: "status" }
 );
@@ -918,10 +919,17 @@ The broker owns:
 - post-action snapshot diffs;
 - diagnostic and artifact registries;
 - workspace path validation;
-- analyzer process lifecycle;
+- trace aggregation and deterministic performance findings;
+- accessibility, SEO, best-practices, and agentic-browsing audits;
+- V8 heap-snapshot parsing and graph analysis;
+- AV1 encoding and WebM muxing;
 - translation into stable MCP outputs.
 
-Specialized analyzers operate on broker-created artifacts through a narrow local process interface. Release packages contain every required executable for their target. Installed machines do not compile Rust or install Node.
+The performance analyzer, heap parser, audit engine, and screencast encoder run
+inside `visible-browser-lab-mcp`. They consume broker-owned data after session
+and tab validation and return bounded structured results plus session-owned
+artifacts. Each release package contains one executable and requires no
+language, media, or trace-analysis runtime on the installed machine.
 
 # Drawbacks
 
@@ -941,7 +949,7 @@ A small set of generic tools minimizes tool count but moves too much meaning int
 
 A DOM-derived semantic tree can run as injected JavaScript. Chrome's Accessibility domain supplies computed browser semantics and backend node associations directly, so the broker uses it as the primary representation and enriches it with DOM data.
 
-Bundled Playwright and Chrome DevTools MCP processes would preserve their internal behavior. A Chromiumoxide core keeps ownership validation, target selection, focus policy, runtime packaging, errors, and outputs inside one broker contract. Artifact-only analyzers add specialized computation without receiving browser authority.
+Bundled Playwright and Chrome DevTools MCP processes would preserve their internal behavior. A Chromiumoxide core keeps ownership validation, target selection, focus policy, runtime packaging, errors, outputs, analysis, and artifact generation inside one broker contract.
 
 # Stage 2 Criteria
 
@@ -957,5 +965,14 @@ Stage 2 promotion requires:
 - Semantic tasks do not use CSS or `evaluate` unless the task requests that path.
 - No trial acts on an unowned tab.
 - The hybrid catalog's serialized schema token count is at most 60 percent of a one-tool-per-operation catalog covering the same capability matrix.
-- Performance analyzer feasibility is verified for all six release targets, with a packaged sidecar or an in-process implementation that preserves the public output contract.
+- The in-process performance analyzer compiles for all six release targets and preserves one public output contract.
 - Unit, fake-CDP, headless real-browser, visible macOS, Windows compile, package validation, and deterministic catalog checks pass.
+
+The Stage 2 evidence consists of:
+
+- a capability matrix covering 23 default Playwright MCP operations and 29 default Chrome DevTools MCP operations;
+- one shared 27-tool contract and 63-tool comparison catalog consumed by the production MCP server and evaluation server;
+- an `o200k_base` catalog measurement of 15,668 tokens for the hybrid catalog and 27,193 tokens for the comparison catalog, a ratio of 57.62 percent;
+- 29 successful tasks and 29 correct first selections across 30 isolated GPT-5.5 medium-reasoning trials, with zero semantic fallback violations and zero foreign-tab actions;
+- real-browser tests for the ownership boundary, accessibility references, actionability, all 45 domain operations, artifact containment, trace and heap analysis, and silent AV1-in-WebM capture;
+- strict workspace Clippy, workspace tests, Windows ARM64 compilation, release-input validation, and deterministic catalog validation.
