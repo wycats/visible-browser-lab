@@ -19,6 +19,7 @@ pub struct RawAxNode {
     pub value: Option<String>,
     pub properties: Vec<(String, String)>,
     pub ignored: bool,
+    pub bounds: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,8 +92,11 @@ pub struct SnapshotBuildContext<'a> {
     pub tab_id: &'a TabId,
     pub target_id: &'a str,
     pub mode: SnapshotMode,
+    pub root_backend_node_id: Option<i64>,
     pub depth: usize,
     pub max_nodes: usize,
+    pub include_hidden: bool,
+    pub include_bounds: bool,
 }
 
 impl ElementReferenceRegistry {
@@ -110,10 +114,25 @@ impl ElementReferenceRegistry {
             tab_id,
             target_id,
             mode,
+            root_backend_node_id,
             depth,
             max_nodes,
+            include_hidden,
+            include_bounds,
         } = context;
         let document_revision = raw.document_revision()?.to_string();
+        if let Some(root_backend_node_id) = root_backend_node_id
+            && !raw.frames.iter().any(|frame| {
+                frame
+                    .nodes
+                    .iter()
+                    .any(|node| node.backend_node_id == Some(root_backend_node_id))
+            })
+        {
+            return Err(BrowserToolError::element_not_found(
+                "snapshot root is absent from the accessibility tree",
+            ));
+        }
         let next_ref = &mut self.next_ref;
         let tab = self.tabs.entry(tab_id.clone()).or_default();
         if tab.agent_session_id.as_ref() != Some(agent_session_id)
@@ -137,8 +156,11 @@ impl ElementReferenceRegistry {
             target_id,
             document_revision: &document_revision,
             mode,
+            root_backend_node_id,
             depth,
             max_nodes,
+            include_hidden,
+            include_bounds,
             node_count: 0,
             truncated: false,
             lines: vec![format!(
@@ -209,8 +231,11 @@ struct SnapshotFormatter<'a> {
     target_id: &'a str,
     document_revision: &'a str,
     mode: SnapshotMode,
+    root_backend_node_id: Option<i64>,
     depth: usize,
     max_nodes: usize,
+    include_hidden: bool,
+    include_bounds: bool,
     node_count: usize,
     truncated: bool,
     lines: Vec<String>,
@@ -218,6 +243,30 @@ struct SnapshotFormatter<'a> {
 
 impl SnapshotFormatter<'_> {
     fn format_frames(&mut self, frames: &[RawAxFrame]) {
+        if let Some(root_backend_node_id) = self.root_backend_node_id {
+            for frame in frames {
+                let Some(root) = frame
+                    .nodes
+                    .iter()
+                    .find(|node| node.backend_node_id == Some(root_backend_node_id))
+                else {
+                    continue;
+                };
+                self.lines.push(format!(
+                    "  frame id={} url={}",
+                    quoted(&frame.frame_id),
+                    quoted(&frame.url)
+                ));
+                let nodes = frame
+                    .nodes
+                    .iter()
+                    .map(|node| (node.node_id.as_str(), node))
+                    .collect::<HashMap<_, _>>();
+                self.format_node(root, &nodes, 2, 0);
+                return;
+            }
+            return;
+        }
         for frame in frames {
             if self.truncated {
                 break;
@@ -272,7 +321,7 @@ impl SnapshotFormatter<'_> {
             return;
         }
 
-        let include = should_include(node, self.mode);
+        let include = should_include(node, self.mode, self.include_hidden);
         let child_indent = if include { indent + 1 } else { indent };
         if include {
             if self.node_count >= self.max_nodes {
@@ -349,11 +398,16 @@ fn format_node(formatter: &mut SnapshotFormatter<'_>, node: &RawAxNode, indent: 
             parts.push(format!("[{name}={}]", compact(value)));
         }
     }
+    if formatter.include_bounds
+        && let Some(bounds) = &node.bounds
+    {
+        parts.push(format!("[bounds={bounds}]"));
+    }
     parts.join(" ")
 }
 
-fn should_include(node: &RawAxNode, mode: SnapshotMode) -> bool {
-    if node.ignored {
+fn should_include(node: &RawAxNode, mode: SnapshotMode, include_hidden: bool) -> bool {
+    if node.ignored && !include_hidden {
         return false;
     }
     let role = node.role.to_ascii_lowercase();
@@ -490,6 +544,7 @@ mod tests {
                         value: None,
                         properties: Vec::new(),
                         ignored: false,
+                        bounds: Some("0.0,0.0,800.0,600.0".to_string()),
                     },
                     RawAxNode {
                         node_id: "button".to_string(),
@@ -502,6 +557,7 @@ mod tests {
                         value: None,
                         properties: vec![("disabled".to_string(), "false".to_string())],
                         ignored: false,
+                        bounds: Some("20.0,20.0,80.0,30.0".to_string()),
                     },
                 ],
             }],
@@ -514,8 +570,11 @@ mod tests {
             tab_id: tab,
             target_id: "target-a",
             mode: SnapshotMode::Meaningful,
+            root_backend_node_id: None,
             depth: 8,
             max_nodes: 500,
+            include_hidden: false,
+            include_bounds: false,
         }
     }
 
@@ -576,6 +635,56 @@ mod tests {
             error.code,
             crate::leases::BrowserToolErrorCode::ElementStale
         );
+    }
+
+    #[test]
+    fn snapshot_root_scopes_tree_and_includes_bounds_on_request() {
+        let session = AgentSessionId("session_a".to_string());
+        let tab = TabId("tab_a".to_string());
+        let mut registry = ElementReferenceRegistry::new();
+        let mut options = context(&session, &tab);
+        options.root_backend_node_id = Some(2);
+        options.include_bounds = true;
+
+        let (snapshot, _) = registry
+            .build_snapshot(options, raw_snapshot("loader-a", "Submit"))
+            .unwrap();
+
+        assert!(snapshot.tree.contains("button \"Submit\""));
+        assert!(snapshot.tree.contains("[bounds=20.0,20.0,80.0,30.0]"));
+        assert!(!snapshot.tree.contains("WebArea"));
+    }
+
+    #[test]
+    fn hidden_accessibility_nodes_require_include_hidden() {
+        let session = AgentSessionId("session_a".to_string());
+        let tab = TabId("tab_a".to_string());
+        let mut raw = raw_snapshot("loader-a", "Submit");
+        raw.frames[0].nodes[0].child_ids.push("hidden".to_string());
+        raw.frames[0].nodes.push(RawAxNode {
+            node_id: "hidden".to_string(),
+            parent_id: Some("root".to_string()),
+            child_ids: Vec::new(),
+            backend_node_id: Some(3),
+            frame_id: "frame-main".to_string(),
+            role: "button".to_string(),
+            name: "Hidden action".to_string(),
+            value: None,
+            properties: Vec::new(),
+            ignored: true,
+            bounds: None,
+        });
+        let mut registry = ElementReferenceRegistry::new();
+
+        let (without_hidden, _) = registry
+            .build_snapshot(context(&session, &tab), raw.clone())
+            .unwrap();
+        let mut options = context(&session, &tab);
+        options.include_hidden = true;
+        let (with_hidden, _) = registry.build_snapshot(options, raw).unwrap();
+
+        assert!(!without_hidden.tree.contains("Hidden action"));
+        assert!(with_hidden.tree.contains("Hidden action"));
     }
 
     #[test]

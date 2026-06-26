@@ -262,9 +262,15 @@ pub struct SnapshotParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<SnapshotMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<ElementTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_nodes: Option<usize>,
+    #[serde(default)]
+    pub include_hidden: bool,
+    #[serde(default)]
+    pub include_bounds: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
