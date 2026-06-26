@@ -214,6 +214,27 @@ impl ElementReferenceRegistry {
             .map(|tab| tab.document_revision.clone())
     }
 
+    pub fn reference_for_backend_node(
+        &self,
+        agent_session_id: &AgentSessionId,
+        tab_id: &TabId,
+        backend_node_id: i64,
+        document_revision: &str,
+    ) -> Option<String> {
+        let tab = self.tabs.get(tab_id)?;
+        if tab.agent_session_id.as_ref() != Some(agent_session_id)
+            || tab.document_revision != document_revision
+        {
+            return None;
+        }
+        tab.by_node
+            .iter()
+            .find(|(key, _)| {
+                key.backend_node_id == backend_node_id && key.document_revision == document_revision
+            })
+            .map(|(_, reference)| reference.clone())
+    }
+
     pub fn reset_tab(&mut self, tab_id: &TabId) {
         self.tabs.remove(tab_id);
     }
