@@ -41,9 +41,10 @@ session-owned artifact. The analyzer returns bounded findings for:
 - the largest duration-bearing trace slices.
 
 The optional `insight` parameter selects `overview`, `long_tasks`,
-`script_execution`, `style_layout`, `paint`, or `network`. The analyzer parses
-events incrementally, retains bounded aggregates, and never loads an unbounded
-result set into the MCP response.
+`script_execution`, `style_layout`, `paint`, or `network`. The analyzer accepts
+trace artifacts up to 128 MiB, deserializes the trace JSON in process, and
+returns at most 100 findings. Larger traces remain available through the
+artifact API for export and external analysis.
 
 ## Distribution Contract
 
