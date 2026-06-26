@@ -41,7 +41,7 @@ fn complete_v03_domain_surface() -> Result<()> {
         "start_session",
         json!({
             "label":"v03-domain-surface",
-            "start_url":start_url,
+            "start_url":"about:blank",
             "focus":true,
             "workspace_root":workspace
         }),
@@ -52,6 +52,12 @@ fn complete_v03_domain_surface() -> Result<()> {
     let tab = OpenTab::from_summary(
         &session_id,
         session.get("tab").context("start_session omitted tab")?,
+    )?;
+    harness.client_mut().call_tool(
+        "navigate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"action":"url","url":start_url,"wait_until":"load"}),
+        Duration::from_secs(20),
+        false,
     )?;
     let snapshot = harness.client_mut().call_tool(
         "snapshot",
