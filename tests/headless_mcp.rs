@@ -311,6 +311,12 @@ fn complete_v03_domain_surface() -> Result<()> {
         false,
     )?;
 
+    harness.client_mut().call_tool(
+        "emulation",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"set_viewport","width":777,"height":555,"device_scale_factor":1,"mobile":false,"touch":false}),
+        Duration::from_secs(20),
+        false,
+    )?;
     let audit = harness.client_mut().call_tool(
         "audit",
         json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"run","categories":["accessibility","seo","best_practices","agentic_browsing"],"mode":"navigation","device":"mobile"}),
@@ -324,6 +330,20 @@ fn complete_v03_domain_surface() -> Result<()> {
                 .is_some_and(|refs| !refs.is_empty())
         })
     }));
+    let restored_viewport = harness.client_mut().call_tool(
+        "evaluate",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"({width:innerWidth,height:innerHeight})"}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(restored_viewport["value"]["width"], 777);
+    assert_eq!(restored_viewport["value"]["height"], 555);
+    harness.client_mut().call_tool(
+        "emulation",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"reset"}),
+        Duration::from_secs(20),
+        false,
+    )?;
     let audit_id = field_str(&audit["reports"][0], "artifact_id")?;
 
     let capture = harness.client_mut().call_tool(
