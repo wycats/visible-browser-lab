@@ -1025,7 +1025,7 @@ impl BrowserMcpHarness {
             "start_session",
             json!({
                 "label": actor.label(),
-                "start_url": url,
+                "start_url": "about:blank",
                 "focus": true
             }),
             Duration::from_secs(45),
@@ -1034,6 +1034,18 @@ impl BrowserMcpHarness {
         let session_id = field_str(&result, "agent_session_id")?;
         let tab = result.get("tab").context("start_session omitted tab")?;
         let open_tab = OpenTab::from_summary(&session_id, tab)?;
+        self.client_mut().call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": open_tab.tab_id,
+                "action": "url",
+                "url": url,
+                "wait_until": "load"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
         self.sessions[actor.index()] = Some(session_id);
         self.tabs.push(ConcreteTab {
             owner: Some(actor),
