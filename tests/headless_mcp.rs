@@ -73,8 +73,6 @@ fn complete_v03_domain_surface() -> Result<()> {
     let drag_ref = snapshot_element_ref(&tree, "button \"Drag source\"")?;
     let drop_ref = snapshot_element_ref(&tree, "button \"Drop target\"")?;
     let file_drop_ref = snapshot_element_ref(&tree, "button \"File drop\"")?;
-    let upload_ref = snapshot_element_ref(&tree, "button \"Upload\"")
-        .or_else(|_| snapshot_element_ref(&tree, "button \"Choose File\""))?;
     let dialog_ref = snapshot_element_ref(&tree, "button \"Dialog\"")?;
     let iframe_ref = snapshot_element_ref(&tree, "Iframe \"Embedded fixture\"")?;
     let rooted_snapshot = harness.client_mut().call_tool(
@@ -151,11 +149,11 @@ fn complete_v03_domain_surface() -> Result<()> {
     for arguments in [
         json!({"operation":"select_options","target":{"ref":select_ref},"values":["two"],"observe":"none"}),
         json!({"operation":"set_checked","target":{"ref":checkbox_ref},"checked":true,"observe":"none"}),
-        json!({"operation":"hover","target":{"ref":hover_ref},"observe":"none"}),
+        json!({"operation":"hover","target":{"css":"#hover"},"observe":"none"}),
         json!({"operation":"drag","source":{"ref":drag_ref},"destination":{"ref":drop_ref},"observe":"none"}),
         json!({"operation":"drop","target":{"ref":file_drop_ref},"paths":["upload.txt"],"data":{"text/plain":"fixture"},"observe":"none"}),
-        json!({"operation":"upload_files","target":{"ref":upload_ref},"paths":["upload.txt"],"observe":"none"}),
-        json!({"operation":"scroll","delta_y":120,"observe":"none"}),
+        json!({"operation":"upload_files","target":{"css":"#upload"},"paths":["upload.txt"],"observe":"none"}),
+        json!({"operation":"scroll","target":{"css":"#scroll-box"},"delta_y":120,"observe":"none"}),
         json!({"operation":"click_at","x":2,"y":2,"button":"left","count":1,"observe":"none"}),
     ] {
         let mut arguments = arguments.as_object().cloned().unwrap();
