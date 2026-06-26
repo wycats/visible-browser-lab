@@ -71,6 +71,7 @@ struct BrokerState {
     artifacts: Arc<Mutex<ArtifactRegistry>>,
     traces: Arc<AsyncMutex<HashMap<String, TraceCapture>>>,
     screencasts: Arc<AsyncMutex<HashMap<String, ActiveScreencast>>>,
+    viewport_overrides: Arc<Mutex<HashMap<String, serde_json::Map<String, Value>>>>,
     focused_target_id: Arc<Mutex<Option<String>>>,
     browser: BrowserBackend,
 }
@@ -87,6 +88,7 @@ impl BrokerState {
             )),
             traces: Arc::new(AsyncMutex::new(HashMap::new())),
             screencasts: Arc::new(AsyncMutex::new(HashMap::new())),
+            viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             browser: BrowserBackend::new(config)?,
         })
@@ -102,6 +104,7 @@ impl BrokerState {
             artifacts: Arc::new(Mutex::new(ArtifactRegistry::new(&state_dir).unwrap())),
             traces: Arc::new(AsyncMutex::new(HashMap::new())),
             screencasts: Arc::new(AsyncMutex::new(HashMap::new())),
+            viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             browser,
         }
@@ -2056,6 +2059,7 @@ async fn broker_claim_tab(
             .browser
             .emulate(&target, "reset", &serde_json::Map::new())
             .await?;
+        state.viewport_overrides.lock().unwrap().remove(&target.id);
     }
     let tab = state.registry().lock().unwrap().claim_tab(
         &params.agent_session_id,
@@ -2111,6 +2115,7 @@ async fn broker_release_tab(
             .browser
             .emulate(&target, "reset", &serde_json::Map::new())
             .await?;
+        state.viewport_overrides.lock().unwrap().remove(&target.id);
     }
     state
         .diagnostics()
@@ -4050,6 +4055,19 @@ async fn broker_emulation(
         .browser
         .emulate(&target, &params.operation, &params.arguments)
         .await?;
+    match params.operation.as_str() {
+        "set_viewport" => {
+            state
+                .viewport_overrides
+                .lock()
+                .unwrap()
+                .insert(target.id.clone(), params.arguments.clone());
+        }
+        "reset" => {
+            state.viewport_overrides.lock().unwrap().remove(&target.id);
+        }
+        _ => {}
+    }
     Ok(json!({"operation":params.operation, "effective":effective}))
 }
 
@@ -4461,6 +4479,16 @@ async fn broker_audit(
   return {{findings}};
 }})()"#
     );
+    let prior_viewport = (device == "mobile")
+        .then(|| {
+            state
+                .viewport_overrides
+                .lock()
+                .unwrap()
+                .get(&target.id)
+                .cloned()
+        })
+        .flatten();
     if device == "mobile" {
         state
             .browser
@@ -4504,10 +4532,16 @@ async fn broker_audit(
         Ok::<_, BrowserToolError>((snapshot.document_revision, result))
     }
     .await;
-    let reset_result = if device == "mobile" {
+    let reset_result = if let Some(prior_viewport) = prior_viewport {
         state
             .browser
-            .emulate(&target, "reset", &serde_json::Map::new())
+            .emulate(&target, "set_viewport", &prior_viewport)
+            .await
+            .map(|_| ())
+    } else if device == "mobile" {
+        state
+            .browser
+            .emulate(&target, "reset_viewport", &serde_json::Map::new())
             .await
             .map(|_| ())
     } else {
@@ -4893,6 +4927,11 @@ async fn broker_close_tab(
             Err(error) => return Err(error),
         }
     }
+    state
+        .viewport_overrides
+        .lock()
+        .unwrap()
+        .remove(&lease.target_id);
 
     let closed = state
         .registry()
@@ -5000,6 +5039,11 @@ async fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
                 drop(active);
             }
             state.clear_focused_target(&lease.target_id);
+            state
+                .viewport_overrides
+                .lock()
+                .unwrap()
+                .remove(&lease.target_id);
             state
                 .diagnostics()
                 .lock()

@@ -1905,6 +1905,22 @@ impl CdpClient {
                     )
                     .await?;
             }
+            "reset_viewport" => {
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(ClearDeviceMetricsOverrideParams::default()),
+                        "clear viewport emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetTouchEmulationEnabledParams::new(false)),
+                        "clear touch emulation",
+                    )
+                    .await?;
+            }
             "reset" => {
                 self.runtime
                     .page_command(
