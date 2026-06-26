@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
+    future::Future,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -28,8 +29,8 @@ use crate::{
     config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
-        AgentSessionId, BrowserToolError, LeaseRegistry, LeaseState, OwnedTabSummary, TabId,
-        TabLease, TabSnapshot,
+        AgentSessionId, BrowserToolError, BrowserToolErrorCode, LeaseRegistry, LeaseState,
+        OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
     managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
@@ -58,6 +59,7 @@ const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
 const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
 
 #[derive(Clone)]
@@ -2676,16 +2678,16 @@ async fn broker_click(
     .await?
     {
         ResolvedElementTarget::Reference(element) => {
-            state
-                .browser
-                .click_backend_node(
+            retry_element_action(params.timeout_ms, || {
+                state.browser.click_backend_node(
                     &target,
                     element.backend_node_id,
                     button,
                     count,
                     &params.modifiers,
                 )
-                .await?;
+            })
+            .await?;
         }
         ResolvedElementTarget::Css(selector) => {
             state
@@ -2727,16 +2729,18 @@ async fn broker_fill(
     .await?
     {
         ResolvedElementTarget::Reference(element) => {
-            state
-                .browser
-                .fill_backend_node(&target, element.backend_node_id, &params.value)
-                .await?;
+            retry_element_action(params.timeout_ms, || {
+                state
+                    .browser
+                    .fill_backend_node(&target, element.backend_node_id, &params.value)
+            })
+            .await?;
         }
         ResolvedElementTarget::Css(selector) => {
-            state
-                .browser
-                .fill_css(&target, &selector, &params.value)
-                .await?;
+            retry_element_action(params.timeout_ms, || {
+                state.browser.fill_css(&target, &selector, &params.value)
+            })
+            .await?;
         }
     }
     post_action_observation(
@@ -2761,6 +2765,7 @@ async fn broker_fill_form(
     }
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     let total_fields = params.fields.len();
+    let timeout_ms = params.timeout_ms;
     let mut completed_fields = 0;
     for field in params.fields {
         match field {
@@ -2777,13 +2782,18 @@ async fn broker_fill_form(
             .await?
             {
                 ResolvedElementTarget::Reference(element) => {
-                    state
-                        .browser
-                        .fill_backend_node(&target, element.backend_node_id, &value)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state
+                            .browser
+                            .fill_backend_node(&target, element.backend_node_id, &value)
+                    })
+                    .await?;
                 }
                 ResolvedElementTarget::Css(selector) => {
-                    state.browser.fill_css(&target, &selector, &value).await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.fill_css(&target, &selector, &value)
+                    })
+                    .await?;
                 }
             },
             FormField::Select {
@@ -2799,16 +2809,18 @@ async fn broker_fill_form(
             .await?
             {
                 ResolvedElementTarget::Reference(element) => {
-                    state
-                        .browser
-                        .select_backend_node(&target, element.backend_node_id, &values)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state
+                            .browser
+                            .select_backend_node(&target, element.backend_node_id, &values)
+                    })
+                    .await?;
                 }
                 ResolvedElementTarget::Css(selector) => {
-                    state
-                        .browser
-                        .select_css(&target, &selector, &values)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.select_css(&target, &selector, &values)
+                    })
+                    .await?;
                 }
             },
             FormField::Checked {
@@ -2824,16 +2836,20 @@ async fn broker_fill_form(
             .await?
             {
                 ResolvedElementTarget::Reference(element) => {
-                    state
-                        .browser
-                        .set_checked_backend_node(&target, element.backend_node_id, checked)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.set_checked_backend_node(
+                            &target,
+                            element.backend_node_id,
+                            checked,
+                        )
+                    })
+                    .await?;
                 }
                 ResolvedElementTarget::Css(selector) => {
-                    state
-                        .browser
-                        .set_checked_css(&target, &selector, checked)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.set_checked_css(&target, &selector, checked)
+                    })
+                    .await?;
                 }
             },
         }
@@ -2858,6 +2874,47 @@ async fn broker_fill_form(
 enum ResolvedElementTarget {
     Reference(ElementReference),
     Css(String),
+}
+
+async fn retry_element_action<T, F, Fut>(
+    timeout_ms: Option<u64>,
+    mut action: F,
+) -> Result<T, BrowserToolError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, BrowserToolError>>,
+{
+    let timeout_ms = timeout_ms
+        .unwrap_or(DEFAULT_ELEMENT_TIMEOUT_MS)
+        .clamp(1, 60_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match action().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.code,
+                    BrowserToolErrorCode::ElementNotFound
+                        | BrowserToolErrorCode::ElementNotActionable
+                ) && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(error)
+                if matches!(
+                    error.code,
+                    BrowserToolErrorCode::ElementNotFound
+                        | BrowserToolErrorCode::ElementNotActionable
+                ) =>
+            {
+                return Err(BrowserToolError::operation_timeout(format!(
+                    "element did not become actionable within {timeout_ms} ms: {}",
+                    error.message
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn resolve_element_target(
@@ -3059,16 +3116,20 @@ async fn broker_type_text_v3(
     };
     match resolved {
         ResolvedElementTarget::Reference(element) => {
-            state
-                .browser
-                .type_text_backend_node(&target, element.backend_node_id, initial_text)
-                .await?;
+            retry_element_action(params.timeout_ms, || {
+                state
+                    .browser
+                    .type_text_backend_node(&target, element.backend_node_id, initial_text)
+            })
+            .await?;
         }
         ResolvedElementTarget::Css(selector) => {
-            state
-                .browser
-                .type_text_css(&target, &selector, initial_text)
-                .await?;
+            retry_element_action(params.timeout_ms, || {
+                state
+                    .browser
+                    .type_text_css(&target, &selector, initial_text)
+            })
+            .await?;
         }
     }
     if delay_ms > 0 {
@@ -3126,13 +3187,18 @@ async fn broker_press_key_v3(
         .await?
         {
             ResolvedElementTarget::Reference(element) => {
-                state
-                    .browser
-                    .type_text_backend_node(&target, element.backend_node_id, "")
-                    .await?;
+                retry_element_action(params.timeout_ms, || {
+                    state
+                        .browser
+                        .type_text_backend_node(&target, element.backend_node_id, "")
+                })
+                .await?;
             }
             ResolvedElementTarget::Css(selector) => {
-                state.browser.type_text_css(&target, &selector, "").await?;
+                retry_element_action(params.timeout_ms, || {
+                    state.browser.type_text_css(&target, &selector, "")
+                })
+                .await?;
             }
         }
     }
@@ -3171,22 +3237,25 @@ async fn broker_interact(
         .transpose()
         .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?
         .unwrap_or_default();
+    let timeout_ms = params.arguments.get("timeout_ms").and_then(Value::as_u64);
 
     match params.operation.as_str() {
         "select_options" => {
             let values = string_array_argument(&params.arguments, "values")?;
             match resolve_domain_element_target(state, &params, tab_id, &target, "target").await? {
                 ResolvedElementTarget::Reference(element) => {
-                    state
-                        .browser
-                        .select_backend_node(&target, element.backend_node_id, &values)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state
+                            .browser
+                            .select_backend_node(&target, element.backend_node_id, &values)
+                    })
+                    .await?;
                 }
                 ResolvedElementTarget::Css(selector) => {
-                    state
-                        .browser
-                        .select_css(&target, &selector, &values)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.select_css(&target, &selector, &values)
+                    })
+                    .await?;
                 }
             }
         }
@@ -3194,16 +3263,20 @@ async fn broker_interact(
             let checked = bool_argument(&params.arguments, "checked")?;
             match resolve_domain_element_target(state, &params, tab_id, &target, "target").await? {
                 ResolvedElementTarget::Reference(element) => {
-                    state
-                        .browser
-                        .set_checked_backend_node(&target, element.backend_node_id, checked)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.set_checked_backend_node(
+                            &target,
+                            element.backend_node_id,
+                            checked,
+                        )
+                    })
+                    .await?;
                 }
                 ResolvedElementTarget::Css(selector) => {
-                    state
-                        .browser
-                        .set_checked_css(&target, &selector, checked)
-                        .await?;
+                    retry_element_action(timeout_ms, || {
+                        state.browser.set_checked_css(&target, &selector, checked)
+                    })
+                    .await?;
                 }
             }
         }
@@ -3211,10 +3284,12 @@ async fn broker_interact(
             require_document_focus(state, tab_id, &target).await?;
             let element =
                 require_referenced_element(state, &params, tab_id, &target, "target").await?;
-            state
-                .browser
-                .hover_backend_node(&target, element.backend_node_id)
-                .await?;
+            retry_element_action(timeout_ms, || {
+                state
+                    .browser
+                    .hover_backend_node(&target, element.backend_node_id)
+            })
+            .await?;
         }
         "drag" => {
             require_document_focus(state, tab_id, &target).await?;
@@ -3222,10 +3297,14 @@ async fn broker_interact(
                 require_referenced_element(state, &params, tab_id, &target, "source").await?;
             let destination =
                 require_referenced_element(state, &params, tab_id, &target, "destination").await?;
-            state
-                .browser
-                .drag_backend_nodes(&target, source.backend_node_id, destination.backend_node_id)
-                .await?;
+            retry_element_action(timeout_ms, || {
+                state.browser.drag_backend_nodes(
+                    &target,
+                    source.backend_node_id,
+                    destination.backend_node_id,
+                )
+            })
+            .await?;
         }
         "drop" => {
             let element =
@@ -3237,20 +3316,27 @@ async fn broker_interact(
                 .get("data")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            state
-                .browser
-                .drop_data_backend_node(&target, element.backend_node_id, &files, &data)
-                .await?;
+            retry_element_action(timeout_ms, || {
+                state.browser.drop_data_backend_node(
+                    &target,
+                    element.backend_node_id,
+                    &files,
+                    &data,
+                )
+            })
+            .await?;
         }
         "upload_files" => {
             let element =
                 require_referenced_element(state, &params, tab_id, &target, "target").await?;
             let paths = string_array_argument(&params.arguments, "paths")?;
             let paths = resolve_workspace_paths(state, &params.agent_session_id, &paths)?;
-            state
-                .browser
-                .upload_files_backend_node(&target, element.backend_node_id, &paths)
-                .await?;
+            retry_element_action(timeout_ms, || {
+                state
+                    .browser
+                    .upload_files_backend_node(&target, element.backend_node_id, &paths)
+            })
+            .await?;
         }
         "handle_dialog" => {
             let action = string_argument(&params.arguments, "action")?;
@@ -4286,6 +4372,26 @@ async fn broker_audit(
         .as_ref()
         .ok_or_else(|| BrowserToolError::invalid_input("audit requires tab_id"))?;
     let target = active_owned_target(state, &params.agent_session_id, tab_id).await?;
+    let mode = params
+        .arguments
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("snapshot");
+    if !matches!(mode, "navigation" | "snapshot") {
+        return Err(BrowserToolError::invalid_input(format!(
+            "unknown audit mode `{mode}`"
+        )));
+    }
+    let device = params
+        .arguments
+        .get("device")
+        .and_then(Value::as_str)
+        .unwrap_or("desktop");
+    if !matches!(device, "desktop" | "mobile") {
+        return Err(BrowserToolError::invalid_input(format!(
+            "unknown audit device `{device}`"
+        )));
+    }
     let categories = {
         let requested = optional_string_array_argument(&params.arguments, "categories")?;
         if requested.is_empty() {
@@ -4305,12 +4411,24 @@ async fn broker_audit(
         r#"(() => {{
   const requested = new Set({requested});
   const findings = [];
-  const add = (id, category, title, description) => findings.push({{id, category, title, description, refs:[]}});
+  const selector = e => {{
+    if (!e) return null;
+    if (e.id) return `#${{CSS.escape(e.id)}}`;
+    const parts = [];
+    for (let node = e; node && node !== document.documentElement; node = node.parentElement) {{
+      let part = node.localName;
+      const siblings = node.parentElement ? [...node.parentElement.children].filter(child => child.localName === node.localName) : [];
+      if (siblings.length > 1) part += `:nth-of-type(${{siblings.indexOf(node) + 1}})`;
+      parts.unshift(part);
+    }}
+    return parts.join(" > ");
+  }};
+  const add = (id, category, title, description, element = null) => findings.push({{id, category, title, description, refs:[], selector:selector(element)}});
   const visible = e => {{ const r=e.getBoundingClientRect(),s=getComputedStyle(e); return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"; }};
   const name = e => (e.getAttribute("aria-label") || e.getAttribute("aria-labelledby") || e.alt || e.title || e.textContent || "").trim();
   if (requested.has("accessibility")) {{
-    document.querySelectorAll("img:not([alt])").forEach(() => add("image-alt", "accessibility", "Image has no alt attribute", "Provide alt text or an empty alt attribute for decorative images."));
-    document.querySelectorAll("button,input,select,textarea,a[href],[role=button]").forEach(e => {{ if (visible(e) && !name(e)) add("control-name", "accessibility", "Interactive control has no accessible name", "Give the control a label or accessible name."); }});
+    document.querySelectorAll("img:not([alt])").forEach(e => add("image-alt", "accessibility", "Image has no alt attribute", "Provide alt text or an empty alt attribute for decorative images.", e));
+    document.querySelectorAll("button,input,select,textarea,a[href],[role=button]").forEach(e => {{ if (visible(e) && !name(e)) add("control-name", "accessibility", "Interactive control has no accessible name", "Give the control a label or accessible name.", e); }});
     const ids = [...document.querySelectorAll("[id]")].map(e => e.id); if (new Set(ids).size !== ids.length) add("duplicate-id", "accessibility", "Document contains duplicate ids", "Use unique id values for label and accessibility relationships.");
   }}
   if (requested.has("seo")) {{
@@ -4321,26 +4439,105 @@ async fn broker_audit(
   }}
   if (requested.has("best_practices")) {{
     if (location.protocol === "https:" && [...document.querySelectorAll("img,script,link")].some(e => (e.src || e.href || "").startsWith("http:"))) add("mixed-content", "best_practices", "Page requests insecure content", "Serve subresources over HTTPS.");
-    document.querySelectorAll('input[type="password"]:not([autocomplete])').forEach(() => add("password-autocomplete", "best_practices", "Password field omits autocomplete", "Declare the appropriate current-password or new-password value."));
+    document.querySelectorAll('input[type="password"]:not([autocomplete])').forEach(e => add("password-autocomplete", "best_practices", "Password field omits autocomplete", "Declare the appropriate current-password or new-password value.", e));
   }}
   if (requested.has("agentic_browsing")) {{
-    document.querySelectorAll("button,input,select,textarea,a[href],[role=button],[contenteditable=true]").forEach(e => {{ if (visible(e) && !name(e)) add("unnamed-action", "agentic_browsing", "Action cannot be selected semantically", "Give the action a stable accessible name."); }});
-    if ([...document.querySelectorAll("a[href]")].some(e => /^(click here|more|learn more)$/i.test(e.textContent.trim()))) add("generic-link", "agentic_browsing", "Link text does not identify its destination", "Use link text that names the destination or action.");
+    document.querySelectorAll("button,input,select,textarea,a[href],[role=button],[contenteditable=true]").forEach(e => {{ if (visible(e) && !name(e)) add("unnamed-action", "agentic_browsing", "Action cannot be selected semantically", "Give the action a stable accessible name.", e); }});
+    [...document.querySelectorAll("a[href]")].filter(e => /^(click here|more|learn more)$/i.test(e.textContent.trim())).forEach(e => add("generic-link", "agentic_browsing", "Link text does not identify its destination", "Use link text that names the destination or action.", e));
   }}
   return {{findings}};
 }})()"#
     );
-    let result = state
-        .browser
-        .evaluate(&target, &expression)
-        .await?
-        .value
-        .unwrap_or_else(|| json!({"findings":[]}));
-    let findings = result
+    if device == "mobile" {
+        state
+            .browser
+            .emulate(
+                &target,
+                "set_viewport",
+                &serde_json::Map::from_iter([
+                    ("width".to_string(), json!(390)),
+                    ("height".to_string(), json!(844)),
+                    ("device_scale_factor".to_string(), json!(3.0)),
+                    ("mobile".to_string(), json!(true)),
+                    ("touch".to_string(), json!(true)),
+                    ("orientation".to_string(), json!("portrait")),
+                ]),
+            )
+            .await?;
+    }
+    let audit_result = async {
+        if mode == "navigation" {
+            state
+                .browser
+                .reload(&target, false, DEFAULT_NAVIGATION_TIMEOUT_MS, None)
+                .await?;
+        }
+        let (snapshot, _) = snapshot_for_target(
+            state,
+            &params.agent_session_id,
+            tab_id,
+            &target,
+            SnapshotRequest {
+                mode: SnapshotMode::Full,
+                root_backend_node_id: None,
+                depth: 64,
+                max_nodes: 5_000,
+                include_hidden: false,
+                include_bounds: false,
+            },
+        )
+        .await?;
+        let result = state.browser.evaluate(&target, &expression).await?;
+        Ok::<_, BrowserToolError>((snapshot.document_revision, result))
+    }
+    .await;
+    let reset_result = if device == "mobile" {
+        state
+            .browser
+            .emulate(&target, "reset", &serde_json::Map::new())
+            .await
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    let (document_revision, result) = audit_result?;
+    let result = result.value.unwrap_or_else(|| json!({"findings":[]}));
+    reset_result?;
+    let mut findings = result
         .get("findings")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    for finding in &mut findings {
+        let reference = if let Some(selector) = finding.get("selector").and_then(Value::as_str) {
+            match state
+                .browser
+                .resolve_css_backend_node(&target, selector)
+                .await
+            {
+                Ok(backend_node_id) => state
+                    .references()
+                    .lock()
+                    .unwrap()
+                    .reference_for_backend_node(
+                        &params.agent_session_id,
+                        tab_id,
+                        backend_node_id,
+                        &document_revision,
+                    ),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(object) = finding.as_object_mut() {
+            object.remove("selector");
+            object.insert(
+                "refs".to_string(),
+                reference.map_or_else(|| json!([]), |reference| json!([reference])),
+            );
+        }
+    }
     let mut scores = serde_json::Map::new();
     for category in &categories {
         let count = findings
@@ -5781,6 +5978,32 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn element_action_retry_waits_for_actionability_and_times_out() {
+        let mut attempts = 0;
+        let value = retry_element_action(Some(250), || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(BrowserToolError::element_not_actionable("moving"))
+            } else {
+                Ok("ready")
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 3);
+
+        let error = retry_element_action(Some(1), || {
+            std::future::ready::<Result<(), _>>(Err(BrowserToolError::element_not_actionable(
+                "covered",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::OperationTimeout);
     }
 
     #[test]
