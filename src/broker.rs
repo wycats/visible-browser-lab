@@ -3295,7 +3295,7 @@ async fn broker_interact(
         "hover" => {
             require_document_focus(state, tab_id, &target).await?;
             let element =
-                require_referenced_element(state, &params, tab_id, &target, "target").await?;
+                resolve_domain_backend_element(state, &params, tab_id, &target, "target").await?;
             retry_element_action(timeout_ms, || {
                 state
                     .browser
@@ -3306,9 +3306,10 @@ async fn broker_interact(
         "drag" => {
             require_document_focus(state, tab_id, &target).await?;
             let source =
-                require_referenced_element(state, &params, tab_id, &target, "source").await?;
+                resolve_domain_backend_element(state, &params, tab_id, &target, "source").await?;
             let destination =
-                require_referenced_element(state, &params, tab_id, &target, "destination").await?;
+                resolve_domain_backend_element(state, &params, tab_id, &target, "destination")
+                    .await?;
             retry_element_action(timeout_ms, || {
                 state.browser.drag_backend_nodes(
                     &target,
@@ -3320,7 +3321,7 @@ async fn broker_interact(
         }
         "drop" => {
             let element =
-                require_referenced_element(state, &params, tab_id, &target, "target").await?;
+                resolve_domain_backend_element(state, &params, tab_id, &target, "target").await?;
             let paths = optional_string_array_argument(&params.arguments, "paths")?;
             let files = read_workspace_files(state, &params.agent_session_id, &paths)?;
             let data = params
@@ -3340,7 +3341,7 @@ async fn broker_interact(
         }
         "upload_files" => {
             let element =
-                require_referenced_element(state, &params, tab_id, &target, "target").await?;
+                resolve_domain_backend_element(state, &params, tab_id, &target, "target").await?;
             let paths = string_array_argument(&params.arguments, "paths")?;
             let paths = resolve_workspace_paths(state, &params.agent_session_id, &paths)?;
             retry_element_action(timeout_ms, || {
@@ -3364,22 +3365,10 @@ async fn broker_interact(
         "scroll" => {
             let delta_x = number_argument_or(&params.arguments, "delta_x", 0.0)?;
             let delta_y = number_argument_or(&params.arguments, "delta_y", 0.0)?;
-            if let Some(element_target) = params.arguments.get("target") {
-                let element_target: ElementTarget = serde_json::from_value(element_target.clone())
-                    .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
-                let ResolvedElementTarget::Reference(element) = resolve_element_target(
-                    state,
-                    &params.agent_session_id,
-                    tab_id,
-                    &target,
-                    &element_target,
-                )
-                .await?
-                else {
-                    return Err(BrowserToolError::invalid_input(
-                        "interact scroll target requires a snapshot reference",
-                    ));
-                };
+            if params.arguments.contains_key("target") {
+                let element =
+                    resolve_domain_backend_element(state, &params, tab_id, &target, "target")
+                        .await?;
                 state
                     .browser
                     .scroll_backend_node(&target, element.backend_node_id, delta_x, delta_y)
@@ -3446,7 +3435,7 @@ async fn require_document_focus(
     }
 }
 
-async fn require_referenced_element(
+async fn resolve_domain_backend_element(
     state: &BrokerState,
     params: &DomainParams,
     tab_id: &TabId,
@@ -3471,9 +3460,23 @@ async fn require_referenced_element(
     .await?
     {
         ResolvedElementTarget::Reference(element) => Ok(element),
-        ResolvedElementTarget::Css(_) => Err(BrowserToolError::invalid_input(format!(
-            "interact `{field}` requires a snapshot reference"
-        ))),
+        ResolvedElementTarget::Css(selector) => {
+            let document_revision = state.browser.document_revision(target).await?;
+            let backend_node_id = state
+                .browser
+                .resolve_css_backend_node(target, &selector)
+                .await?;
+            Ok(ElementReference {
+                agent_session_id: params.agent_session_id.clone(),
+                tab_id: tab_id.clone(),
+                target_id: target.id.clone(),
+                frame_id: "main".to_string(),
+                document_revision,
+                backend_node_id,
+                role: "css".to_string(),
+                name: selector,
+            })
+        }
     }
 }
 
