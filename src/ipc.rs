@@ -129,7 +129,7 @@ mod tests {
 
         let endpoint = default_endpoint_display(Path::new("/tmp/visible-browser-lab-test"));
 
-        assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker-v2.sock");
+        assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker-v3.sock");
     }
 
     #[test]
@@ -142,7 +142,7 @@ mod tests {
         } else {
             assert_eq!(
                 endpoint.stale_path(),
-                Some(Path::new("/tmp/visible-browser-lab-test/broker-v2.sock"))
+                Some(Path::new("/tmp/visible-browser-lab-test/broker-v3.sock"))
             );
         }
     }

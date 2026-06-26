@@ -1,5 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+#[allow(deprecated)]
 use chromiumoxide::{
     Browser,
     cdp::{
@@ -7,28 +9,54 @@ use chromiumoxide::{
             accessibility::{
                 AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
             },
-            dom::{BackendNodeId, GetContentQuadsParams, ResolveNodeParams},
+            dom::{
+                BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetDocumentParams,
+                PushNodesByBackendIdsToFrontendParams, QuerySelectorAllParams, ResolveNodeParams,
+                SetFileInputFilesParams,
+            },
+            emulation::{
+                ClearDeviceMetricsOverrideParams, MediaFeature, SetCpuThrottlingRateParams,
+                SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
+                SetGeolocationOverrideParams, SetTouchEmulationEnabledParams,
+                SetUserAgentOverrideParams,
+            },
             input::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, InsertTextParams, MouseButton,
             },
             log::{EnableParams as LogEnableParams, EventEntryAdded},
             network::{
-                EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
-                EventRequestWillBeSent, EventResponseReceived,
+                EmulateNetworkConditionsParams, EnableParams as NetworkEnableParams,
+                EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+                EventResponseReceived, GetRequestPostDataParams, GetResponseBodyParams, Headers,
+                RequestId, SetExtraHttpHeadersParams,
             },
             page::{
-                CaptureScreenshotFormat, CaptureScreenshotParams, EnableParams as PageEnableParams,
-                Frame, FrameTree, GetFrameTreeParams, GetLayoutMetricsParams, Viewport,
+                AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
+                CaptureScreenshotParams, EnableParams as PageEnableParams,
+                EventJavascriptDialogOpening, EventScreencastFrame, Frame, FrameTree,
+                GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
+                HandleJavaScriptDialogParams, NavigateParams as PageNavigateParams,
+                NavigateToHistoryEntryParams, ReloadParams,
+                RemoveScriptToEvaluateOnNewDocumentParams, ScreencastFrameAckParams,
+                ScriptIdentifier, StartScreencastFormat, StartScreencastParams,
+                StopScreencastParams, Viewport,
             },
             target::{
                 ActivateTargetParams, CloseTargetParams, CreateTargetParams, GetTargetsParams,
                 TargetId,
             },
+            tracing::{
+                EndParams as TraceEndParams, EventDataCollected, EventTracingComplete,
+                StartParams as TraceStartParams, StartTransferMode, TraceConfig,
+            },
+        },
+        js_protocol::heap_profiler::{
+            EnableParams as HeapEnableParams, EventAddHeapSnapshotChunk, TakeHeapSnapshotParams,
         },
         js_protocol::runtime::{
             CallArgument, CallFunctionOnParams, EnableParams as RuntimeEnableParams,
-            EventConsoleApiCalled, RemoteObjectId,
+            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled, RemoteObjectId,
         },
     },
     error::CdpError,
@@ -52,6 +80,14 @@ use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+pub struct ElementEvaluation<'a> {
+    pub source: &'a str,
+    pub mode: &'a str,
+    pub args: &'a [Value],
+    pub await_promise: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdpEndpoint {
@@ -203,30 +239,171 @@ impl CdpClient {
         url: &str,
         wait_until: Option<&str>,
         timeout_ms: u64,
+        before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
-        if wait_until.unwrap_or("load") != "load" {
-            return Err(BrowserToolError::invalid_input(
-                "navigate currently supports only wait_until `load`",
-            ));
-        }
-
         let (page, connection) = self.page(&target.id).await?;
-        match timeout(Duration::from_millis(timeout_ms), page.goto(url)).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(self
-                .runtime
-                .page_error(&connection, "navigate", error)
-                .await),
-            Err(_) => Err(BrowserToolError::operation_timeout(format!(
-                "timed out waiting for load after navigating to `{url}`"
-            ))),
-        }
+        let navigation = async {
+            if wait_until == Some("none") {
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(PageNavigateParams::new(url)),
+                        "start page navigation",
+                    )
+                    .await?;
+                return Ok(());
+            }
+            match timeout(Duration::from_millis(timeout_ms), page.goto(url)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(self
+                    .runtime
+                    .page_error(&connection, "navigate", error)
+                    .await),
+                Err(_) => Err(BrowserToolError::operation_timeout(format!(
+                    "timed out waiting for load after navigating to `{url}`"
+                ))),
+            }
+        };
+        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+            .await
+    }
+
+    pub async fn add_init_script(
+        &self,
+        target: &CdpTarget,
+        source: &str,
+    ) -> Result<String, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let response = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(AddScriptToEvaluateOnNewDocumentParams::new(source)),
+                "install navigation init script",
+            )
+            .await?;
+        Ok(response.result.identifier.into())
+    }
+
+    pub async fn remove_init_script(
+        &self,
+        target: &CdpTarget,
+        identifier: String,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
+                    ScriptIdentifier::new(identifier),
+                )),
+                "remove navigation init script",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn navigate_history(
+        &self,
+        target: &CdpTarget,
+        direction: i64,
+        timeout_ms: u64,
+        before_unload: Option<&str>,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let history = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetNavigationHistoryParams::default()),
+                "read navigation history",
+            )
+            .await?;
+        let index = history.result.current_index + direction;
+        let entry = history
+            .result
+            .entries
+            .get(index.max(0) as usize)
+            .filter(|_| index >= 0)
+            .ok_or_else(|| {
+                BrowserToolError::invalid_input(if direction < 0 {
+                    "this tab has no previous history entry"
+                } else {
+                    "this tab has no forward history entry"
+                })
+            })?;
+        let entry_id = entry.id;
+        let navigation = async {
+            self.runtime
+                .page_command(
+                    &connection,
+                    page.execute(NavigateToHistoryEntryParams::new(entry_id)),
+                    "navigate browser history",
+                )
+                .await?;
+            match timeout(
+                Duration::from_millis(timeout_ms),
+                page.wait_for_navigation(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(self
+                    .runtime
+                    .page_error(&connection, "navigate browser history", error)
+                    .await),
+                Err(_) => Err(BrowserToolError::operation_timeout(
+                    "timed out waiting for browser history navigation",
+                )),
+            }
+        };
+        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+            .await
+    }
+
+    pub async fn reload(
+        &self,
+        target: &CdpTarget,
+        ignore_cache: bool,
+        timeout_ms: u64,
+        before_unload: Option<&str>,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let navigation = async {
+            self.runtime
+                .page_command(
+                    &connection,
+                    page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build()),
+                    "reload page",
+                )
+                .await?;
+            match timeout(
+                Duration::from_millis(timeout_ms),
+                page.wait_for_navigation(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(self
+                    .runtime
+                    .page_error(&connection, "reload page", error)
+                    .await),
+                Err(_) => Err(BrowserToolError::operation_timeout(
+                    "timed out waiting for page reload",
+                )),
+            }
+        };
+        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+            .await
     }
 
     pub async fn screenshot(
         &self,
         target: &CdpTarget,
         full_page: bool,
+        format: &str,
+        quality: Option<u8>,
+        clip: Option<Viewport>,
     ) -> Result<String, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         self.runtime
@@ -236,11 +413,30 @@ impl CdpClient {
                 "enable page for screenshot",
             )
             .await?;
+        let capture_format = match format {
+            "png" => CaptureScreenshotFormat::Png,
+            "jpeg" => CaptureScreenshotFormat::Jpeg,
+            "webp" => CaptureScreenshotFormat::Webp,
+            other => {
+                return Err(BrowserToolError::invalid_input(format!(
+                    "unsupported screenshot format `{other}`"
+                )));
+            }
+        };
         let mut builder = CaptureScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
+            .format(capture_format)
             .capture_beyond_viewport(full_page);
 
-        if full_page {
+        if format != "png" {
+            builder = builder.quality(i64::from(quality.unwrap_or(80).clamp(1, 100)));
+        }
+
+        let has_clip = clip.is_some();
+        if let Some(clip) = clip {
+            builder = builder.clip(clip).capture_beyond_viewport(true);
+        }
+
+        if full_page && !has_clip {
             let metrics = self
                 .runtime
                 .page_command(
@@ -272,6 +468,99 @@ impl CdpClient {
         Ok(response.result.data.into())
     }
 
+    pub async fn screenshot_clip_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<Viewport, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let quads = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    GetContentQuadsParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build(),
+                ),
+                "read screenshot element content quad",
+            )
+            .await?;
+        viewport_from_quad(
+            quads
+                .result
+                .quads
+                .first()
+                .ok_or_else(|| {
+                    BrowserToolError::element_not_actionable("element has no content quad")
+                })?
+                .inner(),
+        )
+    }
+
+    pub async fn screenshot_clip_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+    ) -> Result<Viewport, BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let result = self
+            .evaluate(
+                target,
+                &format!(
+                    r#"(() => {{ const matches=document.querySelectorAll({selector_json}); if(matches.length===0)return {{state:"not_found"}}; if(matches.length>1)return {{state:"ambiguous",count:matches.length}}; const e=matches[0]; e.scrollIntoView({{block:"center",inline:"center"}}); const r=e.getBoundingClientRect(),s=getComputedStyle(e); if(r.width<=0||r.height<=0||s.visibility==="hidden"||s.display==="none")return {{state:"hidden"}}; return {{state:"ready",x:r.left,y:r.top,width:r.width,height:r.height}}; }})()"#
+                ),
+            )
+            .await?
+            .value
+            .ok_or_else(|| BrowserToolError::chrome_unavailable("CSS screenshot target omitted result"))?;
+        match result.get("state").and_then(Value::as_str) {
+            Some("not_found") => return Err(BrowserToolError::element_not_found(selector)),
+            Some("ambiguous") => {
+                return Err(BrowserToolError::element_ambiguous(
+                    selector,
+                    result.get("count").and_then(Value::as_u64).unwrap_or(2) as usize,
+                ));
+            }
+            _ => actionable_state(result.clone())?,
+        }
+        Viewport::builder()
+            .x(result["x"].as_f64().unwrap_or(0.0))
+            .y(result["y"].as_f64().unwrap_or(0.0))
+            .width(result["width"].as_f64().unwrap_or(1.0).max(1.0))
+            .height(result["height"].as_f64().unwrap_or(1.0).max(1.0))
+            .scale(1.0)
+            .build()
+            .map_err(BrowserToolError::invalid_input)
+    }
+
+    pub async fn screenshot_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        format: &str,
+        quality: Option<u8>,
+    ) -> Result<String, BrowserToolError> {
+        let clip = self
+            .screenshot_clip_backend_node(target, backend_node_id)
+            .await?;
+        self.screenshot(target, false, format, quality, Some(clip))
+            .await
+    }
+
+    pub async fn screenshot_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        format: &str,
+        quality: Option<u8>,
+    ) -> Result<String, BrowserToolError> {
+        let clip = self.screenshot_clip_css(target, selector).await?;
+        self.screenshot(target, false, format, quality, Some(clip))
+            .await
+    }
+
     pub async fn evaluate(
         &self,
         target: &CdpTarget,
@@ -295,6 +584,152 @@ impl CdpClient {
                 .clone()
                 .or_else(|| Some(remote.r#type.as_ref().to_string())),
         })
+    }
+
+    pub async fn evaluate_on_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        evaluation: ElementEvaluation<'_>,
+    ) -> Result<EvaluateResult, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        self.evaluate_on_object(&page, &connection, object_id, evaluation)
+            .await
+    }
+
+    pub async fn resolve_frame_css_backend_node(
+        &self,
+        target: &CdpTarget,
+        frame_backend_node_id: i64,
+        selector: &str,
+    ) -> Result<i64, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(GetDocumentParams::builder().depth(1).pierce(true).build()),
+                "enable DOM tree for framed CSS",
+            )
+            .await?;
+        let frame = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    DescribeNodeParams::builder()
+                        .backend_node_id(BackendNodeId::new(frame_backend_node_id))
+                        .depth(1)
+                        .build(),
+                ),
+                "resolve CSS frame reference",
+            )
+            .await?;
+        let document_backend_node_id = frame
+            .result
+            .node
+            .content_document
+            .as_ref()
+            .map(|node| node.backend_node_id)
+            .ok_or_else(|| {
+                BrowserToolError::element_not_actionable(
+                    "frame reference does not expose a content document",
+                )
+            })?;
+        let document_node_id = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(PushNodesByBackendIdsToFrontendParams::new(vec![
+                    document_backend_node_id,
+                ])),
+                "register referenced frame content document",
+            )
+            .await?
+            .result
+            .node_ids
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                BrowserToolError::element_not_actionable(
+                    "frame content document could not be registered",
+                )
+            })?;
+        let matches = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(QuerySelectorAllParams::new(document_node_id, selector)),
+                "query CSS inside referenced frame",
+            )
+            .await?
+            .result
+            .node_ids;
+        let node_id = match matches.as_slice() {
+            [] => return Err(BrowserToolError::element_not_found(selector)),
+            [node_id] => *node_id,
+            matches => return Err(BrowserToolError::element_ambiguous(selector, matches.len())),
+        };
+        let node = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(DescribeNodeParams::builder().node_id(node_id).build()),
+                "resolve framed CSS backend node",
+            )
+            .await?;
+        Ok(node.result.node.backend_node_id.inner().to_owned())
+    }
+
+    pub async fn evaluate_on_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        evaluation: ElementEvaluation<'_>,
+    ) -> Result<EvaluateResult, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let count = page
+            .evaluate_expression(format!("document.querySelectorAll({selector_json}).length"))
+            .await
+            .map_err(|error| map_cdp_error("resolve evaluation CSS target", &error))?
+            .value()
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        match count {
+            0 => return Err(BrowserToolError::element_not_found(selector)),
+            1 => {}
+            count => {
+                return Err(BrowserToolError::element_ambiguous(
+                    selector,
+                    count as usize,
+                ));
+            }
+        }
+        let result = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    RuntimeEvaluateParams::builder()
+                        .expression(format!("document.querySelector({selector_json})"))
+                        .return_by_value(false)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "resolve evaluation CSS target",
+            )
+            .await?;
+        let object_id = result
+            .result
+            .result
+            .object_id
+            .ok_or_else(|| BrowserToolError::element_stale(selector))?;
+        self.evaluate_on_object(&page, &connection, object_id, evaluation)
+            .await
     }
 
     pub async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
@@ -397,6 +832,9 @@ impl CdpClient {
         target: &CdpTarget,
         selector: &str,
         timeout_ms: u64,
+        button: &str,
+        count: u8,
+        modifiers: &[String],
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         let point = self
@@ -408,41 +846,26 @@ impl CdpClient {
             )
             .await?;
 
-        for event in [
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MouseMoved)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::None)
-                .build(),
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MousePressed)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build(),
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MouseReleased)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build(),
-        ] {
-            let event = event.map_err(BrowserToolError::invalid_input)?;
-            self.runtime
-                .page_command(&connection, page.execute(event), "dispatch mouse input")
-                .await?;
-        }
-
-        Ok(())
+        self.dispatch_click(
+            &page,
+            &connection,
+            point,
+            PointerClick {
+                button,
+                count,
+                modifiers,
+            },
+        )
+        .await
     }
 
     pub async fn click_backend_node(
         &self,
         target: &CdpTarget,
         backend_node_id: i64,
+        button: &str,
+        count: u8,
+        modifiers: &[String],
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         let object_id = self
@@ -453,13 +876,17 @@ impl CdpClient {
                 &page,
                 &connection,
                 object_id,
-                r#"function() {
+                r#"async function() {
   if (!this.isConnected) return { state: "stale" };
   this.scrollIntoView({ block: "center", inline: "center" });
+  const first = this.getBoundingClientRect();
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   const rect = this.getBoundingClientRect();
+  if (Math.abs(first.x - rect.x) > 0.5 || Math.abs(first.y - rect.y) > 0.5 || Math.abs(first.width - rect.width) > 0.5 || Math.abs(first.height - rect.height) > 0.5) return { state: "unstable" };
   const style = this.ownerDocument.defaultView.getComputedStyle(this);
-  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return { state: "hidden" };
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0 || style.pointerEvents === "none") return { state: "hidden" };
   if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && this.readOnly) return { state: "not_editable" };
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
   const hit = this.ownerDocument.elementFromPoint(x, y);
@@ -492,7 +919,17 @@ impl CdpClient {
                 )
             })
             .and_then(|quad| content_quad_point(quad.inner()))?;
-        self.dispatch_click(&page, &connection, point).await
+        self.dispatch_click(
+            &page,
+            &connection,
+            point,
+            PointerClick {
+                button,
+                count,
+                modifiers,
+            },
+        )
+        .await
     }
 
     pub async fn fill_backend_node(
@@ -532,6 +969,505 @@ impl CdpClient {
             )
             .await?;
         actionable_state(result)
+    }
+
+    pub async fn type_text_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        text: &str,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let result = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  if (!(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable)) return { state: "not_editable" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  this.focus({ preventScroll: true });
+  return { state: "ready" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result)?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(InsertTextParams::new(text)),
+                "insert text into referenced element",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn type_text_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        text: &str,
+    ) -> Result<(), BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+  const matches = document.querySelectorAll({selector_json});
+  if (matches.length === 0) return {{ state: "not_found" }};
+  if (matches.length > 1) return {{ state: "ambiguous", count: matches.length }};
+  const element = matches[0];
+  if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable)) return {{ state: "not_editable" }};
+  if (element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") return {{ state: "disabled" }};
+  element.focus({{ preventScroll: true }});
+  return {{ state: "ready" }};
+}})()"#
+        );
+        let result = self
+            .evaluate(target, &expression)
+            .await?
+            .value
+            .ok_or_else(|| {
+                BrowserToolError::chrome_unavailable("focus CSS target omitted result")
+            })?;
+        match result.get("state").and_then(Value::as_str) {
+            Some("not_found") => return Err(BrowserToolError::element_not_found(selector)),
+            Some("ambiguous") => {
+                return Err(BrowserToolError::element_ambiguous(
+                    selector,
+                    result.get("count").and_then(Value::as_u64).unwrap_or(2) as usize,
+                ));
+            }
+            _ => actionable_state(result)?,
+        }
+        self.type_text(target, text).await
+    }
+
+    pub async fn set_checked_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        checked: bool,
+    ) -> Result<(), BrowserToolError> {
+        self.mutate_backend_node(
+            target,
+            backend_node_id,
+            r#"function(checked) {
+  if (!this.isConnected) return { state: "stale" };
+  if (!(this instanceof HTMLInputElement) || !["checkbox", "radio"].includes(this.type)) return { state: "not_checkable" };
+  if (this.disabled || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if (this.checked !== checked) {
+    this.checked = checked;
+    this.dispatchEvent(new Event("input", { bubbles: true }));
+    this.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  return { state: "ready" };
+}"#,
+            vec![CallArgument::builder().value(checked).build()],
+        )
+        .await
+    }
+
+    pub async fn select_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        values: &[String],
+    ) -> Result<(), BrowserToolError> {
+        self.mutate_backend_node(
+            target,
+            backend_node_id,
+            r#"function(values) {
+  if (!this.isConnected) return { state: "stale" };
+  if (!(this instanceof HTMLSelectElement)) return { state: "not_select" };
+  if (this.disabled || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  const wanted = new Set(values);
+  const matched = new Set();
+  for (const option of this.options) {
+    if (wanted.has(option.value)) matched.add(option.value);
+    if (wanted.has(option.label)) matched.add(option.label);
+  }
+  if (matched.size !== wanted.size) return { state: "option_not_found" };
+  for (const option of this.options) {
+    option.selected = wanted.has(option.value) || wanted.has(option.label);
+  }
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+  return { state: "ready" };
+}"#,
+            vec![
+                CallArgument::builder()
+                    .value(serde_json::to_value(values).unwrap_or_default())
+                    .build(),
+            ],
+        )
+        .await
+    }
+
+    pub async fn select_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        values: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let values_json = serde_json::to_string(values)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+  const matches = document.querySelectorAll({selector_json});
+  if (matches.length === 0) return {{state:"not_found"}};
+  if (matches.length > 1) return {{state:"ambiguous",count:matches.length}};
+  const element = matches[0];
+  if (!(element instanceof HTMLSelectElement)) return {{state:"not_select"}};
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") return {{state:"disabled"}};
+  const wanted = new Set({values_json});
+  const matched = new Set();
+  for (const option of element.options) {{
+    if (wanted.has(option.value)) matched.add(option.value);
+    if (wanted.has(option.label)) matched.add(option.label);
+  }}
+  if (matched.size !== wanted.size) return {{state:"option_not_found"}};
+  for (const option of element.options) option.selected = wanted.has(option.value) || wanted.has(option.label);
+  element.dispatchEvent(new Event("input", {{bubbles:true}}));
+  element.dispatchEvent(new Event("change", {{bubbles:true}}));
+  return {{state:"ready"}};
+}})()"#
+        );
+        self.css_mutation_result(target, selector, &expression)
+            .await
+    }
+
+    pub async fn set_checked_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        checked: bool,
+    ) -> Result<(), BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+  const matches = document.querySelectorAll({selector_json});
+  if (matches.length === 0) return {{state:"not_found"}};
+  if (matches.length > 1) return {{state:"ambiguous",count:matches.length}};
+  const element = matches[0];
+  if (!(element instanceof HTMLInputElement) || !["checkbox","radio"].includes(element.type)) return {{state:"not_checkable"}};
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") return {{state:"disabled"}};
+  if (element.checked !== {checked}) {{
+    element.checked = {checked};
+    element.dispatchEvent(new Event("input", {{bubbles:true}}));
+    element.dispatchEvent(new Event("change", {{bubbles:true}}));
+  }}
+  return {{state:"ready"}};
+}})()"#
+        );
+        self.css_mutation_result(target, selector, &expression)
+            .await
+    }
+
+    pub async fn element_state_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<Value, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        self.call_on_element(
+            &page,
+            &connection,
+            object_id,
+            r#"function() {
+  if (!this.isConnected) return { attached: false, visible: false };
+  const rect = this.getBoundingClientRect();
+  const style = this.ownerDocument.defaultView.getComputedStyle(this);
+  const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0;
+  const disabled = this.matches(":disabled") || this.getAttribute("aria-disabled") === "true";
+  const editable = !disabled && (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable);
+  const checked = "checked" in this ? Boolean(this.checked) : this.getAttribute("aria-checked") === "true";
+  return { attached: true, visible, enabled: !disabled, editable, checked };
+}"#,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn hover_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let quads = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    GetContentQuadsParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build(),
+                ),
+                "read referenced element content quad",
+            )
+            .await?;
+        let point = quads
+            .result
+            .quads
+            .first()
+            .ok_or_else(|| BrowserToolError::element_not_actionable("element has no content quad"))
+            .and_then(|quad| content_quad_point(quad.inner()))?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseMoved)
+                        .x(point.x)
+                        .y(point.y)
+                        .button(MouseButton::None)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "hover referenced element",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn drag_backend_nodes(
+        &self,
+        target: &CdpTarget,
+        source_backend_node_id: i64,
+        destination_backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let mut points = Vec::new();
+        for backend_node_id in [source_backend_node_id, destination_backend_node_id] {
+            let quads = self
+                .runtime
+                .page_command(
+                    &connection,
+                    page.execute(
+                        GetContentQuadsParams::builder()
+                            .backend_node_id(BackendNodeId::new(backend_node_id))
+                            .build(),
+                    ),
+                    "read drag endpoint content quad",
+                )
+                .await?;
+            points.push(
+                quads
+                    .result
+                    .quads
+                    .first()
+                    .ok_or_else(|| {
+                        BrowserToolError::element_not_actionable(
+                            "drag endpoint has no content quad",
+                        )
+                    })
+                    .and_then(|quad| content_quad_point(quad.inner()))?,
+            );
+        }
+        let source = points[0];
+        let destination = points[1];
+        for event in [
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(source.x)
+                .y(source.y)
+                .button(MouseButton::None)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(source.x)
+                .y(source.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(destination.x)
+                .y(destination.y)
+                .button(MouseButton::Left)
+                .build(),
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(destination.x)
+                .y(destination.y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build(),
+        ] {
+            self.runtime
+                .page_command(
+                    &connection,
+                    page.execute(event.map_err(BrowserToolError::invalid_input)?),
+                    "dispatch drag input",
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn click_at(
+        &self,
+        target: &CdpTarget,
+        x: f64,
+        y: f64,
+        button: &str,
+        count: i64,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.dispatch_click(
+            &page,
+            &connection,
+            ClickPoint { x, y },
+            PointerClick {
+                button,
+                count: count as u8,
+                modifiers,
+            },
+        )
+        .await
+    }
+
+    pub async fn scroll_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Result<(), BrowserToolError> {
+        self.mutate_backend_node(
+            target,
+            backend_node_id,
+            r#"function(x, y) { if (!this.isConnected) return {state:"stale"}; this.scrollBy(x, y); return {state:"ready"}; }"#,
+            vec![
+                CallArgument::builder().value(delta_x).build(),
+                CallArgument::builder().value(delta_y).build(),
+            ],
+        )
+        .await
+    }
+
+    pub async fn upload_files_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        paths: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    SetFileInputFilesParams::builder()
+                        .files(paths)
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "set file input paths",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn drop_data_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        files: &Value,
+        data: &Value,
+    ) -> Result<(), BrowserToolError> {
+        self.mutate_backend_node(
+            target,
+            backend_node_id,
+            r#"async function(files, data) {
+  if (!this.isConnected) return {state:"stale"};
+  const transfer = new DataTransfer();
+  for (const file of files) {
+    const binary = atob(file.base64);
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+    transfer.items.add(new File([bytes], file.name, {type:file.media_type}));
+  }
+  for (const [type, value] of Object.entries(data)) transfer.setData(type, value);
+  for (const name of ["dragenter", "dragover", "drop"]) this.dispatchEvent(new DragEvent(name, {bubbles:true, cancelable:true, dataTransfer:transfer}));
+  return {state:"ready"};
+}"#,
+            vec![
+                CallArgument::builder().value(files.clone()).build(),
+                CallArgument::builder().value(data.clone()).build(),
+            ],
+        )
+        .await
+    }
+
+    pub async fn handle_dialog(
+        &self,
+        target: &CdpTarget,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let mut builder = HandleJavaScriptDialogParams::builder().accept(accept);
+        if let Some(prompt_text) = prompt_text {
+            builder = builder.prompt_text(prompt_text);
+        }
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(builder.build().map_err(BrowserToolError::invalid_input)?),
+                "handle JavaScript dialog",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn mutate_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        function: &str,
+        arguments: Vec<CallArgument>,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let result = self
+            .call_on_element(&page, &connection, object_id, function, arguments)
+            .await?;
+        actionable_state(result)
+    }
+
+    async fn css_mutation_result(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+        expression: &str,
+    ) -> Result<(), BrowserToolError> {
+        let result = self
+            .evaluate(target, expression)
+            .await?
+            .value
+            .ok_or_else(|| BrowserToolError::chrome_unavailable("CSS operation omitted result"))?;
+        match result.get("state").and_then(Value::as_str) {
+            Some("not_found") => Err(BrowserToolError::element_not_found(selector)),
+            Some("ambiguous") => Err(BrowserToolError::element_ambiguous(
+                selector,
+                result.get("count").and_then(Value::as_u64).unwrap_or(2) as usize,
+            )),
+            _ => actionable_state(result),
+        }
     }
 
     pub async fn fill_css(
@@ -691,6 +1627,556 @@ impl CdpClient {
         })
     }
 
+    pub async fn network_response_body(
+        &self,
+        target: &CdpTarget,
+        request_id: &str,
+    ) -> Result<Vec<u8>, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let response = self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetResponseBodyParams::new(RequestId::new(request_id))),
+                "read network response body",
+            )
+            .await?;
+        if response.result.base64_encoded {
+            BASE64.decode(response.result.body).map_err(|error| {
+                BrowserToolError::artifact_error(format!(
+                    "network response body contained invalid base64: {error}"
+                ))
+            })
+        } else {
+            Ok(response.result.body.into_bytes())
+        }
+    }
+
+    pub async fn network_request_body(
+        &self,
+        target: &CdpTarget,
+        request_id: &str,
+    ) -> Result<Option<String>, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        match self
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(GetRequestPostDataParams::new(RequestId::new(request_id))),
+                "read network request body",
+            )
+            .await
+        {
+            Ok(response) => Ok(Some(response.result.post_data)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[allow(deprecated)]
+    pub async fn emulate(
+        &self,
+        target: &CdpTarget,
+        operation: &str,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        match operation {
+            "set_viewport" => {
+                let width = json_i64(arguments, "width")?;
+                let height = json_i64(arguments, "height")?;
+                let scale = arguments
+                    .get("device_scale_factor")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                let mobile = arguments
+                    .get("mobile")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let touch = arguments
+                    .get("touch")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(mobile);
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetDeviceMetricsOverrideParams::new(
+                            width, height, scale, mobile,
+                        )),
+                        "set viewport emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetTouchEmulationEnabledParams::new(touch)),
+                        "set touch emulation",
+                    )
+                    .await?;
+            }
+            "set_network" => {
+                let preset = arguments
+                    .get("preset")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none");
+                let (offline, latency, down, up) = match preset {
+                    "offline" => (true, 0.0, 0.0, 0.0),
+                    "slow_3g" => (false, 400.0, 50_000.0, 25_000.0),
+                    "fast_3g" => (false, 150.0, 200_000.0, 100_000.0),
+                    "slow_4g" => (false, 100.0, 500_000.0, 250_000.0),
+                    "none" => (false, 0.0, -1.0, -1.0),
+                    other => {
+                        return Err(BrowserToolError::invalid_input(format!(
+                            "unknown network preset `{other}`"
+                        )));
+                    }
+                };
+                let params = EmulateNetworkConditionsParams::new(
+                    arguments
+                        .get("offline")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(offline),
+                    arguments
+                        .get("latency_ms")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(latency),
+                    arguments
+                        .get("download_bytes_per_second")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(down),
+                    arguments
+                        .get("upload_bytes_per_second")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(up),
+                );
+                self.runtime
+                    .page_command(&connection, page.execute(params), "set network emulation")
+                    .await?;
+            }
+            "set_cpu" => {
+                let slowdown = arguments
+                    .get("slowdown")
+                    .and_then(Value::as_f64)
+                    .filter(|value| *value >= 1.0)
+                    .ok_or_else(|| {
+                        BrowserToolError::invalid_input("slowdown must be at least 1")
+                    })?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetCpuThrottlingRateParams::new(slowdown)),
+                        "set CPU emulation",
+                    )
+                    .await?;
+            }
+            "set_geolocation" => {
+                let latitude = json_f64(arguments, "latitude")?;
+                let longitude = json_f64(arguments, "longitude")?;
+                let accuracy = arguments
+                    .get("accuracy_meters")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(
+                            SetGeolocationOverrideParams::builder()
+                                .latitude(latitude)
+                                .longitude(longitude)
+                                .accuracy(accuracy)
+                                .build(),
+                        ),
+                        "set geolocation emulation",
+                    )
+                    .await?;
+            }
+            "set_media" => {
+                let mut builder = SetEmulatedMediaParams::builder();
+                if let Some(media) = arguments.get("media").and_then(Value::as_str) {
+                    builder = builder.media(media);
+                }
+                if let Some(scheme) = arguments.get("color_scheme").and_then(Value::as_str) {
+                    builder = builder.feature(MediaFeature::new(
+                        "prefers-color-scheme",
+                        scheme.replace('_', "-"),
+                    ));
+                }
+                if let Some(motion) = arguments.get("reduced_motion").and_then(Value::as_str) {
+                    builder = builder.feature(MediaFeature::new(
+                        "prefers-reduced-motion",
+                        motion.replace('_', "-"),
+                    ));
+                }
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(builder.build()),
+                        "set media emulation",
+                    )
+                    .await?;
+            }
+            "set_user_agent" => {
+                let mut builder = SetUserAgentOverrideParams::builder()
+                    .user_agent(json_str(arguments, "user_agent")?);
+                if let Some(platform) = arguments.get("platform").and_then(Value::as_str) {
+                    builder = builder.platform(platform);
+                }
+                if let Some(language) = arguments.get("accept_language").and_then(Value::as_str) {
+                    builder = builder.accept_language(language);
+                }
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(builder.build().map_err(BrowserToolError::invalid_input)?),
+                        "set user agent emulation",
+                    )
+                    .await?;
+            }
+            "set_headers" => {
+                let headers = arguments
+                    .get("headers")
+                    .cloned()
+                    .ok_or_else(|| BrowserToolError::invalid_input("missing `headers`"))?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetExtraHttpHeadersParams::new(Headers::new(headers))),
+                        "set extra HTTP headers",
+                    )
+                    .await?;
+            }
+            "reset" => {
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(ClearDeviceMetricsOverrideParams::default()),
+                        "clear viewport emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetTouchEmulationEnabledParams::new(false)),
+                        "clear touch emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(EmulateNetworkConditionsParams::new(false, 0.0, -1.0, -1.0)),
+                        "clear network emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetCpuThrottlingRateParams::new(1.0)),
+                        "clear CPU emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetGeolocationOverrideParams::default()),
+                        "clear geolocation emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetEmulatedMediaParams::default()),
+                        "clear media emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetUserAgentOverrideParams::new("")),
+                        "clear user agent emulation",
+                    )
+                    .await?;
+                self.runtime
+                    .page_command(
+                        &connection,
+                        page.execute(SetExtraHttpHeadersParams::new(Headers::new(json!({})))),
+                        "clear extra HTTP headers",
+                    )
+                    .await?;
+            }
+            other => {
+                return Err(BrowserToolError::invalid_input(format!(
+                    "unknown emulation operation `{other}`"
+                )));
+            }
+        }
+        Ok(Value::Object(arguments.clone()))
+    }
+
+    pub async fn start_trace(
+        &self,
+        categories: Vec<String>,
+        screenshots: bool,
+    ) -> Result<CdpTraceCapture, BrowserToolError> {
+        let connection = self.runtime.connection().await?;
+        let mut data = connection
+            .browser
+            .event_listener::<EventDataCollected>()
+            .await
+            .map_err(|error| map_cdp_error("subscribe to trace data", &error))?;
+        let mut complete = connection
+            .browser
+            .event_listener::<EventTracingComplete>()
+            .await
+            .map_err(|error| map_cdp_error("subscribe to trace completion", &error))?;
+        let mut categories = if categories.is_empty() {
+            vec![
+                "devtools.timeline".to_string(),
+                "v8.execute".to_string(),
+                "blink.user_timing".to_string(),
+                "loading".to_string(),
+            ]
+        } else {
+            categories
+        };
+        if screenshots {
+            categories.push("disabled-by-default-devtools.screenshot".to_string());
+        }
+        let config = TraceConfig::builder()
+            .included_categories(categories)
+            .build();
+        self.runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(
+                    TraceStartParams::builder()
+                        .transfer_mode(StartTransferMode::ReportEvents)
+                        .trace_config(config)
+                        .build(),
+                ),
+                "start performance trace",
+            )
+            .await?;
+        let task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            loop {
+                tokio::select! {
+                    chunk = data.next() => match chunk {
+                        Some(chunk) => events.extend(chunk.value.clone()),
+                        None => break,
+                    },
+                    completed = complete.next() => {
+                        if completed.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            events
+        });
+        Ok(CdpTraceCapture {
+            client: self.clone(),
+            task,
+        })
+    }
+
+    pub async fn heap_snapshot(&self, target: &CdpTarget) -> Result<Vec<u8>, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(HeapEnableParams::default()),
+                "enable heap profiler",
+            )
+            .await?;
+        let mut chunks = self
+            .event_listener::<EventAddHeapSnapshotChunk>(&page, &connection)
+            .await?;
+        let (done_tx, mut done_rx) = oneshot::channel::<()>();
+        let collector = tokio::spawn(async move {
+            let mut output = Vec::new();
+            loop {
+                tokio::select! {
+                    chunk = chunks.next() => match chunk {
+                        Some(chunk) => output.extend_from_slice(chunk.chunk.as_bytes()),
+                        None => break,
+                    },
+                    _ = &mut done_rx => {
+                        while let Ok(Some(chunk)) = timeout(Duration::from_millis(100), chunks.next()).await {
+                            output.extend_from_slice(chunk.chunk.as_bytes());
+                        }
+                        break;
+                    }
+                }
+            }
+            output
+        });
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    TakeHeapSnapshotParams::builder()
+                        .capture_numeric_value(true)
+                        .build(),
+                ),
+                "capture heap snapshot",
+            )
+            .await?;
+        let _ = done_tx.send(());
+        collector.await.map_err(|error| {
+            BrowserToolError::chrome_unavailable(format!("heap snapshot collector failed: {error}"))
+        })
+    }
+
+    pub async fn start_screencast(
+        &self,
+        target: &CdpTarget,
+        fps: u32,
+        quality: u8,
+        max_duration: Duration,
+    ) -> Result<CdpScreencastCapture, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let mut events = self
+            .event_listener::<EventScreencastFrame>(&page, &connection)
+            .await?;
+        self.runtime
+            .page_command(
+                &connection,
+                page.execute(
+                    StartScreencastParams::builder()
+                        .format(StartScreencastFormat::Jpeg)
+                        .quality(i64::from(quality))
+                        .every_nth_frame(1)
+                        .build(),
+                ),
+                "start page screencast",
+            )
+            .await?;
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let event_page = page.clone();
+        let task = tokio::spawn(async move {
+            let deadline = Instant::now() + max_duration;
+            let sample_stride = (60 / fps.max(1)).max(1) as usize;
+            let max_frames = ((fps as f64) * max_duration.as_secs_f64().ceil()) as usize;
+            let mut frame_index = 0usize;
+            let mut frames = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    frame = events.next() => {
+                        let Some(frame) = frame else { break };
+                        let _ = event_page.execute(ScreencastFrameAckParams::new(frame.session_id)).await;
+                        if Instant::now() <= deadline
+                            && frames.len() < max_frames
+                            && frame_index.is_multiple_of(sample_stride)
+                        {
+                            let encoded: String = frame.data.clone().into();
+                            if let Ok(bytes) = BASE64.decode(encoded) {
+                                frames.push(CapturedScreencastFrame { bytes });
+                            }
+                        }
+                        frame_index += 1;
+                    }
+                }
+            }
+            frames
+        });
+        Ok(CdpScreencastCapture {
+            client: self.clone(),
+            target_id: target.id.clone(),
+            done: Some(done_tx),
+            task,
+        })
+    }
+
+    pub async fn stop_screencast(
+        mut capture: CdpScreencastCapture,
+    ) -> Result<Vec<CapturedScreencastFrame>, BrowserToolError> {
+        let (page, connection) = capture.client.page(&capture.target_id).await?;
+        capture
+            .client
+            .runtime
+            .page_command(
+                &connection,
+                page.execute(StopScreencastParams::default()),
+                "stop page screencast",
+            )
+            .await?;
+        if let Some(done) = capture.done.take() {
+            let _ = done.send(());
+        }
+        capture.task.await.map_err(|error| {
+            BrowserToolError::chrome_unavailable(format!("screencast collector failed: {error}"))
+        })
+    }
+
+    pub async fn stop_trace(capture: CdpTraceCapture) -> Result<Vec<Value>, BrowserToolError> {
+        let connection = capture.client.runtime.connection().await?;
+        capture
+            .client
+            .runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(TraceEndParams::default()),
+                "stop performance trace",
+            )
+            .await?;
+        timeout(Duration::from_secs(10), capture.task)
+            .await
+            .map_err(|_| BrowserToolError::operation_timeout("trace completion timed out"))?
+            .map_err(|error| {
+                BrowserToolError::chrome_unavailable(format!("trace collector failed: {error}"))
+            })
+    }
+
+    async fn with_navigation_dialog_policy<T, F>(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        policy: Option<&str>,
+        operation: F,
+    ) -> Result<T, BrowserToolError>
+    where
+        F: Future<Output = Result<T, BrowserToolError>>,
+    {
+        let Some(policy) = policy else {
+            return operation.await;
+        };
+        let accept = match policy {
+            "accept" => true,
+            "dismiss" => false,
+            other => {
+                return Err(BrowserToolError::invalid_input(format!(
+                    "unknown before_unload policy `{other}`"
+                )));
+            }
+        };
+        let mut dialogs = self
+            .event_listener::<EventJavascriptDialogOpening>(page, connection)
+            .await?;
+        tokio::pin!(operation);
+        loop {
+            tokio::select! {
+                result = &mut operation => return result,
+                dialog = dialogs.next() => {
+                    let Some(_dialog) = dialog else {
+                        return operation.await;
+                    };
+                    self.runtime
+                        .page_command(
+                            connection,
+                            page.execute(
+                                HandleJavaScriptDialogParams::builder()
+                                    .accept(accept)
+                                    .build()
+                                    .map_err(BrowserToolError::invalid_input)?,
+                            ),
+                            "handle navigation dialog",
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+
     async fn page(&self, target_id: &str) -> Result<(Page, RuntimeConnection), BrowserToolError> {
         let connection = self.runtime.connection().await?;
         let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
@@ -782,6 +2268,7 @@ impl CdpClient {
                         .object_id(object_id)
                         .arguments(arguments)
                         .return_by_value(true)
+                        .await_promise(true)
                         .build()
                         .map_err(BrowserToolError::invalid_input)?,
                 ),
@@ -799,41 +2286,142 @@ impl CdpClient {
         })
     }
 
+    async fn evaluate_on_object(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+        evaluation: ElementEvaluation<'_>,
+    ) -> Result<EvaluateResult, BrowserToolError> {
+        let function = match evaluation.mode {
+            "expression" if evaluation.args.is_empty() => {
+                format!("function() {{ return ({}); }}", evaluation.source)
+            }
+            "expression" => {
+                return Err(BrowserToolError::invalid_input(
+                    "evaluate arguments require mode `function`",
+                ));
+            }
+            "function" => evaluation.source.to_string(),
+            other => {
+                return Err(BrowserToolError::invalid_input(format!(
+                    "unknown evaluation mode `{other}`"
+                )));
+            }
+        };
+        let arguments = evaluation
+            .args
+            .iter()
+            .cloned()
+            .map(|value| CallArgument::builder().value(value).build())
+            .collect::<Vec<_>>();
+        let response = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    CallFunctionOnParams::builder()
+                        .function_declaration(function)
+                        .object_id(object_id)
+                        .arguments(arguments)
+                        .return_by_value(true)
+                        .await_promise(evaluation.await_promise)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "evaluate on element target",
+            )
+            .await?;
+        if let Some(exception) = response.result.exception_details {
+            return Err(BrowserToolError::invalid_input(format!(
+                "evaluation failed: {}",
+                exception.text
+            )));
+        }
+        let remote = response.result.result;
+        Ok(EvaluateResult {
+            value: remote.value,
+            preview: remote
+                .description
+                .or_else(|| Some(remote.r#type.as_ref().to_string())),
+        })
+    }
+
     async fn dispatch_click(
         &self,
         page: &Page,
         connection: &RuntimeConnection,
         point: ClickPoint,
+        click: PointerClick<'_>,
     ) -> Result<(), BrowserToolError> {
-        for event in [
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MouseMoved)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::None)
-                .build(),
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MousePressed)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build(),
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MouseReleased)
-                .x(point.x)
-                .y(point.y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build(),
-        ] {
-            self.runtime
-                .page_command(
+        let button = match click.button {
+            "left" => MouseButton::Left,
+            "middle" => MouseButton::Middle,
+            "right" => MouseButton::Right,
+            other => {
+                return Err(BrowserToolError::invalid_input(format!(
+                    "unknown mouse button `{other}`"
+                )));
+            }
+        };
+        if !(1..=2).contains(&click.count) {
+            return Err(BrowserToolError::invalid_input(
+                "click count must be 1 or 2",
+            ));
+        }
+        let modifiers = i64::from(modifier_bits(click.modifiers)?);
+        let mut dialogs = self
+            .event_listener::<EventJavascriptDialogOpening>(page, connection)
+            .await?;
+        self.runtime
+            .page_command(
+                connection,
+                page.execute(
+                    DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseMoved)
+                        .x(point.x)
+                        .y(point.y)
+                        .button(MouseButton::None)
+                        .modifiers(modifiers)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "move mouse to click target",
+            )
+            .await?;
+        for click_count in 1..=click.count {
+            for event_type in [
+                DispatchMouseEventType::MousePressed,
+                DispatchMouseEventType::MouseReleased,
+            ] {
+                let event = DispatchMouseEventParams::builder()
+                    .r#type(event_type.clone())
+                    .x(point.x)
+                    .y(point.y)
+                    .button(button.clone())
+                    .click_count(i64::from(click_count))
+                    .modifiers(modifiers)
+                    .build()
+                    .map_err(BrowserToolError::invalid_input)?;
+                let command = self.runtime.page_command(
                     connection,
-                    page.execute(event.map_err(BrowserToolError::invalid_input)?),
+                    page.execute(event),
                     "dispatch mouse input",
-                )
-                .await?;
+                );
+                if event_type == DispatchMouseEventType::MouseReleased {
+                    tokio::pin!(command);
+                    tokio::select! {
+                        biased;
+                        result = &mut command => {
+                            result?;
+                        }
+                        _dialog = dialogs.next() => {}
+                        _ = sleep(Duration::from_millis(250)) => {}
+                    }
+                } else {
+                    command.await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1107,6 +2695,22 @@ pub struct CdpDiagnosticsMonitor {
     task: JoinHandle<()>,
 }
 
+pub struct CdpTraceCapture {
+    client: CdpClient,
+    task: JoinHandle<Vec<Value>>,
+}
+
+pub struct CapturedScreencastFrame {
+    pub bytes: Vec<u8>,
+}
+
+pub struct CdpScreencastCapture {
+    client: CdpClient,
+    target_id: String,
+    done: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Vec<CapturedScreencastFrame>>,
+}
+
 impl CdpDiagnosticsMonitor {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
@@ -1143,6 +2747,12 @@ impl From<&CdpTarget> for TabSnapshot {
 struct ClickPoint {
     x: f64,
     y: f64,
+}
+
+struct PointerClick<'a> {
+    button: &'a str,
+    count: u8,
+    modifiers: &'a [String],
 }
 
 fn click_point(
@@ -1196,6 +2806,29 @@ fn content_quad_point(quad: &[f64]) -> Result<ClickPoint, BrowserToolError> {
     })
 }
 
+fn viewport_from_quad(quad: &[f64]) -> Result<Viewport, BrowserToolError> {
+    if quad.len() != 8 {
+        return Err(BrowserToolError::element_not_actionable(format!(
+            "element content quad contained {} coordinates instead of 8",
+            quad.len()
+        )));
+    }
+    let xs = [quad[0], quad[2], quad[4], quad[6]];
+    let ys = [quad[1], quad[3], quad[5], quad[7]];
+    let min_x = xs.into_iter().fold(f64::INFINITY, f64::min);
+    let max_x = xs.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    let min_y = ys.into_iter().fold(f64::INFINITY, f64::min);
+    let max_y = ys.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    Viewport::builder()
+        .x(min_x)
+        .y(min_y)
+        .width((max_x - min_x).max(1.0))
+        .height((max_y - min_y).max(1.0))
+        .scale(1.0)
+        .build()
+        .map_err(BrowserToolError::invalid_input)
+}
+
 fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
     match value.get("state").and_then(Value::as_str) {
         Some("ready") => Ok(()),
@@ -1209,8 +2842,20 @@ fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
         Some("obscured") => Err(BrowserToolError::element_not_actionable(
             "element is obscured at its action point",
         )),
+        Some("unstable") => Err(BrowserToolError::element_not_actionable(
+            "element geometry did not stabilize before input",
+        )),
         Some("not_editable") => Err(BrowserToolError::element_not_actionable(
             "element is not editable",
+        )),
+        Some("not_checkable") => Err(BrowserToolError::element_not_actionable(
+            "element is not a checkbox or radio control",
+        )),
+        Some("not_select") => Err(BrowserToolError::element_not_actionable(
+            "element is not a select control",
+        )),
+        Some("option_not_found") => Err(BrowserToolError::element_not_actionable(
+            "one or more requested select options were not found",
         )),
         Some(state) => Err(BrowserToolError::chrome_unavailable(format!(
             "element operation returned unknown state `{state}`"
@@ -1372,11 +3017,11 @@ fn key_event_for(key: &str, modifiers: &[String]) -> Result<KeyEvent, BrowserToo
 fn modifier_bits(modifiers: &[String]) -> Result<u8, BrowserToolError> {
     let mut bits = 0;
     for modifier in modifiers {
-        match modifier.as_str() {
-            "Alt" => bits |= 1,
-            "Control" | "Ctrl" => bits |= 2,
-            "Meta" | "Command" => bits |= 4,
-            "Shift" => bits |= 8,
+        match modifier.to_ascii_lowercase().as_str() {
+            "alt" => bits |= 1,
+            "control" | "ctrl" => bits |= 2,
+            "meta" | "command" => bits |= 4,
+            "shift" => bits |= 8,
             other => {
                 return Err(BrowserToolError::invalid_input(format!(
                     "unsupported key modifier `{other}`"
@@ -1424,6 +3069,10 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
         "Network.requestWillBeSent" => Some(CdpDiagnosticEvent::Network(NetworkEvent {
             sequence: 0,
             kind: "request".to_string(),
+            request_id: value
+                .pointer("/params/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             url: value
                 .pointer("/params/request/url")
                 .and_then(Value::as_str)
@@ -1432,6 +3081,12 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
                 .pointer("/params/request/method")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            resource_type: value
+                .pointer("/params/type")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            mime_type: None,
+            headers: diagnostic_headers(value.pointer("/params/request/headers")),
             status: None,
             error_text: None,
             timestamp_ms: monotonic_timestamp_ms(value.pointer("/params/timestamp")),
@@ -1439,11 +3094,24 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
         "Network.responseReceived" => Some(CdpDiagnosticEvent::Network(NetworkEvent {
             sequence: 0,
             kind: "response".to_string(),
+            request_id: value
+                .pointer("/params/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             url: value
                 .pointer("/params/response/url")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             method: None,
+            resource_type: value
+                .pointer("/params/type")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            mime_type: value
+                .pointer("/params/response/mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            headers: diagnostic_headers(value.pointer("/params/response/headers")),
             status: value
                 .pointer("/params/response/status")
                 .and_then(Value::as_f64)
@@ -1454,8 +3122,18 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
         "Network.loadingFailed" => Some(CdpDiagnosticEvent::Network(NetworkEvent {
             sequence: 0,
             kind: "failed".to_string(),
+            request_id: value
+                .pointer("/params/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             url: None,
             method: None,
+            resource_type: value
+                .pointer("/params/type")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            mime_type: None,
+            headers: BTreeMap::new(),
             status: None,
             error_text: value
                 .pointer("/params/errorText")
@@ -1466,14 +3144,72 @@ fn diagnostic_event(value: &Value) -> Option<CdpDiagnosticEvent> {
         "Network.loadingFinished" => Some(CdpDiagnosticEvent::Network(NetworkEvent {
             sequence: 0,
             kind: "finished".to_string(),
+            request_id: value
+                .pointer("/params/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             url: None,
             method: None,
+            resource_type: None,
+            mime_type: None,
+            headers: BTreeMap::new(),
             status: None,
             error_text: None,
             timestamp_ms: monotonic_timestamp_ms(value.pointer("/params/timestamp")),
         })),
         _ => None,
     }
+}
+
+fn diagnostic_headers(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| value.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_str<'a>(
+    arguments: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a str, BrowserToolError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BrowserToolError::invalid_input(format!("missing `{name}`")))
+}
+
+fn json_f64(
+    arguments: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<f64, BrowserToolError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| BrowserToolError::invalid_input(format!("missing `{name}`")))
+}
+
+fn json_i64(
+    arguments: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<i64, BrowserToolError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| BrowserToolError::invalid_input(format!("missing `{name}`")))
 }
 
 fn runtime_console_event(value: &Value) -> Option<CdpDiagnosticEvent> {
@@ -1717,8 +3453,12 @@ mod tests {
             CdpDiagnosticEvent::Network(NetworkEvent {
                 sequence: 0,
                 kind: "response".to_string(),
+                request_id: None,
                 url: Some("https://example.com/data.json".to_string()),
                 method: None,
+                resource_type: None,
+                mime_type: None,
+                headers: BTreeMap::new(),
                 status: Some(201),
                 error_text: None,
                 timestamp_ms: Some(12_500)

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +26,8 @@ pub struct BrowserSession {
     pub owner_display_id: OwnerDisplayId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -174,6 +177,10 @@ pub enum BrowserToolErrorCode {
     ElementAmbiguous,
     ElementStale,
     ElementNotActionable,
+    ArtifactNotFound,
+    ArtifactError,
+    WorkspaceUnavailable,
+    PathOutsideWorkspace,
 }
 
 impl BrowserToolError {
@@ -288,6 +295,41 @@ impl BrowserToolError {
             recovery: Some(RecoveryAction::FocusTab),
         }
     }
+
+    pub fn artifact_not_found(artifact_id: &str) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ArtifactNotFound,
+            message: format!("artifact `{artifact_id}` is not owned by this session"),
+            recovery: None,
+        }
+    }
+
+    pub fn artifact_error(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::ArtifactError,
+            message: message.into(),
+            recovery: None,
+        }
+    }
+
+    pub fn workspace_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::WorkspaceUnavailable,
+            message: message.into(),
+            recovery: None,
+        }
+    }
+
+    pub fn path_outside_workspace(path: &Path) -> Self {
+        Self {
+            code: BrowserToolErrorCode::PathOutsideWorkspace,
+            message: format!(
+                "artifact export path `{}` is outside the session workspace",
+                path.display()
+            ),
+            recovery: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -303,11 +345,20 @@ impl LeaseRegistry {
     }
 
     pub fn start_session(&mut self, label: Option<String>) -> BrowserSession {
+        self.start_session_with_workspace(label, None)
+    }
+
+    pub fn start_session_with_workspace(
+        &mut self,
+        label: Option<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> BrowserSession {
         let now = now_ms();
         let session = BrowserSession {
             agent_session_id: AgentSessionId(prefixed_uuid("session")),
             owner_display_id: OwnerDisplayId(prefixed_uuid("owner")),
             label,
+            workspace_root,
             created_at_ms: now,
             updated_at_ms: now,
         };

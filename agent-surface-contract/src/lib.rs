@@ -1,3 +1,5 @@
+//! Authoritative definitions for the Visible Browser Lab agent-facing MCP surface.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
@@ -806,7 +808,6 @@ fn operation_fields(domain: &str, operation: &str) -> Vec<(&'static str, Value)>
         ],
         ("memory", "close") => vec![("artifact_id", string_schema())],
         ("screencast", "start") => vec![
-            ("format", enum_schema(&["webm", "mp4"])),
             ("fps", integer_schema()),
             ("quality", integer_schema()),
             ("max_duration_ms", integer_schema()),
@@ -1436,6 +1437,7 @@ fn artifact_summary_schema() -> Value {
             ("size_bytes", integer_schema()),
             ("sha256", string_schema()),
             ("created_at_ms", integer_schema()),
+            ("retention", const_string("session")),
         ],
         &[
             "artifact_id",
@@ -1444,6 +1446,7 @@ fn artifact_summary_schema() -> Value {
             "size_bytes",
             "sha256",
             "created_at_ms",
+            "retention",
         ],
     )
 }
@@ -1854,7 +1857,7 @@ fn baseline_operation_description(domain: &str, operation: &str, domain_summary:
             "Close an owned heap-snapshot artifact and release its analysis resources."
         }
         ("screencast", "start") => {
-            "Start an owned-tab screencast with bounded format, frame rate, quality, and duration settings."
+            "Start an owned-tab silent WebM screencast with bounded frame rate, quality, and duration settings."
         }
         ("screencast", "stop") => {
             "Stop the active screencast and return its immutable video artifact metadata."

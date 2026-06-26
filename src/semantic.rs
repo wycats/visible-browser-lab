@@ -75,7 +75,6 @@ struct TabReferences {
     agent_session_id: Option<AgentSessionId>,
     target_id: String,
     document_revision: String,
-    next_ref: u64,
     by_ref: HashMap<String, ElementReference>,
     by_node: HashMap<NodeKey, String>,
     last_snapshot: Option<SnapshotResult>,
@@ -84,6 +83,7 @@ struct TabReferences {
 #[derive(Debug, Default)]
 pub struct ElementReferenceRegistry {
     tabs: HashMap<TabId, TabReferences>,
+    next_ref: u64,
 }
 
 pub struct SnapshotBuildContext<'a> {
@@ -114,6 +114,7 @@ impl ElementReferenceRegistry {
             max_nodes,
         } = context;
         let document_revision = raw.document_revision()?.to_string();
+        let next_ref = &mut self.next_ref;
         let tab = self.tabs.entry(tab_id.clone()).or_default();
         if tab.agent_session_id.as_ref() != Some(agent_session_id)
             || tab.target_id != target_id
@@ -130,6 +131,7 @@ impl ElementReferenceRegistry {
         let previous = tab.last_snapshot.clone();
         let mut formatter = SnapshotFormatter {
             tab,
+            next_ref,
             agent_session_id,
             tab_id,
             target_id,
@@ -184,6 +186,12 @@ impl ElementReferenceRegistry {
         Ok(element.clone())
     }
 
+    pub fn document_revision(&self, tab_id: &TabId) -> Option<String> {
+        self.tabs
+            .get(tab_id)
+            .map(|tab| tab.document_revision.clone())
+    }
+
     pub fn reset_tab(&mut self, tab_id: &TabId) {
         self.tabs.remove(tab_id);
     }
@@ -195,6 +203,7 @@ impl ElementReferenceRegistry {
 
 struct SnapshotFormatter<'a> {
     tab: &'a mut TabReferences,
+    next_ref: &'a mut u64,
     agent_session_id: &'a AgentSessionId,
     tab_id: &'a TabId,
     target_id: &'a str,
@@ -295,8 +304,8 @@ impl SnapshotFormatter<'_> {
             return Some(reference.clone());
         }
 
-        self.tab.next_ref += 1;
-        let reference = format!("e_{}", base36(self.tab.next_ref));
+        *self.next_ref += 1;
+        let reference = format!("e_{}", base36(*self.next_ref));
         let element = ElementReference {
             agent_session_id: self.agent_session_id.clone(),
             tab_id: self.tab_id.clone(),

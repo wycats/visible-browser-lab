@@ -1,16 +1,16 @@
 {
   "name": "visible-browser-lab",
-  "version": "0.1.0",
-  "description": "Visible Chrome automation through a tab-lease MCP facade",
+  "version": "0.3.0",
+  "description": "Lease-scoped visible Chrome interaction, diagnostics, analysis, and artifacts",
   "author": {
-    "name": "Local developer"
+    "name": "Yehuda Katz"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Visible Browser Lab",
-    "shortDescription": "Control a visible Chrome profile through leased-tab MCP tools.",
-    "longDescription": "Visible Browser Lab connects Codex automation to a persistent visible Chrome profile through a tab-lease MCP facade over the Chrome DevTools Protocol.",
-    "developerName": "Local developer",
+    "shortDescription": "Operate a visible Chrome profile through semantic, leased-tab tools.",
+    "longDescription": "Visible Browser Lab connects Codex to a persistent visible Chrome profile through lease-scoped semantic interaction, diagnostics, analysis, and artifact tools.",
+    "developerName": "Yehuda Katz",
     "category": "Productivity",
     "capabilities": [
       "browser",
