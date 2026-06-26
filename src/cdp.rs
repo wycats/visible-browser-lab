@@ -314,13 +314,26 @@ impl CdpClient {
         if !self.start_page_navigation(page, connection, url).await? {
             return Ok(());
         }
+        self.wait_for_lifecycle_event(&mut events, timeout_ms, event_name)
+            .await
+    }
+
+    async fn wait_for_lifecycle_event<T>(
+        &self,
+        events: &mut chromiumoxide::listeners::EventStream<T>,
+        timeout_ms: u64,
+        event_name: &str,
+    ) -> Result<(), BrowserToolError>
+    where
+        T: chromiumoxide::cdp::IntoEventKind + Unpin,
+    {
         match timeout(Duration::from_millis(timeout_ms), events.next()).await {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(BrowserToolError::chrome_unavailable(format!(
-                "Chrome closed the {event_name} event stream while navigating to `{url}`"
+                "Chrome closed the {event_name} event stream during navigation"
             ))),
             Err(_) => Err(BrowserToolError::operation_timeout(format!(
-                "timed out waiting for {event_name} after navigating to `{url}`"
+                "timed out waiting for {event_name} during navigation"
             ))),
         }
     }
@@ -364,6 +377,7 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
         direction: i64,
+        wait_until: Option<&str>,
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
@@ -391,63 +405,136 @@ impl CdpClient {
             })?;
         let entry_id = entry.id;
         let navigation = async {
-            self.runtime
-                .page_command(
-                    &connection,
-                    page.execute(NavigateToHistoryEntryParams::new(entry_id)),
-                    "navigate browser history",
-                )
-                .await?;
-            match timeout(
-                Duration::from_millis(timeout_ms),
-                page.wait_for_navigation(),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => Err(self
+            match wait_until.unwrap_or("load") {
+                "none" => self
                     .runtime
-                    .page_error(&connection, "navigate browser history", error)
-                    .await),
-                Err(_) => Err(BrowserToolError::operation_timeout(
-                    "timed out waiting for browser history navigation",
-                )),
+                    .page_command(
+                        &connection,
+                        page.execute(NavigateToHistoryEntryParams::new(entry_id)),
+                        "navigate browser history",
+                    )
+                    .await
+                    .map(|_| ()),
+                "dom_content_loaded" | "load" | "network_idle" => {
+                    self.runtime
+                        .page_command(
+                            &connection,
+                            page.execute(NavigateToHistoryEntryParams::new(entry_id)),
+                            "navigate browser history",
+                        )
+                        .await?;
+                    self.wait_for_history_entry(
+                        &page,
+                        &connection,
+                        index,
+                        wait_until.unwrap_or("load"),
+                        timeout_ms,
+                    )
+                    .await
+                }
+                wait_until => Err(BrowserToolError::invalid_input(format!(
+                    "unknown navigation wait state `{wait_until}`"
+                ))),
             }
         };
         self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
             .await
     }
 
+    async fn wait_for_history_entry(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        expected_index: i64,
+        wait_until: &str,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserToolError> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let history = self
+                .runtime
+                .page_command(
+                    connection,
+                    page.execute(GetNavigationHistoryParams::default()),
+                    "observe browser history navigation",
+                )
+                .await?;
+            if history.result.current_index == expected_index {
+                let ready_state = match page.evaluate_expression("document.readyState").await {
+                    Ok(value) => value.into_value::<String>().map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned an invalid document state: {error}"
+                        ))
+                    })?,
+                    Err(_) if Instant::now() < deadline => {
+                        sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(map_cdp_error("read history document state", &error));
+                    }
+                };
+                let ready = match wait_until {
+                    "dom_content_loaded" => {
+                        matches!(ready_state.as_str(), "interactive" | "complete")
+                    }
+                    "load" | "network_idle" => ready_state == "complete",
+                    _ => false,
+                };
+                if ready {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(BrowserToolError::operation_timeout(format!(
+                    "timed out waiting for history entry {expected_index} to reach {wait_until}"
+                )));
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     pub async fn reload(
         &self,
         target: &CdpTarget,
         ignore_cache: bool,
+        wait_until: Option<&str>,
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         let navigation = async {
-            self.runtime
-                .page_command(
-                    &connection,
-                    page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build()),
-                    "reload page",
-                )
-                .await?;
-            match timeout(
-                Duration::from_millis(timeout_ms),
-                page.wait_for_navigation(),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(error)) => Err(self
+            let command =
+                || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
+            match wait_until.unwrap_or("load") {
+                "none" => self
                     .runtime
-                    .page_error(&connection, "reload page", error)
-                    .await),
-                Err(_) => Err(BrowserToolError::operation_timeout(
-                    "timed out waiting for page reload",
-                )),
+                    .page_command(&connection, command(), "reload page")
+                    .await
+                    .map(|_| ()),
+                "dom_content_loaded" => {
+                    let mut events = self
+                        .event_listener::<EventDomContentEventFired>(&page, &connection)
+                        .await?;
+                    self.runtime
+                        .page_command(&connection, command(), "reload page")
+                        .await?;
+                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "DOMContentLoaded")
+                        .await
+                }
+                "load" | "network_idle" => {
+                    let mut events = self
+                        .event_listener::<EventLoadEventFired>(&page, &connection)
+                        .await?;
+                    self.runtime
+                        .page_command(&connection, command(), "reload page")
+                        .await?;
+                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "load")
+                        .await
+                }
+                wait_until => Err(BrowserToolError::invalid_input(format!(
+                    "unknown navigation wait state `{wait_until}`"
+                ))),
             }
         };
         self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
