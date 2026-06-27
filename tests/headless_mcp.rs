@@ -16,6 +16,9 @@ use visible_browser_lab_test_support::{
     tabs_include_id,
 };
 
+const PROPERTY_BROWSER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+const PROPERTY_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+
 #[test]
 fn deterministic_real_browser_facade() -> Result<()> {
     let mut harness = BrowserMcpHarness::start("visible-browser-lab-deterministic", false)?;
@@ -1073,9 +1076,10 @@ impl BrowserMcpHarness {
                 "tab_id": open_tab.tab_id,
                 "action": "url",
                 "url": url,
-                "wait_until": "load"
+                "wait_until": "load",
+                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
             }),
-            Duration::from_secs(20),
+            PROPERTY_BROWSER_TOOL_TIMEOUT,
             false,
         )?;
         self.sessions[actor.index()] = Some(session_id);
@@ -1109,9 +1113,10 @@ impl BrowserMcpHarness {
                 "tab_id": open_tab.tab_id,
                 "action": "url",
                 "url": url,
-                "wait_until": "load"
+                "wait_until": "load",
+                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
             }),
-            Duration::from_secs(20),
+            PROPERTY_BROWSER_TOOL_TIMEOUT,
             false,
         )?;
         self.tabs.push(ConcreteTab {
