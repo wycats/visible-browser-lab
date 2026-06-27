@@ -104,7 +104,9 @@ usage:
   cargo xtask validate
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
   cargo xtask checksums [--dir <dir>]
-  cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>]
+  cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
+      Omitting --cdp-endpoint exercises managed Chrome mode.
+      Omitting --allow-focus keeps native input checks on the focus_required path.
   cargo xtask install-smoke [--archive <path>] [--codex <path>] [--chrome-path <path>] [--invoke-codex] [--auth-source <path>] [--keep-temp]
   cargo xtask catalog-measurement
   cargo xtask agent-eval --auth-source <path> [--codex <path>] [--model <model>] [--reasoning-effort <effort>] [--fixture <id>] [--resume <run-dir>]
@@ -203,26 +205,29 @@ impl ChecksumsArgs {
 
 #[derive(Debug)]
 struct LiveSmokeArgs {
-    cdp_endpoint: String,
+    cdp_endpoint: Option<String>,
     binary: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    allow_focus: bool,
 }
 
 impl LiveSmokeArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
-        let mut cdp_endpoint = "http://127.0.0.1:9222".to_string();
+        let mut cdp_endpoint = None;
         let mut binary = None;
         let mut state_dir = None;
+        let mut allow_focus = false;
         let mut index = 0;
 
         while index < args.len() {
             match args[index].as_str() {
                 "--cdp-endpoint" => {
                     index += 1;
-                    cdp_endpoint = args
-                        .get(index)
-                        .context("missing value after --cdp-endpoint")?
-                        .to_string();
+                    cdp_endpoint = Some(
+                        args.get(index)
+                            .context("missing value after --cdp-endpoint")?
+                            .to_string(),
+                    );
                 }
                 "--binary" => {
                     index += 1;
@@ -236,6 +241,9 @@ impl LiveSmokeArgs {
                         args.get(index).context("missing value after --state-dir")?,
                     ));
                 }
+                "--allow-focus" => {
+                    allow_focus = true;
+                }
                 arg => bail!("unknown live-smoke argument `{arg}`"),
             }
 
@@ -246,6 +254,7 @@ impl LiveSmokeArgs {
             cdp_endpoint,
             binary,
             state_dir,
+            allow_focus,
         })
     }
 }
@@ -456,21 +465,34 @@ fn live_smoke(args: LiveSmokeArgs) -> Result<()> {
         }
     };
 
-    let mut client = visible_browser_lab_test_support::McpClient::spawn(
-        &binary,
-        &args.cdp_endpoint,
-        &state_dir,
-        &root,
-    )?;
+    let mut client = match args.cdp_endpoint.as_deref() {
+        Some(cdp_endpoint) => visible_browser_lab_test_support::McpClient::spawn(
+            &binary,
+            cdp_endpoint,
+            &state_dir,
+            &root,
+        )?,
+        None => visible_browser_lab_test_support::McpClient::spawn_with_state(
+            &binary, &state_dir, &root,
+        )?,
+    };
     let mut open_tabs = Vec::new();
     let smoke_result = visible_browser_lab_test_support::run_live_smoke(
         &mut client,
         &mut open_tabs,
-        &args.cdp_endpoint,
+        args.cdp_endpoint.as_deref(),
+        Some(&state_dir),
+        args.allow_focus,
     );
     visible_browser_lab_test_support::cleanup_open_tabs(&mut client, &mut open_tabs);
     client.shutdown();
     visible_browser_lab_test_support::stop_broker(&state_dir);
+    if args.cdp_endpoint.is_none()
+        && remove_state_dir
+        && let Ok(endpoint) = visible_browser_lab_test_support::managed_endpoint(&state_dir)
+    {
+        let _ = visible_browser_lab_test_support::close_browser_via_cdp(&endpoint);
+    }
 
     if remove_state_dir {
         let _ = fs::remove_dir_all(&state_dir);

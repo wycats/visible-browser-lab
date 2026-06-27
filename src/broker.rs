@@ -1596,7 +1596,7 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
     prepare_state(config).await?;
 
-    if let Ok(client) = connect_and_ping(config).await {
+    if let Ok(BrokerProbe::Compatible(client)) = probe_broker(config).await {
         return Ok(client);
     }
 
@@ -1604,8 +1604,12 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
 
     loop {
         if let Some(_lock) = BrokerStartLock::try_acquire(&config.lock_path)? {
-            if let Ok(client) = connect_and_ping(config).await {
-                return Ok(client);
+            match probe_broker(config).await {
+                Ok(BrokerProbe::Compatible(client)) => return Ok(client),
+                Ok(BrokerProbe::Incompatible { status, message }) => {
+                    restart_incompatible_broker(config, &status, &message).await?;
+                }
+                Err(_) => {}
             }
 
             cleanup_stale_endpoint(config)?;
@@ -1672,17 +1676,78 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
 }
 
 async fn connect_and_ping(config: &RuntimeConfig) -> Result<BrokerClient> {
+    match probe_broker(config).await? {
+        BrokerProbe::Compatible(client) => Ok(client),
+        BrokerProbe::Incompatible { message, .. } => bail!("{message}"),
+    }
+}
+
+enum BrokerProbe {
+    Compatible(BrokerClient),
+    Incompatible {
+        status: BrokerStatus,
+        message: String,
+    },
+}
+
+async fn probe_broker(config: &RuntimeConfig) -> Result<BrokerProbe> {
     let endpoint = broker_endpoint(config)?;
     let mut client = BrokerClient::connect(&endpoint).await?;
     let status = client.ping().await?;
-    if status.protocol_version != BROKER_PROTOCOL_VERSION {
-        bail!(
-            "broker protocol mismatch: expected {}, got {}",
-            BROKER_PROTOCOL_VERSION,
-            status.protocol_version
-        );
+    if let Some(message) = broker_status_mismatch(config, &status)? {
+        return Ok(BrokerProbe::Incompatible { status, message });
     }
-    Ok(client)
+    Ok(BrokerProbe::Compatible(client))
+}
+
+fn broker_status_mismatch(config: &RuntimeConfig, status: &BrokerStatus) -> Result<Option<String>> {
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        return Ok(Some(format!(
+            "broker protocol mismatch: expected {}, got {}",
+            BROKER_PROTOCOL_VERSION, status.protocol_version
+        )));
+    }
+    if status.runtime_mode != config.runtime_mode {
+        return Ok(Some(format!(
+            "broker runtime mismatch: requested {:?}, existing broker is {:?} at {}",
+            config.runtime_mode, status.runtime_mode, status.ipc_endpoint
+        )));
+    }
+    if config.runtime_mode == RuntimeMode::External {
+        let expected = config
+            .cdp_endpoint
+            .as_deref()
+            .context("external runtime omitted its CDP endpoint")?;
+        if status.cdp_endpoint != expected {
+            return Ok(Some(format!(
+                "broker CDP endpoint mismatch: requested {expected}, existing broker uses {} at {}",
+                status.cdp_endpoint, status.ipc_endpoint
+            )));
+        }
+    }
+    Ok(None)
+}
+
+async fn restart_incompatible_broker(
+    config: &RuntimeConfig,
+    status: &BrokerStatus,
+    message: &str,
+) -> Result<()> {
+    tracing::warn!(
+        pid = status.pid,
+        runtime_mode = ?status.runtime_mode,
+        cdp_endpoint = %status.cdp_endpoint,
+        ipc_endpoint = %status.ipc_endpoint,
+        reason = %message,
+        "restarting incompatible visible browser broker"
+    );
+    terminate_process(status.pid).await?;
+    let endpoint = broker_endpoint(config)?;
+    if let Some(stale_path) = endpoint.stale_path() {
+        let _ = fs::remove_file(stale_path);
+    }
+    let _ = fs::remove_file(&config.pid_path);
+    Ok(())
 }
 
 async fn wait_for_broker(config: &RuntimeConfig, timeout: Duration) -> Result<BrokerClient> {
@@ -5233,6 +5298,65 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+async fn terminate_process(pid: u32) -> Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    if pid == std::process::id() {
+        bail!("refusing to terminate the current process as an incompatible broker");
+    }
+
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| format!("failed to terminate broker pid {pid}"));
+            }
+        }
+        wait_for_process_exit(pid, Duration::from_secs(2)).await;
+        if process_is_alive(pid) {
+            let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error).with_context(|| format!("failed to kill broker pid {pid}"));
+                }
+            }
+            wait_for_process_exit(pid, Duration::from_secs(2)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .with_context(|| format!("failed to invoke taskkill for broker pid {pid}"))?;
+        if !output.status.success() && process_is_alive(pid) {
+            bail!(
+                "failed to terminate broker pid {pid}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        wait_for_process_exit(pid, Duration::from_secs(2)).await;
+    }
+
+    if process_is_alive(pid) {
+        bail!("broker pid {pid} did not exit after termination");
+    }
+    Ok(())
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while process_is_alive(pid) && Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleEndpointCleanup {
     NoEndpoint,
@@ -6125,6 +6249,59 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[test]
+    fn broker_status_must_match_requested_runtime() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let managed_config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let external_config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            managed_config.state_dir.clone(),
+        )
+        .unwrap();
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: managed_config.ipc_endpoint.clone(),
+            socket_path: managed_config.socket_path.clone(),
+        };
+
+        let message = broker_status_mismatch(&managed_config, &status)
+            .unwrap()
+            .expect("managed startup should reject an external broker");
+        assert!(message.contains("broker runtime mismatch"));
+
+        assert!(
+            broker_status_mismatch(&external_config, &status)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_broker_status_must_match_requested_cdp_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            tempdir.path().join("state"),
+        )
+        .unwrap();
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9223".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        let message = broker_status_mismatch(&config, &status)
+            .unwrap()
+            .expect("external startup should reject a different endpoint");
+        assert!(message.contains("broker CDP endpoint mismatch"));
     }
 
     #[tokio::test]
