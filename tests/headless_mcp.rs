@@ -1069,19 +1069,7 @@ impl BrowserMcpHarness {
         let session_id = field_str(&result, "agent_session_id")?;
         let tab = result.get("tab").context("start_session omitted tab")?;
         let open_tab = OpenTab::from_summary(&session_id, tab)?;
-        self.client_mut().call_tool(
-            "navigate",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "action": "url",
-                "url": url,
-                "wait_until": "load",
-                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
-            }),
-            PROPERTY_BROWSER_TOOL_TIMEOUT,
-            false,
-        )?;
+        self.navigate_to_url(&session_id, &open_tab.tab_id, &url)?;
         self.sessions[actor.index()] = Some(session_id);
         self.tabs.push(ConcreteTab {
             owner: Some(actor),
@@ -1106,25 +1094,33 @@ impl BrowserMcpHarness {
         )?;
         let tab = result.get("tab").context("new_tab omitted tab")?;
         let open_tab = OpenTab::from_summary(&session_id, tab)?;
-        self.client_mut().call_tool(
-            "navigate",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "action": "url",
-                "url": url,
-                "wait_until": "load",
-                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
-            }),
-            PROPERTY_BROWSER_TOOL_TIMEOUT,
-            false,
-        )?;
+        self.navigate_to_url(&session_id, &open_tab.tab_id, &url)?;
         self.tabs.push(ConcreteTab {
             owner: Some(actor),
             state: ModelTabState::Active,
             tab_id: open_tab.tab_id,
             target_id: open_tab.target_id,
         });
+        Ok(())
+    }
+
+    fn navigate_to_url(&mut self, session_id: &str, tab_id: &str, url: &str) -> Result<()> {
+        let result = self.client_mut().call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id,
+                "action": "url",
+                "url": url,
+                "wait_until": "dom_content_loaded",
+                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
+            }),
+            PROPERTY_BROWSER_TOOL_TIMEOUT,
+            false,
+        )?;
+        if result.get("document_revision").is_none() {
+            bail!("navigate omitted document_revision");
+        }
         Ok(())
     }
 
@@ -1289,9 +1285,10 @@ impl BrowserMcpHarness {
                 "tab_id": tab_id,
                 "action": "url",
                 "url": url,
-                "timeout_ms": 10000
+                "wait_until": "dom_content_loaded",
+                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
             }),
-            Duration::from_secs(30),
+            PROPERTY_BROWSER_TOOL_TIMEOUT,
             false,
         )?;
         if result.get("document_revision").is_none() {
@@ -1322,6 +1319,22 @@ impl BrowserMcpHarness {
     fn semantic_fill(&mut self, owner: Actor, tab: usize) -> Result<()> {
         let session_id = self.session(owner)?;
         let tab_id = self.tabs[tab].tab_id.clone();
+        self.client_mut().call_tool(
+            "wait_for",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab_id,
+                "condition": {
+                    "kind": "element",
+                    "target": { "css": "#entry" },
+                    "state": "visible"
+                },
+                "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS,
+                "observe": "none"
+            }),
+            PROPERTY_BROWSER_TOOL_TIMEOUT,
+            false,
+        )?;
         let snapshot = self.client_mut().call_tool(
             "snapshot",
             json!({
