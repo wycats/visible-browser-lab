@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use proptest::{
@@ -18,6 +18,7 @@ use visible_browser_lab_test_support::{
 
 const PROPERTY_BROWSER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const PROPERTY_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+const PROPERTY_NAVIGATION_ATTEMPTS: usize = 3;
 
 #[test]
 fn deterministic_real_browser_facade() -> Result<()> {
@@ -1105,8 +1106,7 @@ impl BrowserMcpHarness {
     }
 
     fn navigate_to_url(&mut self, session_id: &str, tab_id: &str, url: &str) -> Result<()> {
-        let result = self.client_mut().call_tool(
-            "navigate",
+        let arguments = || {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab_id,
@@ -1114,14 +1114,41 @@ impl BrowserMcpHarness {
                 "url": url,
                 "wait_until": "dom_content_loaded",
                 "timeout_ms": PROPERTY_NAVIGATION_TIMEOUT_MS
-            }),
-            PROPERTY_BROWSER_TOOL_TIMEOUT,
-            false,
-        )?;
-        if result.get("document_revision").is_none() {
-            bail!("navigate omitted document_revision");
+            })
+        };
+        for attempt in 1..=PROPERTY_NAVIGATION_ATTEMPTS {
+            let result = self.client_mut().request(
+                "tools/call",
+                json!({
+                    "name": "navigate",
+                    "arguments": arguments()
+                }),
+                PROPERTY_BROWSER_TOOL_TIMEOUT,
+            )?;
+            let is_error = result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let structured = result
+                .get("structuredContent")
+                .or_else(|| result.get("structured_content"))
+                .cloned()
+                .context("tool `navigate` omitted structured content")?;
+            if !is_error {
+                if structured.get("document_revision").is_none() {
+                    bail!("navigate omitted document_revision");
+                }
+                return Ok(());
+            }
+            if attempt < PROPERTY_NAVIGATION_ATTEMPTS
+                && is_retryable_fixture_navigation_error(&structured)
+            {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            bail!("tool `navigate` returned isError=true, expected false: {result}");
         }
-        Ok(())
+        unreachable!("navigation attempts loop always returns or bails")
     }
 
     fn list_owned(&mut self, actor: Actor) -> Result<Value> {
@@ -1488,6 +1515,18 @@ impl Drop for BrowserMcpHarness {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn is_retryable_fixture_navigation_error(error: &Value) -> bool {
+    let code = error.get("code").and_then(Value::as_str);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    (matches!(code, Some("operation_timeout"))
+        && message.contains("start page navigation timed out"))
+        || (matches!(code, Some("chrome_unavailable"))
+            && message.contains("net::ERR_CONNECTION_RESET"))
 }
 
 fn assert_tool_error(value: &Value, expected: &str) -> Result<()> {
