@@ -230,7 +230,9 @@ fn wait_for_devtools_endpoint(profile_dir: &Path) -> Result<String> {
 pub fn run_live_smoke(
     client: &mut McpClient,
     open_tabs: &mut Vec<OpenTab>,
-    cdp_endpoint: &str,
+    cdp_endpoint: Option<&str>,
+    state_dir: Option<&Path>,
+    allow_focus: bool,
 ) -> Result<SmokeSummary> {
     let _init = client.request(
         "initialize",
@@ -259,7 +261,7 @@ pub fn run_live_smoke(
         json!({
             "label": "smoke-first",
             "start_url": data_url("VBL Smoke One", "VBL Smoke One"),
-            "focus": true
+            "focus": allow_focus
         }),
         Duration::from_secs(45),
         false,
@@ -276,7 +278,7 @@ pub fn run_live_smoke(
         json!({
             "label": "smoke-second",
             "start_url": data_url("VBL Smoke Two", "VBL Smoke Two"),
-            "focus": true
+            "focus": allow_focus
         }),
         Duration::from_secs(45),
         false,
@@ -349,7 +351,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "url": data_url("VBL Smoke Three", "VBL Smoke Three"),
-            "focus": true
+            "focus": allow_focus
         }),
         Duration::from_secs(45),
         false,
@@ -504,83 +506,103 @@ pub fn run_live_smoke(
         bail!("fill did not resolve the iframe element reference: {frame_value}");
     }
 
-    client.call_tool(
-        "click",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "target": { "ref": frame_button_ref },
-            "observe": "none",
-            "timeout_ms": 5000
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    let frame_clicked = client.call_tool(
-        "evaluate",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "source": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
-        bail!(
-            "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
-        );
+    if allow_focus {
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "target": { "ref": frame_button_ref },
+                "observe": "none",
+                "timeout_ms": 5000
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let frame_clicked = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "source": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
+            bail!(
+                "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
+            );
+        }
+
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "target": { "ref": button_ref },
+                "observe": "diff",
+                "timeout_ms": 5000
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let clicked = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "source": "document.body.dataset.clicked"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        if clicked.get("value").and_then(Value::as_str) != Some("yes") {
+            bail!("click did not update the fixture page: {clicked}");
+        }
+    } else {
+        let click_requires_focus = client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "target": { "ref": button_ref },
+                "observe": "none",
+                "timeout_ms": 5000
+            }),
+            Duration::from_secs(20),
+            true,
+        )?;
+        if field_str(&click_requires_focus, "code")? != "focus_required" {
+            bail!("background click returned the wrong error: {click_requires_focus}");
+        }
     }
 
-    client.call_tool(
-        "click",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "target": { "ref": button_ref },
-            "observe": "diff",
-            "timeout_ms": 5000
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    let clicked = client.call_tool(
-        "evaluate",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "source": "document.body.dataset.clicked"
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    if clicked.get("value").and_then(Value::as_str) != Some("yes") {
-        bail!("click did not update the fixture page: {clicked}");
-    }
-
-    client.call_tool(
-        "evaluate",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "source": "document.querySelector('#clicker').remove()"
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    let removed = client.call_tool(
-        "click",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "target": { "ref": button_ref },
-            "observe": "none"
-        }),
-        Duration::from_secs(20),
-        true,
-    )?;
-    if field_str(&removed, "code")? != "element_stale" {
-        bail!("removed DOM node did not invalidate its element reference: {removed}");
+    if allow_focus {
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "source": "document.querySelector('#clicker').remove()"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let removed = client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": first_session,
+                "tab_id": transferable_tab.tab_id,
+                "target": { "ref": button_ref },
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            true,
+        )?;
+        if field_str(&removed, "code")? != "element_stale" {
+            bail!("removed DOM node did not invalidate its element reference: {removed}");
+        }
     }
 
     client.call_tool(
@@ -596,18 +618,6 @@ pub fn run_live_smoke(
         false,
     )?;
     client.call_tool(
-        "click",
-        json!({
-            "agent_session_id": first_session,
-            "tab_id": transferable_tab.tab_id,
-            "target": { "ref": textbox_ref },
-            "observe": "none",
-            "timeout_ms": 5000
-        }),
-        Duration::from_secs(20),
-        false,
-    )?;
-    client.call_tool(
         "type_text",
         json!({
             "agent_session_id": first_session,
@@ -618,7 +628,7 @@ pub fn run_live_smoke(
         Duration::from_secs(20),
         false,
     )?;
-    client.call_tool(
+    let press_key_result = client.call_tool(
         "press_key",
         json!({
             "agent_session_id": first_session,
@@ -626,8 +636,11 @@ pub fn run_live_smoke(
             "key": "Enter"
         }),
         Duration::from_secs(20),
-        false,
+        !allow_focus,
     )?;
+    if !allow_focus && field_str(&press_key_result, "code")? != "focus_required" {
+        bail!("background press_key returned the wrong error: {press_key_result}");
+    }
     let typed = client.call_tool(
         "evaluate",
         json!({
@@ -646,7 +659,12 @@ pub fn run_live_smoke(
         .get("value")
         .and_then(|value| value.get("key"))
         .and_then(Value::as_str);
-    if typed_value != Some("typed") || !matches!(pressed_key, Some("Enter" | "Unidentified")) {
+    let key_matches = if allow_focus {
+        matches!(pressed_key, Some("Enter" | "Unidentified"))
+    } else {
+        pressed_key.is_none()
+    };
+    if typed_value != Some("typed") || !key_matches {
         bail!("type_text or press_key did not update the fixture page: {typed}");
     }
 
@@ -810,7 +828,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "url": data_url("VBL Smoke Missing", "VBL Smoke Missing"),
-            "focus": true
+            "focus": allow_focus
         }),
         Duration::from_secs(45),
         false,
@@ -818,7 +836,13 @@ pub fn run_live_smoke(
     let missing_tab = missing.get("tab").context("new_tab omitted missing tab")?;
     let missing_open_tab = OpenTab::from_summary(&first_session, missing_tab)?;
     open_tabs.push(missing_open_tab.clone());
-    close_target_via_cdp(cdp_endpoint, &missing_open_tab.target_id)?;
+    let missing_close_endpoint = cdp_endpoint
+        .map(ToOwned::to_owned)
+        .or_else(|| state_dir.and_then(|state_dir| managed_endpoint(state_dir).ok()))
+        .context(
+            "live smoke needs a CDP endpoint or managed state dir for external target close",
+        )?;
+    close_target_via_cdp(&missing_close_endpoint, &missing_open_tab.target_id)?;
 
     let missing_error = client.call_tool(
         "focus_tab",
@@ -1196,6 +1220,12 @@ impl McpClient {
         Self::spawn_command(command, binary)
     }
 
+    pub fn spawn_with_state(binary: &Path, state_dir: &Path, root: &Path) -> Result<Self> {
+        let mut command = Command::new(binary);
+        command.arg("--state-dir").arg(state_dir).current_dir(root);
+        Self::spawn_command(command, binary)
+    }
+
     pub fn spawn_managed(
         binary: &Path,
         state_dir: &Path,
@@ -1497,6 +1527,17 @@ pub fn close_browser_via_cdp(endpoint: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     bail!("managed Chrome endpoint `{endpoint}` remained reachable after Browser.close")
+}
+
+pub fn managed_endpoint(state_dir: &Path) -> Result<String> {
+    let active_port = fs::read_to_string(state_dir.join("chrome-profile/DevToolsActivePort"))?;
+    let port = active_port
+        .lines()
+        .next()
+        .context("DevToolsActivePort omitted port")?
+        .trim()
+        .parse::<u16>()?;
+    Ok(format!("http://127.0.0.1:{port}"))
 }
 
 pub fn close_target_via_cdp(cdp_endpoint: &str, target_id: &str) -> Result<()> {

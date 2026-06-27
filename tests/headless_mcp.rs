@@ -25,7 +25,13 @@ fn deterministic_real_browser_facade() -> Result<()> {
     let mut harness = BrowserMcpHarness::start("visible-browser-lab-deterministic", false)?;
     let mut open_tabs = Vec::new();
     let cdp_endpoint = harness.cdp_endpoint().to_string();
-    let summary = run_live_smoke(harness.client_mut(), &mut open_tabs, &cdp_endpoint);
+    let summary = run_live_smoke(
+        harness.client_mut(),
+        &mut open_tabs,
+        Some(&cdp_endpoint),
+        None,
+        true,
+    );
     cleanup_open_tabs(harness.client_mut(), &mut open_tabs);
     let summary = summary?;
     assert!(summary.tool_count >= EXPECTED_TOOLS.len());
