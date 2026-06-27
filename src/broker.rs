@@ -739,8 +739,7 @@ impl BrowserBackend {
                 let target = client.create_page(url, false).await?;
                 if focus {
                     client.activate_target(&target.id).await?;
-                    activate_managed_chrome(&browser.config)
-                        .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+                    activate_managed_chrome_if_available(&browser.config);
                 }
                 Ok(target)
             }
@@ -754,8 +753,8 @@ impl BrowserBackend {
             Self::External(client) => client.activate_target(target_id).await,
             Self::Managed(browser) => {
                 browser.client().await?.activate_target(target_id).await?;
-                activate_managed_chrome(&browser.config)
-                    .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))
+                activate_managed_chrome_if_available(&browser.config);
+                Ok(())
             }
         }
     }
@@ -1561,6 +1560,15 @@ impl BrowserBackend {
 
 fn normalized_endpoint(client: &CdpClient) -> String {
     client.endpoint().as_str().trim_end_matches('/').to_string()
+}
+
+fn activate_managed_chrome_if_available(config: &RuntimeConfig) {
+    if let Err(error) = activate_managed_chrome(config) {
+        tracing::warn!(
+            error = %error,
+            "managed Chrome window activation did not complete"
+        );
+    }
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
