@@ -489,7 +489,7 @@ fn live_smoke(args: LiveSmokeArgs) -> Result<()> {
     visible_browser_lab_test_support::stop_broker(&state_dir);
     if args.cdp_endpoint.is_none()
         && remove_state_dir
-        && let Ok(endpoint) = visible_browser_lab_test_support::managed_endpoint(&state_dir)
+        && let Ok(endpoint) = managed_endpoint(&state_dir)
     {
         let _ = visible_browser_lab_test_support::close_browser_via_cdp(&endpoint);
     }

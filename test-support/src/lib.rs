@@ -836,12 +836,20 @@ pub fn run_live_smoke(
     let missing_tab = missing.get("tab").context("new_tab omitted missing tab")?;
     let missing_open_tab = OpenTab::from_summary(&first_session, missing_tab)?;
     open_tabs.push(missing_open_tab.clone());
-    let missing_close_endpoint = cdp_endpoint
-        .map(ToOwned::to_owned)
-        .or_else(|| state_dir.and_then(|state_dir| managed_endpoint(state_dir).ok()))
-        .context(
-            "live smoke needs a CDP endpoint or managed state dir for external target close",
-        )?;
+    let missing_close_endpoint = match cdp_endpoint {
+        Some(cdp_endpoint) => cdp_endpoint.to_owned(),
+        None => {
+            let state_dir = state_dir.context(
+                "live smoke needs a CDP endpoint or managed state dir for external target close",
+            )?;
+            managed_endpoint(state_dir).with_context(|| {
+                format!(
+                    "failed to discover managed Chrome endpoint from `{}` for external target close",
+                    state_dir.display()
+                )
+            })?
+        }
+    };
     close_target_via_cdp(&missing_close_endpoint, &missing_open_tab.target_id)?;
 
     let missing_error = client.call_tool(
