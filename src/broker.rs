@@ -19,6 +19,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
     time::{Instant, sleep},
 };
+use url::Url;
 
 use crate::{
     artifacts::ArtifactRegistry,
@@ -1972,14 +1973,7 @@ async fn broker_start_session(
     let params = params?;
     let workspace_root = params
         .workspace_root
-        .map(|path| {
-            path.canonicalize().map_err(|error| {
-                BrowserToolError::workspace_unavailable(format!(
-                    "workspace root `{}` is unavailable: {error}",
-                    path.display()
-                ))
-            })
-        })
+        .map(canonical_workspace_root)
         .transpose()?;
     let session = {
         let mut registry = state.registry().lock().unwrap();
@@ -1996,6 +1990,34 @@ async fn broker_start_session(
     Ok(StartSessionResult {
         agent_session_id: session.agent_session_id,
         tab,
+    })
+}
+
+fn canonical_workspace_root(path: PathBuf) -> Result<PathBuf, BrowserToolError> {
+    let original = path.display().to_string();
+    let path = local_workspace_path(path)?;
+    path.canonicalize().map_err(|error| {
+        BrowserToolError::workspace_unavailable(format!(
+            "workspace root `{original}` is unavailable: {error}"
+        ))
+    })
+}
+
+fn local_workspace_path(path: PathBuf) -> Result<PathBuf, BrowserToolError> {
+    let raw = path.as_os_str().to_string_lossy();
+    if !raw.starts_with("file:") {
+        return Ok(path);
+    }
+
+    let url = Url::parse(raw.as_ref()).map_err(|error| {
+        BrowserToolError::workspace_unavailable(format!(
+            "workspace root `{raw}` is not a valid file URL: {error}"
+        ))
+    })?;
+    url.to_file_path().map_err(|()| {
+        BrowserToolError::workspace_unavailable(format!(
+            "workspace root `{raw}` is not a local file URL"
+        ))
     })
 }
 
@@ -5389,6 +5411,36 @@ mod tests {
         assert!(result.agent_session_id.0.starts_with("session_"));
         assert_eq!(tab.url, "https://example.com/start");
         assert!(tab.focused);
+    }
+
+    #[tokio::test]
+    async fn start_session_accepts_file_url_workspace_root() {
+        let state = fake_state(Vec::new());
+        let workspace = tempfile::Builder::new()
+            .prefix("workspace root ")
+            .tempdir()
+            .unwrap();
+        let canonical_workspace = workspace.path().canonicalize().unwrap();
+        let workspace_url = Url::from_directory_path(workspace.path()).unwrap();
+
+        let result = broker_start_session(
+            &state,
+            Ok(StartSessionParams {
+                label: Some("agent".to_string()),
+                start_url: None,
+                focus: false,
+                workspace_root: Some(PathBuf::from(workspace_url.as_str())),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let registry = state.registry.lock().unwrap();
+        let session = registry.session(&result.agent_session_id).unwrap();
+        assert_eq!(
+            session.workspace_root.as_deref(),
+            Some(canonical_workspace.as_path())
+        );
     }
 
     #[tokio::test]
