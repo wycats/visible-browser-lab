@@ -1,0 +1,124 @@
+{
+  "date": "2026-06-28",
+  "host": {
+    "os": "macOS",
+    "arch": "aarch64",
+    "frontmost_app_before_actions": "com.apple.finder"
+  },
+  "chrome": {
+    "kind": "Chrome for Testing",
+    "version": "150.0.7871.24",
+    "path": "/Users/wycats/plugins/visible-browser-lab/target/chrome-for-testing/150.0.7871.24/mac-arm64/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+  },
+  "tool_versions": {
+    "playwright": "1.61.1",
+    "puppeteer-core": "25.2.1",
+    "selenium-webdriver": "4.45.0",
+    "chromedriver": "150.0.0"
+  },
+  "fixture": {
+    "controls": [
+      "button",
+      "menu-button",
+      "text-input",
+      "contenteditable",
+      "submit-form",
+      "iframe-button"
+    ],
+    "event_fields": [
+      "kind",
+      "target",
+      "isTrusted",
+      "document.hasFocus"
+    ]
+  },
+  "results": [
+    {
+      "stack": "playwright-launched",
+      "browser_ownership_mode": "tool-launched-headed-chrome",
+      "frontmost_after_actions": "com.scopely.startrek",
+      "chrome_remained_frontmost": false,
+      "page_effects": {
+        "button_clicked": true,
+        "menu_opened": true,
+        "input_filled": true,
+        "contenteditable_filled": true,
+        "form_submitted": true,
+        "iframe_clicked": true
+      },
+      "event_evidence": {
+        "trusted_click": true,
+        "trusted_input": true,
+        "trusted_submit": true,
+        "document_focus_inside_chrome": true
+      }
+    },
+    {
+      "stack": "playwright-connect-over-cdp",
+      "browser_ownership_mode": "fresh-headed-chrome-profile-dynamic-cdp-port",
+      "frontmost_after_actions": "com.apple.finder",
+      "chrome_remained_frontmost": false,
+      "page_effects": {
+        "button_clicked": true,
+        "menu_opened": true,
+        "input_filled": true,
+        "contenteditable_filled": true,
+        "form_submitted": true,
+        "iframe_clicked": true
+      },
+      "event_evidence": {
+        "trusted_click": true,
+        "trusted_input": true,
+        "trusted_submit": true,
+        "document_focus_inside_chrome": true
+      }
+    },
+    {
+      "stack": "puppeteer-launched",
+      "browser_ownership_mode": "tool-launched-headed-chrome",
+      "frontmost_after_actions": "com.apple.finder",
+      "chrome_remained_frontmost": false,
+      "page_effects": {
+        "button_clicked": true,
+        "menu_opened": true,
+        "input_typed": true,
+        "contenteditable_typed": true,
+        "form_submitted": true,
+        "iframe_clicked": true
+      },
+      "event_evidence": {
+        "trusted_click": true,
+        "trusted_keydown": true,
+        "trusted_input": true,
+        "trusted_submit": true,
+        "document_focus_inside_chrome": true
+      }
+    },
+    {
+      "stack": "selenium-chromedriver",
+      "browser_ownership_mode": "chromedriver-launched-headed-chrome",
+      "frontmost_after_actions": "com.apple.finder",
+      "chrome_remained_frontmost": false,
+      "page_effects": {
+        "button_clicked": true,
+        "menu_opened": true,
+        "input_typed": true,
+        "contenteditable_typed": true,
+        "form_submitted": true,
+        "iframe_clicked": true
+      },
+      "event_evidence": {
+        "trusted_click": true,
+        "trusted_keydown": true,
+        "trusted_input": true,
+        "trusted_submit": true,
+        "document_focus_inside_chrome": true
+      }
+    }
+  ],
+  "conclusion": {
+    "os_foreground_required_for_normal_page_actions": false,
+    "closest_browser_lab_match": "playwright-connect-over-cdp",
+    "implementation_direction": "browser-protocol target activation, element focus, actionability, and CDP input while preserving the active application"
+  }
+}
