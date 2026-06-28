@@ -12,7 +12,7 @@ mod macos {
     use anyhow::{Context, Result, bail};
     use chromiumoxide::Browser;
     use futures_util::StreamExt;
-    use serde_json::{Value, json};
+    use serde_json::json;
     use visible_browser_lab_test_support::{
         FixtureServer, McpClient, OpenTab, chrome_for_testing_executable, field_str,
     };
@@ -107,45 +107,57 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
-        let focus_state = client.call_tool(
-            "evaluate",
+        assert_frontmost(&original_frontmost, "background browser actions")?;
+
+        client.call_tool(
+            "click",
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
-                "source": "document.hasFocus() && document.visibilityState === 'visible'"
+                "target": { "css": "#clicker" },
+                "observe": "none"
             }),
             Duration::from_secs(20),
             false,
         )?;
-        if focus_state.get("value").and_then(Value::as_bool) != Some(false) {
-            bail!("background tab reported trusted-input focus: {focus_state}");
+        client.call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
+                "key": "Enter"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let background_actions = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "({ clicked: document.body.dataset.clicked, key: document.body.dataset.key })"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let background_value = background_actions
+            .get("value")
+            .context("background action verification omitted value")?;
+        if background_value
+            .get("clicked")
+            .and_then(|value| value.as_str())
+            != Some("yes")
+        {
+            bail!("background click did not update the fixture page: {background_actions}");
         }
-        assert_frontmost(&original_frontmost, "background browser actions")?;
-
-        for (tool, params) in [
-            (
-                "click",
-                json!({
-                    "agent_session_id": session_id,
-                    "tab_id": tab.tab_id,
-                    "target": { "css": "#clicker" },
-                    "observe": "none"
-                }),
-            ),
-            (
-                "press_key",
-                json!({
-                    "agent_session_id": session_id,
-                    "tab_id": tab.tab_id,
-                    "key": "Enter"
-                }),
-            ),
-        ] {
-            let error = client.call_tool(tool, params, Duration::from_secs(20), true)?;
-            if field_str(&error, "code")? != "focus_required" {
-                bail!("{tool} returned the wrong background-focus error: {error}");
+        match background_value.get("key").and_then(|value| value.as_str()) {
+            Some("Enter" | "Unidentified") => {}
+            _ => {
+                bail!("background press_key did not update the fixture page: {background_actions}");
             }
         }
+        assert_frontmost(&original_frontmost, "background click and press_key")?;
 
         client.call_tool(
             "focus_tab",

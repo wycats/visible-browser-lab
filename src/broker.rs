@@ -759,6 +759,21 @@ impl BrowserBackend {
         }
     }
 
+    async fn prepare_target_for_action(&self, target: &CdpTarget) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().activate_target(&target.id),
+            Self::External(client) => client.prepare_target_for_action(target).await,
+            Self::Managed(browser) => {
+                browser
+                    .client()
+                    .await?
+                    .prepare_target_for_action(target)
+                    .await
+            }
+        }
+    }
+
     async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
         match self {
             #[cfg(test)]
@@ -2779,9 +2794,7 @@ async fn broker_click(
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
-    if !state.browser.has_focus(&target).await? {
-        return Err(BrowserToolError::focus_required(&params.tab_id));
-    }
+    state.browser.prepare_target_for_action(&target).await?;
     let button = params.button.as_deref().unwrap_or("left");
     let count = params.count.unwrap_or(1);
     match resolve_element_target(
@@ -3281,9 +3294,7 @@ async fn broker_press_key(
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
-    if !state.browser.has_focus(&target).await? {
-        return Err(BrowserToolError::focus_required(&params.tab_id));
-    }
+    state.browser.prepare_target_for_action(&target).await?;
     state
         .browser
         .press_key(&target, &params.key, &params.modifiers)
@@ -3298,6 +3309,7 @@ async fn broker_press_key_v3(
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
+    state.browser.prepare_target_for_action(&target).await?;
     if let Some(element_target) = params.target.as_ref() {
         match resolve_element_target(
             state,
@@ -3323,9 +3335,6 @@ async fn broker_press_key_v3(
                 .await?;
             }
         }
-    }
-    if !state.browser.has_focus(&target).await? {
-        return Err(BrowserToolError::focus_required(&params.tab_id));
     }
     state
         .browser
@@ -3403,7 +3412,7 @@ async fn broker_interact(
             }
         }
         "hover" => {
-            require_document_focus(state, tab_id, &target).await?;
+            state.browser.prepare_target_for_action(&target).await?;
             let element =
                 resolve_domain_backend_element(state, &params, tab_id, &target, "target").await?;
             retry_element_action(timeout_ms, || {
@@ -3414,7 +3423,7 @@ async fn broker_interact(
             .await?;
         }
         "drag" => {
-            require_document_focus(state, tab_id, &target).await?;
+            state.browser.prepare_target_for_action(&target).await?;
             let source =
                 resolve_domain_backend_element(state, &params, tab_id, &target, "source").await?;
             let destination =
@@ -3494,7 +3503,7 @@ async fn broker_interact(
             }
         }
         "click_at" => {
-            require_document_focus(state, tab_id, &target).await?;
+            state.browser.prepare_target_for_action(&target).await?;
             let modifiers = optional_string_array_argument(&params.arguments, "modifiers")?;
             state
                 .browser
@@ -3531,18 +3540,6 @@ async fn broker_interact(
         "document_revision": action.document_revision,
         "observation": action.observation,
     }))
-}
-
-async fn require_document_focus(
-    state: &BrokerState,
-    tab_id: &TabId,
-    target: &CdpTarget,
-) -> Result<(), BrowserToolError> {
-    if state.browser.has_focus(target).await? {
-        Ok(())
-    } else {
-        Err(BrowserToolError::focus_required(tab_id))
-    }
 }
 
 async fn resolve_domain_backend_element(
@@ -5976,64 +5973,6 @@ mod tests {
         .await
         .unwrap();
 
-        let click_error = broker_click(
-            &state,
-            Ok(ClickParams {
-                agent_session_id: owner.agent_session_id.clone(),
-                tab_id: tab.tab_id.clone(),
-                target: ElementTarget::Reference(ElementReferenceTarget {
-                    reference: "e_2".to_string(),
-                }),
-                button: None,
-                count: None,
-                modifiers: Vec::new(),
-                timeout_ms: None,
-                observe: Some(ObservationMode::None),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            click_error.code,
-            crate::leases::BrowserToolErrorCode::FocusRequired
-        );
-
-        broker_type_text(
-            &state,
-            Ok(TypeTextParams {
-                agent_session_id: owner.agent_session_id.clone(),
-                tab_id: tab.tab_id.clone(),
-                text: "hello".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(fake.lock().unwrap().focused_target_id, None);
-        let press_error = broker_press_key(
-            &state,
-            Ok(PressKeyParams {
-                agent_session_id: owner.agent_session_id.clone(),
-                tab_id: tab.tab_id.clone(),
-                key: "Enter".to_string(),
-                modifiers: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            press_error.code,
-            crate::leases::BrowserToolErrorCode::FocusRequired
-        );
-
-        broker_focus_tab(
-            &state,
-            Ok(TabActionParams {
-                agent_session_id: owner.agent_session_id.clone(),
-                tab_id: tab.tab_id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
         let clicked = broker_click(
             &state,
             Ok(ClickParams {
@@ -6052,6 +5991,17 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(clicked.observation, Observation::None));
+
+        broker_type_text(
+            &state,
+            Ok(TypeTextParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                text: "hello".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
         broker_press_key(
             &state,
             Ok(PressKeyParams {

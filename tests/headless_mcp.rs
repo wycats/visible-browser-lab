@@ -11,9 +11,8 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use visible_browser_lab_test_support::{
-    BROWSER_MODE_ENV, EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser,
-    cleanup_open_tabs, close_target_via_cdp, field_str, run_live_smoke, stop_broker,
-    tabs_include_id,
+    EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser, cleanup_open_tabs,
+    close_target_via_cdp, field_str, run_live_smoke, stop_broker, tabs_include_id,
 };
 
 const PROPERTY_BROWSER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -640,85 +639,49 @@ fn explicit_focus_contract() -> Result<()> {
         false,
     )?;
 
-    let focus_state = harness.client_mut().call_tool(
-        "evaluate",
+    harness.client_mut().call_tool(
+        "click",
         json!({
             "agent_session_id": session_id,
             "tab_id": open_tab.tab_id,
-            "source": "document.hasFocus() && document.visibilityState === 'visible'"
+            "target": { "css": "#clicker" },
+            "observe": "none"
         }),
         Duration::from_secs(20),
         false,
     )?;
-    let browser_reports_focus = focus_state
+    harness.client_mut().call_tool(
+        "press_key",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "target": { "css": "#entry" },
+            "key": "Enter"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let action_result = harness.client_mut().call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": open_tab.tab_id,
+            "source": "({ clicked: document.body.dataset.clicked, key: document.body.dataset.key })"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let action_value = action_result
         .get("value")
-        .and_then(Value::as_bool)
-        .context("trusted-input focus probe did not return a boolean")?;
-    if env::var(BROWSER_MODE_ENV).as_deref() == Ok("visible") && browser_reports_focus {
-        bail!("visible Chrome reported trusted-input focus for the background test tab");
+        .context("background action result omitted value")?;
+    if action_value.get("clicked").and_then(Value::as_str) != Some("yes") {
+        bail!("background click did not update the fixture page: {action_result}");
     }
-
-    for (tool, params) in [
-        (
-            "click",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "target": { "css": "#clicker" },
-                "observe": "none"
-            }),
-        ),
-        (
-            "press_key",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "key": "Enter"
-            }),
-        ),
-    ] {
-        let result = harness.client_mut().call_tool(
-            tool,
-            params,
-            Duration::from_secs(20),
-            !browser_reports_focus,
-        )?;
-        if !browser_reports_focus {
-            assert_tool_error(&result, "focus_required")?;
+    match action_value.get("key").and_then(Value::as_str) {
+        Some("Enter" | "Unidentified") => {}
+        _ => {
+            bail!("background press_key did not update the fixture page: {action_result}");
         }
-    }
-
-    if !browser_reports_focus {
-        harness.client_mut().call_tool(
-            "focus_tab",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        harness.client_mut().call_tool(
-            "click",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "target": { "css": "#clicker" },
-                "observe": "none"
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        harness.client_mut().call_tool(
-            "press_key",
-            json!({
-                "agent_session_id": session_id,
-                "tab_id": open_tab.tab_id,
-                "key": "Enter"
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
     }
     harness.client_mut().call_tool(
         "close_tab",
