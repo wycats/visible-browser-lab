@@ -120,6 +120,7 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        assert_frontmost(&original_frontmost, "background click")?;
         client.call_tool(
             "press_key",
             json!({
@@ -131,6 +132,7 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        assert_frontmost(&original_frontmost, "background press_key")?;
         let background_actions = client.call_tool(
             "evaluate",
             json!({
@@ -157,8 +159,6 @@ mod macos {
                 bail!("background press_key did not update the fixture page: {background_actions}");
             }
         }
-        assert_frontmost(&original_frontmost, "background click and press_key")?;
-
         client.call_tool(
             "focus_tab",
             json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),

@@ -143,7 +143,7 @@ impl VisibleBrowserLab {
             "example": {"tool": preferred_tool, "arguments": {}},
             "result_schema": result_schema,
             "errors": [
-                {"code":"focus_required", "recovery":"Use focus_tab only when the user asks to bring Chrome forward for manual handoff."},
+                {"code":"focus_required", "recovery":"The requested handoff did not make the owned document focused; keep the same tab_id, verify Chrome is available, and retry focus_tab when the user is ready."},
                 {"code":"element_stale", "recovery":"Call snapshot and use a reference from the active document."}
             ]
         });
