@@ -20,9 +20,10 @@ actions while keeping the user's active application stable:
 ## Current Contract
 
 RFC 00004 currently defines `click` and `press_key` as focused-document
-operations. The broker checks `document.hasFocus()` and
-`document.visibilityState === "visible"` before dispatching native input. When
-the target does not have document focus, the broker returns `focus_required`.
+operations. The broker checks
+`document.hasFocus() && document.visibilityState === 'visible'` before
+dispatching native input. When the target does not have document focus, the
+broker returns `focus_required`.
 `focus_tab` activates the Chrome target and then invokes the platform activation
 adapter for managed Chrome.
 
@@ -35,7 +36,7 @@ Code points:
 - `src/managed_chrome.rs`: macOS `focus_tab` activation calls
   `NSRunningApplication::activateWithOptions`.
 - `src/cdp.rs`: `has_focus` evaluates
-  `document.hasFocus() && document.visibilityState === "visible"`.
+  `document.hasFocus() && document.visibilityState === 'visible'`.
 
 ## Local Evidence
 
@@ -55,7 +56,7 @@ contains the key behavior that led to the current contract:
 
 ### Refreshed Local Runs
 
-Commands run from `/Users/wycats/plugins/visible-browser-lab`:
+Commands run from the repository root:
 
 ```bash
 cargo test --test headless_mcp focus_contract -- --nocapture
