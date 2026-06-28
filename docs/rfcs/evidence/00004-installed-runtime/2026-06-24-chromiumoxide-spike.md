@@ -6,7 +6,9 @@ Date: 2026-06-24
 
 Use `chromiumoxide 0.9.1` as the candidate CDP transport and generated protocol layer for the installed runtime. Integrate its low-level connection, command, page-session, and event APIs. Keep browser launch, tab ownership, selector semantics, diagnostics retention, and MCP error contracts in Visible Browser Lab.
 
-The implementation decision for `click` and `press_key` remains explicit: visible Chrome does not deliver CDP mouse or key input to a tab while the operating-system foreground remains with another application. The facade can preserve focus by using DOM-mediated events, or preserve trusted input semantics by returning `focus_required` until the caller invokes `focus_tab`. RFC `00004` should name the selected behavior before those tools change.
+The spike correctly observed that a narrow raw-CDP sequence returned success without delivering mouse or key input to the page while another application was foregrounded. The later non-intrusive interaction recon under RFC `00005` showed that this observation did not establish an OS-foreground requirement. Playwright-over-CDP, Puppeteer, and ChromeDriver all delivered trusted page input in headed Chrome while preserving the user's active application. The missing piece is browser-side target activation, element focus, actionability, and hit-test preparation before CDP input dispatch.
+
+RFC `00004` records the focus handoff behavior shipped with the installed runtime. RFC `00005` defines the replacement interaction contract for normal page actions.
 
 ## Environment
 
@@ -33,8 +35,8 @@ The reproducible programs are:
 | Navigate | Passed | Typed page navigation worked without activating Chrome. |
 | Evaluate JavaScript | Passed | `Page::evaluate_expression` matched the facade's main-frame evaluation contract. |
 | Insert text | Passed | `Input.insertText` updated the focused element while Chrome remained behind another application. |
-| Mouse input in a background target | Not delivered | `Input.dispatchMouseEvent` returned successfully but did not trigger the element click. |
-| Keyboard input in a background target | Not delivered | `Input.dispatchKeyEvent` returned successfully but did not trigger the page key listener. |
+| Mouse input in a background target | Not delivered in the narrow raw-CDP sequence | `Input.dispatchMouseEvent` returned successfully but did not trigger the element click. Later recon showed browser-protocol preparation can deliver trusted click input without OS foreground activation. |
+| Keyboard input in a background target | Not delivered in the narrow raw-CDP sequence | `Input.dispatchKeyEvent` returned successfully but did not trigger the page key listener. Later recon showed browser-protocol preparation can deliver trusted key input without OS foreground activation. |
 | DOM click in a background target | Passed | `HTMLElement.click()` triggered the click handler without changing application focus. |
 | Console events | Passed | Typed `Runtime.consoleAPICalled` events arrived through a page event stream. |
 | Network events | Passed | Typed `Network.requestWillBeSent` events arrived through a page event stream. |
@@ -91,12 +93,11 @@ cargo check --manifest-path spikes/chromiumoxide-core/Cargo.toml --target x86_64
 6. Retain broker-owned selector, click, text, key, screenshot, and error semantics while sending typed commands through `Page::execute`.
 7. Validate the replacement with the existing deterministic, state-machine, headless, and visible browser suites before deleting the manual CDP transport.
 
-## Open Interaction Decision
+## Superseded Interaction Decision
 
-Choose one contract before changing `click` and `press_key`:
+The spike left two apparent contracts before changing `click` and `press_key`:
 
 - **DOM-mediated background actions:** preserve application focus; click and key events are untrusted DOM events and may differ from physical input.
 - **Explicit trusted input:** preserve CDP input semantics; return `focus_required` until the caller explicitly invokes `focus_tab`.
 
-The spike supports Chromiumoxide adoption under either interaction contract.
-
+RFC `00004` shipped the explicit trusted-input handoff. The RFC `00005` non-intrusive interaction recon supersedes that decision for normal page actions: use browser-protocol target activation, element focus, actionability, and CDP input while preserving the user's active application. Keep `focus_tab` for user handoff to the visible browser window.

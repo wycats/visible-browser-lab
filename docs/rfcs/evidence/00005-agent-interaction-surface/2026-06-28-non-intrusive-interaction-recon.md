@@ -89,6 +89,22 @@ The v0 RFC 0013 run supplied two concrete Browser Lab observations:
   selector. That should become a fixture for target resolution, center-point
   hit testing, overlay reporting, and post-action observation.
 
+A later active sandboxd run supplied the same signal on the current installed
+runtime:
+
+- `click` on `button[aria-label="Select model"]` failed until `focus_tab`; after
+  the handoff, the selector opened and `v0 Mini` was selected.
+- A first-run Design Systems modal appeared. Its close affordance was absent
+  from the accessible button scan, and `Escape` dismissed it.
+- `click` on `[data-testid="prompt-form-send-button"]` failed with the tab
+  lacking trusted focus. After `focus_tab`, the same click succeeded; the editor
+  cleared, the URL changed to `/chat/pNeEany1brr`, and `/chat/api/chat` posted.
+
+This product feedback matches the recon conclusion. The shipped focus-handoff
+path can complete the workflow, and normal Browser Lab actions should move to
+browser-protocol target preparation and input so those clicks preserve the
+user's active application.
+
 ## Ecosystem Comparison
 
 Primary references:

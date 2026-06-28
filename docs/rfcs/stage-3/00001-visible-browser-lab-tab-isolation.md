@@ -442,7 +442,7 @@ The visible-browser-lab skill uses the broker workflow:
 2. Reuse the returned `agent_session_id` for the whole workflow.
 3. Use only owned `tab_id`s for browser actions.
 4. Use `global_readonly` listing only for target identification or explicit user-directed tab transfer.
-5. Use `focus_tab` as the explicit transition before native click or key input when the broker returns `focus_required`.
+5. Use `focus_tab` as the explicit transition before native click or key input when the broker returns `focus_required` in the shipped focus-handoff path. RFC 00005 defines the successor interaction contract for normal page actions: browser-protocol target preparation and input that preserve the user's active application.
 6. Use the facade MCP server for this workflow.
 
 ## Failure Modes
