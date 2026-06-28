@@ -506,103 +506,83 @@ pub fn run_live_smoke(
         bail!("fill did not resolve the iframe element reference: {frame_value}");
     }
 
-    if allow_focus {
-        client.call_tool(
-            "click",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "target": { "ref": frame_button_ref },
-                "observe": "none",
-                "timeout_ms": 5000
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        let frame_clicked = client.call_tool(
-            "evaluate",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "source": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
-            bail!(
-                "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
-            );
-        }
-
-        client.call_tool(
-            "click",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "target": { "ref": button_ref },
-                "observe": "diff",
-                "timeout_ms": 5000
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        let clicked = client.call_tool(
-            "evaluate",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "source": "document.body.dataset.clicked"
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        if clicked.get("value").and_then(Value::as_str) != Some("yes") {
-            bail!("click did not update the fixture page: {clicked}");
-        }
-    } else {
-        let click_requires_focus = client.call_tool(
-            "click",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "target": { "ref": button_ref },
-                "observe": "none",
-                "timeout_ms": 5000
-            }),
-            Duration::from_secs(20),
-            true,
-        )?;
-        if field_str(&click_requires_focus, "code")? != "focus_required" {
-            bail!("background click returned the wrong error: {click_requires_focus}");
-        }
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": frame_button_ref },
+            "observe": "none",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let frame_clicked = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "source": "document.querySelector('iframe').contentDocument.body.dataset.clicked"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
+        bail!(
+            "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
+        );
     }
 
-    if allow_focus {
-        client.call_tool(
-            "evaluate",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "source": "document.querySelector('#clicker').remove()"
-            }),
-            Duration::from_secs(20),
-            false,
-        )?;
-        let removed = client.call_tool(
-            "click",
-            json!({
-                "agent_session_id": first_session,
-                "tab_id": transferable_tab.tab_id,
-                "target": { "ref": button_ref },
-                "observe": "none"
-            }),
-            Duration::from_secs(20),
-            true,
-        )?;
-        if field_str(&removed, "code")? != "element_stale" {
-            bail!("removed DOM node did not invalidate its element reference: {removed}");
-        }
+    client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": button_ref },
+            "observe": "diff",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let clicked = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "source": "document.body.dataset.clicked"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    if clicked.get("value").and_then(Value::as_str) != Some("yes") {
+        bail!("click did not update the fixture page: {clicked}");
+    }
+
+    client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "source": "document.querySelector('#clicker').remove()"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let removed = client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "ref": button_ref },
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        true,
+    )?;
+    if field_str(&removed, "code")? != "element_stale" {
+        bail!("removed DOM node did not invalidate its element reference: {removed}");
     }
 
     client.call_tool(
@@ -628,7 +608,7 @@ pub fn run_live_smoke(
         Duration::from_secs(20),
         false,
     )?;
-    let press_key_result = client.call_tool(
+    client.call_tool(
         "press_key",
         json!({
             "agent_session_id": first_session,
@@ -636,11 +616,8 @@ pub fn run_live_smoke(
             "key": "Enter"
         }),
         Duration::from_secs(20),
-        !allow_focus,
+        false,
     )?;
-    if !allow_focus && field_str(&press_key_result, "code")? != "focus_required" {
-        bail!("background press_key returned the wrong error: {press_key_result}");
-    }
     let typed = client.call_tool(
         "evaluate",
         json!({
@@ -659,11 +636,7 @@ pub fn run_live_smoke(
         .get("value")
         .and_then(|value| value.get("key"))
         .and_then(Value::as_str);
-    let key_matches = if allow_focus {
-        matches!(pressed_key, Some("Enter" | "Unidentified"))
-    } else {
-        pressed_key.is_none()
-    };
+    let key_matches = matches!(pressed_key, Some("Enter" | "Unidentified"));
     if typed_value != Some("typed") || !key_matches {
         bail!("type_text or press_key did not update the fixture page: {typed}");
     }

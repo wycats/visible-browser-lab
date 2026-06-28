@@ -219,6 +219,13 @@ impl CdpClient {
         Ok(())
     }
 
+    pub async fn prepare_target_for_action(
+        &self,
+        target: &CdpTarget,
+    ) -> Result<(), BrowserToolError> {
+        self.activate_target(&target.id).await
+    }
+
     pub async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
         let connection = self.runtime.connection().await?;
         self.runtime

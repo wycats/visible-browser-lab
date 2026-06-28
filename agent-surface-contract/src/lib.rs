@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::o200k_base_singleton;
 
-pub const SERVER_INSTRUCTIONS: &str = "Start each browser task with start_session and retain its agent_session_id. Use only tab_id values owned by that session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret; it preserves application focus and does not require focus_tab. Use press_key only for named keys or shortcuts after focus_tab. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. click, press_key, and native pointer operations return focus_required until focus_tab makes the owned document visible and focused. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
+pub const SERVER_INSTRUCTIONS: &str = "Start each browser task with start_session and retain its agent_session_id. Use only tab_id values owned by that session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key for named keys or shortcuts after the relevant element or document has been selected by snapshot, click, fill, or type_text. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, key, and pointer actions prepare the owned target inside Chrome and preserve the user's active application. Use focus_tab only when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
 
 pub const DOMAIN_OPERATIONS: &[(&str, &[&str])] = &[
     (
@@ -145,7 +145,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
         tool(
             "focus_tab",
             "Focus Tab",
-            "Bring an owned tab and its browser window to the foreground for trusted pointer or keyboard input.",
+            "Bring an owned tab and its browser window to the foreground for explicit user handoff or manual inspection.",
             page_scope_schema(),
             tab_result(),
             false,
@@ -1758,10 +1758,10 @@ fn baseline_operation_description(domain: &str, operation: &str, domain_summary:
             "Set a referenced checkbox or radio control to the requested checked state and report the resulting page observation."
         }
         ("interact", "hover") => {
-            "Move the native pointer over a referenced element after actionability and focused-document checks."
+            "Move the browser pointer over a referenced element after target preparation and actionability checks."
         }
         ("interact", "drag") => {
-            "Drag one referenced element to another using native pointer input and report the resulting page observation."
+            "Drag one referenced element to another using browser pointer input and report the resulting page observation."
         }
         ("interact", "drop") => {
             "Drop workspace files or string data on a referenced target and report the resulting page observation."
@@ -1776,7 +1776,7 @@ fn baseline_operation_description(domain: &str, operation: &str, domain_summary:
             "Scroll the owned page or a referenced element by the requested horizontal and vertical deltas."
         }
         ("interact", "click_at") => {
-            "Dispatch a native pointer click at explicit page coordinates after focused-document checks."
+            "Dispatch a browser pointer click at explicit page coordinates after target preparation."
         }
         ("console", "list") => {
             "List bounded lease-scoped console messages using sequence, severity, and limit filters."

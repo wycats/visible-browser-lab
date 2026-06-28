@@ -143,7 +143,7 @@ impl VisibleBrowserLab {
             "example": {"tool": preferred_tool, "arguments": {}},
             "result_schema": result_schema,
             "errors": [
-                {"code":"focus_required", "recovery":"Call focus_tab for the owned tab and retry native input."},
+                {"code":"focus_required", "recovery":"Use focus_tab only when the user asks to bring Chrome forward for manual handoff."},
                 {"code":"element_stale", "recovery":"Call snapshot and use a reference from the active document."}
             ]
         });
@@ -252,7 +252,7 @@ fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, Str
         ),
         "interaction" => (
             vec!["click", "fill", "fill_form", "type_text", "press_key"],
-            "Use snapshot references for interaction. Focus the tab only when native pointer or keyboard input reports focus_required.",
+            "Use snapshot references for interaction. Routine click, key, and pointer actions prepare the owned target inside Chrome while preserving the user's active application.",
         ),
         "navigation" => (
             vec!["navigate", "wait_for"],
