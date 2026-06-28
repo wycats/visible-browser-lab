@@ -39,12 +39,12 @@ capability flag. Its generated reference contains 23 default operations.
 | `browser_file_upload` | `interact(operation: "upload_files")` | Domain | Resolves workspace-relative paths and an explicit file-input target. |
 | `browser_fill_form` | `fill_form` | Explicit | Applies typed field operations sequentially and reports partial completion. |
 | `browser_handle_dialog` | `interact(operation: "handle_dialog")` | Domain | Accepts or dismisses the owned tab's pending JavaScript dialog. |
-| `browser_hover` | `interact(operation: "hover")` | Domain | Requires the owned tab to be the focused visible document. |
+| `browser_hover` | `interact(operation: "hover")` | Domain | Uses browser-protocol target preparation, actionability, and pointer input. |
 | `browser_navigate` | `navigate(action: "url")` | Explicit | Navigates the owned tab without selecting a global page. |
 | `browser_navigate_back` | `navigate(action: "back")` | Explicit | Uses the owned tab's session history. |
 | `browser_network_request` | `network(operation: "get")` | Domain | Returns bounded request and response detail; large bodies become artifacts. |
 | `browser_network_requests` | `network(operation: "list")` | Domain | Supports URL, resource type, status, and sequence filters. |
-| `browser_press_key` | `press_key` | Explicit | Dispatches native keyboard input after the focused-document check. |
+| `browser_press_key` | `press_key` | Explicit | Dispatches browser-protocol keyboard input after target and element preparation. |
 | `browser_resize` | `emulation(operation: "set_viewport")` | Domain | Sets the owned target's viewport and device presentation. |
 | `browser_run_code_unsafe` | named page tools plus `evaluate` | Semantic | Page JavaScript remains available; server-process JavaScript execution is not part of the browser contract. |
 | `browser_select_option` | `interact(operation: "select_options")` | Domain | Selects one or more values on one resolved control. |
@@ -68,7 +68,7 @@ and Network categories are enabled by default.
 | `fill` | `fill` | Explicit | Replaces the value of one editable control. |
 | `fill_form` | `fill_form` | Explicit | Supports text, select, and checked field operations. |
 | `handle_dialog` | `interact(operation: "handle_dialog")` | Domain | Handles the dialog attached to the owned target. |
-| `hover` | `interact(operation: "hover")` | Domain | Uses native pointer input after focus validation. |
+| `hover` | `interact(operation: "hover")` | Domain | Uses browser-protocol pointer input after target preparation and actionability checks. |
 | `press_key` | `press_key` | Explicit | Supports printable keys, named browser keys, and modifiers. |
 | `type_text` | `type_text` | Explicit | Inserts text into a resolved editable target. |
 | `upload_file` | `interact(operation: "upload_files")` | Domain | Uses workspace-bounded paths and a resolved file input. |
@@ -116,9 +116,9 @@ unconfigured compatibility floor.
 
 The `click_at` operation requires Chrome DevTools MCP's experimental vision
 flag. Visible Browser Lab exposes the same operation under `interact` because
-coordinate input is useful for canvas and other non-semantic surfaces. It
-follows the focused-document contract and is not the documented path for DOM
-elements.
+coordinate input is useful for canvas and other non-semantic surfaces. It uses
+the browser-protocol pointer path with explicit hit-test evidence and remains
+separate from the documented DOM-element path.
 
 Chrome DevTools MCP's extension, experimental third-party, WebMCP, tab-ID
 interop, and Playwright's opt-in config, network interception, storage,

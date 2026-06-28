@@ -39,7 +39,7 @@ Every page-scoped request carries `agent_session_id` and `tab_id`. The broker pe
 4. The lease is active.
 5. The Chrome target still exists.
 6. Any element reference belongs to the same active lease and document revision.
-7. The requested operation's actionability and focus conditions hold.
+7. The requested operation's actionability, target-preparation, and artifact-boundary conditions hold.
 
 Chrome target IDs, frame IDs, backend node IDs, snapshot IDs, diagnostic IDs, and artifact IDs do not authorize Chrome actions. The broker resolves them only after validating the session and tab lease.
 
@@ -111,19 +111,19 @@ The catalog uses these agent-facing descriptions and MCP annotations:
 | --- | --- | --- | --- | --- | --- |
 | `start_session` | Start one browser task and optionally create its first owned tab. Use this before every other browser tool. | false | false | false | true |
 | `list_tabs` | List this session's tab leases, or inspect the shared read-only target inventory. | true | false | true | true |
-| `new_tab` | Create a background tab owned by this session. Request focus only for immediate native input. | false | false | false | true |
+| `new_tab` | Create a background tab owned by this session. Request focus only for user handoff to the visible browser. | false | false | false | true |
 | `claim_tab` | Claim an unowned target, or perform a user-instructed takeover that returns a new tab lease. | false | true | false | true |
 | `release_tab` | End ownership while leaving the Chrome target open and claimable. | false | true | true | true |
-| `focus_tab` | Bring an owned tab to the foreground before trusted pointer or keyboard input. | false | false | true | true |
+| `focus_tab` | Bring an owned tab to the foreground for user handoff or manual inspection. | false | false | true | true |
 | `close_tab` | Close an owned Chrome target and its lease. | false | true | true | true |
 | `snapshot` | Inspect user-perceivable page structure and obtain element references for later actions. | true | false | false | true |
 | `navigate` | Change the owned tab's URL or session history and observe the resulting document. | false | false | false | true |
 | `wait_for` | Wait for page text, element state, URL, load state, expression, or a bounded delay. | true | false | true | true |
-| `click` | Activate one referenced or explicitly selected element after focus and actionability checks. | false | true | false | true |
+| `click` | Activate one referenced or explicitly selected element after browser-protocol target preparation and actionability checks. | false | true | false | true |
 | `fill` | Replace the value of one editable control without activating Chrome. | false | true | true | true |
 | `fill_form` | Apply two or more typed field updates and report partial completion on failure. | false | true | true | true |
 | `type_text` | Insert text at an editable target's current selection without activating Chrome. | false | true | false | true |
-| `press_key` | Dispatch one native key sequence after the owned document has focus. | false | true | false | true |
+| `press_key` | Dispatch one browser-protocol key sequence after preparing the owned target and focused element. | false | true | false | true |
 | `screenshot` | Capture visual page state as MCP image content and an owned artifact. | false | false | false | true |
 | `evaluate` | Read or modify page state with JavaScript when the semantic tools do not expose it. | false | true | false | true |
 | `interact` | Perform a specialized user interaction such as hover, drag, upload, dialog handling, scrolling, or coordinate input. | false | true | false | true |
@@ -353,7 +353,9 @@ Common conditions:
 
 Pointer actions additionally hit-test the action point and reject an obscured target with `element_not_actionable`. Operations that imply one target use strict resolution.
 
-The focus contract from RFC 00004 remains authoritative. `click`, `press_key`, hover, drag, drop, scrolling through native input, and coordinate input require the owned tab to be the visible focused document. Background tabs return `focus_required` before native input dispatch. Snapshot, navigation, waits, fill, form fill, text insertion, screenshots, evaluation, diagnostics, emulation, and analysis operate without activating Chrome.
+Element actions preserve the user's active application by default. For pointer and keyboard operations, the broker prepares the owned target inside Chrome, focuses the resolved element inside the document when the operation needs editable or keyboard state, and dispatches browser input through CDP after actionability succeeds. `focus_tab` remains the explicit user handoff operation for bringing managed Chrome forward; it is not the normal recovery path for routine page actions.
+
+The RFC `00004` installed runtime shipped with a focused-document recovery path for `click` and `press_key`. The non-intrusive interaction recon under this RFC supersedes that design interpretation: OS foreground application focus is not required for normal headed-browser page actions when the browser automation path performs target activation, element focus, actionability, and CDP input inside Chrome.
 
 ## Post-Action Observation
 
@@ -480,7 +482,7 @@ press_key({
 }) -> PageActionResult
 ```
 
-`press_key` dispatches native keyboard events and follows the explicit focus transition.
+`press_key` dispatches browser-protocol keyboard input after preparing the owned target and focused element.
 
 ## Screenshot
 
@@ -560,7 +562,7 @@ type FormResult = {
 - `scroll`
 - `click_at`
 
-Element operations use `ElementTarget`. Upload paths resolve inside the active workspace supplied by the MCP host. Dialog handling accepts `accept` or `dismiss` and optional prompt text. Coordinate input follows the focused-document contract.
+Element operations use `ElementTarget`. Upload paths resolve inside the active workspace supplied by the MCP host. Dialog handling accepts `accept` or `dismiss` and optional prompt text. Coordinate input follows the same browser-protocol target preparation, hit-test, and actionability contract as referenced pointer actions.
 
 ## Console
 
@@ -867,10 +869,12 @@ The MCP server publishes these instructions with the catalog:
 > Use `fill` for one field, `fill_form` for a form, `wait_for` for asynchronous
 > state, and `screenshot` for visual appearance. Use `console` and `network`
 > for runtime diagnosis. Use `help` to select an operation in a specialized
-> domain. `click`, `press_key`, and native pointer operations return
-> `focus_required` until `focus_tab` makes the owned document visible and
-> focused. CSS and `evaluate` are explicit escape hatches for page state the
-> semantic tools do not expose.
+> domain. `click`, `press_key`, and pointer operations prepare the owned target
+> inside Chrome, run actionability checks, and preserve the user's active
+> application during normal browser work. Use `focus_tab` only when the user
+> asks to bring managed Chrome forward for handoff or manual inspection. CSS and
+> `evaluate` are explicit escape hatches for page state the semantic tools do
+> not expose.
 
 These instructions establish the decision path without duplicating individual
 input schemas.
@@ -883,7 +887,7 @@ The installed skill teaches one ordered workflow:
 2. Reuse an owned tab from `list_tabs`, create one with `new_tab`, or claim an unowned target after inspecting `global_readonly` inventory.
 3. Call `snapshot` before interacting with an unfamiliar document or after `element_stale`.
 4. Use the shortest named semantic action that expresses the task: `click`, `fill`, `fill_form`, `type_text`, `press_key`, or `wait_for`.
-5. Call `focus_tab` only when a trusted pointer or keyboard operation returns `focus_required` or the user asks to bring Chrome forward.
+5. Call `focus_tab` only when the user asks to bring Chrome forward for handoff or manual inspection.
 6. Read the action's accessibility diff; request a full snapshot when the new document structure matters.
 7. Use `console` and `network` when page behavior differs from the requested result.
 8. Use `performance`, `audit`, `memory`, `screencast`, or `artifacts` for the corresponding investigation output.
