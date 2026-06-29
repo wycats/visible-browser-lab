@@ -461,8 +461,22 @@ fn chrome_arguments(config: &RuntimeConfig, launch_mode: BrowserLaunchMode) -> V
         }
     }
 
-    args.push(STARTUP_PAGE.into());
+    if suppress_startup_page(launch_mode) {
+        args.push("--no-startup-window".into());
+    } else {
+        args.push(STARTUP_PAGE.into());
+    }
     args
+}
+
+#[cfg(target_os = "macos")]
+fn suppress_startup_page(launch_mode: BrowserLaunchMode) -> bool {
+    launch_mode == BrowserLaunchMode::Visible
+}
+
+#[cfg(not(target_os = "macos"))]
+fn suppress_startup_page(_launch_mode: BrowserLaunchMode) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -739,6 +753,34 @@ mod tests {
             )
         );
         assert!(!args.contains(&"--headless=new".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_visible_launch_suppresses_startup_window() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments(&config, BrowserLaunchMode::Visible);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--no-startup-window".into()));
+        assert!(!args.contains(&STARTUP_PAGE.into()));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_visible_launch_keeps_startup_page() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments(&config, BrowserLaunchMode::Visible);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&STARTUP_PAGE.into()));
+        assert!(!args.contains(&"--no-startup-window".into()));
     }
 
     #[tokio::test]

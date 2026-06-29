@@ -55,12 +55,11 @@ The launcher starts Chrome with:
 - the managed `chrome-profile/` directory;
 - `--remote-debugging-port=0`;
 - `--no-first-run` and `--no-default-browser-check`;
-- a startup page owned by Visible Browser Lab;
 - stdout and stderr captured in the runtime log directory.
 
 Platform launch adapters preserve the common runtime contract:
 
-- macOS asks LaunchServices to open a new Chrome instance without activating it and passes the managed Chrome arguments;
+- macOS asks LaunchServices to open a new Chrome instance without activating it, suppresses the startup window, and lets `start_session` or `new_tab` create the first visible tab through `Target.createTarget`;
 - Windows starts the discovered executable with a non-activating window startup mode;
 - Linux starts the discovered executable directly and relies on desktop focus-stealing prevention while creating Chrome targets in the background.
 
@@ -126,7 +125,7 @@ The release dry run downloads a pinned standalone Codex package from the `openai
 1. The broker-owned Chromiumoxide runtime maintains one driven browser connection and handler for each CDP endpoint.
 2. Cross-platform runtime directory resolution provides broker IPC, logs, and the persistent managed Chrome profile.
 3. Browser discovery and platform launch adapters start Chrome in the background, discover `DevToolsActivePort`, retain startup diagnostics, and reuse a healthy managed instance.
-4. Background target creation and background-safe actions preserve application focus. The shipped pointer and keyboard path uses explicit focus operations; RFC 00005 defines the replacement browser-protocol action path that preserves the active application for normal page actions.
+4. Background target creation and normal page actions preserve application focus. The browser-protocol action path defined by RFC 00005 prepares targets inside Chrome, applies actionability checks, and dispatches CDP input without foregrounding managed Chrome.
 5. Generated host MCP configuration resolves the binary from the installed package root. Release metadata and binary version output use the release tag's semantic version.
 6. The isolated installed-package harness validates host installation, MCP discovery, managed browser lifecycle, owned-tab operations, optional model invocation, and cleanup.
 7. The packaged skill teaches the managed default, external endpoint overrides, session-scoped tab ownership, background-safe actions, and explicit focus transitions.
@@ -137,7 +136,7 @@ The managed profile consumes persistent disk space and keeps browser state acros
 
 Desktop focus behavior crosses Chrome, the operating system, and the window manager. The platform adapters express the strongest supported no-activation request, and real-browser tests verify observable focus behavior on supported development and CI platforms.
 
-The shipped pointer and keyboard policy uses an explicit focus operation for background tabs. The RFC 00005 interaction contract replaces that recovery path for normal browser workflows with browser-side target activation, element focus, actionability checks, and CDP input that preserve the user's active application.
+Normal browser workflows use browser-side target activation, element focus, actionability checks, and CDP input that preserve the user's active application. `focus_tab` remains available when the user asks to bring managed Chrome forward for manual inspection or handoff.
 
 Browser discovery must track common installation paths. The explicit Chrome path override provides a stable route for custom installations.
 
