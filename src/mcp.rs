@@ -252,7 +252,7 @@ fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, Str
         ),
         "interaction" => (
             vec!["click", "fill", "fill_form", "type_text", "press_key"],
-            "Use snapshot references for interaction. Routine click, key, and pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation is reserved for focus_tab and focus:true.",
+            "Use snapshot references for interaction. Routine click, key, and pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation is reserved for focus_tab and focus: true.",
         ),
         "navigation" => (
             vec!["navigate", "wait_for"],
