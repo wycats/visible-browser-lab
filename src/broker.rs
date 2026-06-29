@@ -3349,6 +3349,8 @@ async fn broker_press_key_v3(
                 .await?;
             }
         }
+    } else {
+        ensure_focused_document_for_raw_input(state, &target, &params.tab_id).await?;
     }
     state
         .browser
@@ -3518,6 +3520,7 @@ async fn broker_interact(
         }
         "click_at" => {
             state.browser.prepare_target_for_action(&target).await?;
+            ensure_focused_document_for_raw_input(state, &target, tab_id).await?;
             let modifiers = optional_string_array_argument(&params.arguments, "modifiers")?;
             state
                 .browser
@@ -3554,6 +3557,18 @@ async fn broker_interact(
         "document_revision": action.document_revision,
         "observation": action.observation,
     }))
+}
+
+async fn ensure_focused_document_for_raw_input(
+    state: &BrokerState,
+    target: &CdpTarget,
+    tab_id: &TabId,
+) -> Result<(), BrowserToolError> {
+    if state.browser.has_focus(target).await? {
+        return Ok(());
+    }
+
+    Err(BrowserToolError::focus_required(tab_id))
 }
 
 async fn resolve_domain_backend_element(
@@ -6028,6 +6043,46 @@ mod tests {
         .await
         .unwrap();
 
+        let raw_key_error = broker_press_key_v3(
+            &state,
+            Ok(V3PressKeyParams {
+                agent_session_id: owner.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                target: None,
+                key: "Enter".to_string(),
+                modifiers: Vec::new(),
+                timeout_ms: None,
+                observe: Some(ObservationMode::None),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            raw_key_error.code,
+            crate::leases::BrowserToolErrorCode::FocusRequired
+        );
+
+        let raw_click_error = broker_interact(
+            &state,
+            Ok(serde_json::from_value(json!({
+                "agent_session_id": owner.agent_session_id,
+                "tab_id": tab.tab_id.clone(),
+                "operation": "click_at",
+                "x": 2,
+                "y": 2,
+                "button": "left",
+                "count": 1,
+                "observe": "none"
+            }))
+            .unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            raw_click_error.code,
+            crate::leases::BrowserToolErrorCode::FocusRequired
+        );
+
         {
             let fake = fake.lock().unwrap();
             assert_eq!(fake.clicked_backend_nodes, vec![2]);
@@ -6039,7 +6094,12 @@ mod tests {
             assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
             assert_eq!(
                 fake.prepared_targets,
-                vec!["target-a".to_string(), "target-a".to_string()]
+                vec![
+                    "target-a".to_string(),
+                    "target-a".to_string(),
+                    "target-a".to_string(),
+                    "target-a".to_string()
+                ]
             );
             assert_eq!(
                 fake.focused_target_id, None,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::o200k_base_singleton;
 
-pub const SERVER_INSTRUCTIONS: &str = "Start each browser task with start_session and retain its agent_session_id. Use only tab_id values owned by that session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key for named keys or shortcuts after the relevant element or document has been selected by snapshot, click, fill, or type_text. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, key, and pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
+pub const SERVER_INSTRUCTIONS: &str = "Start each browser task with start_session and retain its agent_session_id. Use only tab_id values owned by that session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
 
 pub const DOMAIN_OPERATIONS: &[(&str, &[&str])] = &[
     (
@@ -235,7 +235,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
         tool(
             "press_key",
             "Press Key",
-            "Dispatch one native key to the focused owned document after an explicit focus transition.",
+            "Dispatch one key to a referenced element, or to the focused owned document after explicit handoff.",
             press_key_schema(),
             action_result(),
             false,
@@ -1776,7 +1776,7 @@ fn baseline_operation_description(domain: &str, operation: &str, domain_summary:
             "Scroll the owned page or a referenced element by the requested horizontal and vertical deltas."
         }
         ("interact", "click_at") => {
-            "Dispatch a browser pointer click at explicit page coordinates after target preparation."
+            "Dispatch a browser pointer click at explicit page coordinates after explicit handoff focuses the owned document."
         }
         ("console", "list") => {
             "List bounded lease-scoped console messages using sequence, severity, and limit filters."

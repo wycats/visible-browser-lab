@@ -123,7 +123,7 @@ The catalog uses these agent-facing descriptions and MCP annotations:
 | `fill` | Replace the value of one editable control without activating Chrome. | false | true | true | true |
 | `fill_form` | Apply two or more typed field updates and report partial completion on failure. | false | true | true | true |
 | `type_text` | Insert text at an editable target's current selection without activating Chrome. | false | true | false | true |
-| `press_key` | Dispatch one browser-protocol key sequence after preparing the owned target and focused element. | false | true | false | true |
+| `press_key` | Dispatch one browser-protocol key sequence to a resolved element, or to the focused owned document after explicit handoff. | false | true | false | true |
 | `screenshot` | Capture visual page state as MCP image content and an owned artifact. | false | false | false | true |
 | `evaluate` | Read or modify page state with JavaScript when the semantic tools do not expose it. | false | true | false | true |
 | `interact` | Perform a specialized user interaction such as hover, drag, upload, dialog handling, scrolling, or coordinate input. | false | true | false | true |
@@ -353,7 +353,9 @@ Common conditions:
 
 Pointer actions additionally hit-test the action point and reject an obscured target with `element_not_actionable`. Operations that imply one target use strict resolution.
 
-Element actions preserve the user's active application by default. For pointer and keyboard operations, the broker attaches to the owned target, prepares the resolved element inside the document when the operation needs editable or keyboard state, and dispatches browser input through CDP after actionability succeeds. Target activation, including CDP `Target.activateTarget`, is reserved for `focus_tab` and `focus: true` tab creation when the user asks to bring managed Chrome forward for manual inspection or handoff.
+Element actions preserve the user's active application by default. For pointer and keyboard operations with an element target, the broker attaches to the owned target, prepares the resolved element inside the document when the operation needs editable or keyboard state, and dispatches browser input through CDP after actionability succeeds. Target activation, including CDP `Target.activateTarget`, is reserved for `focus_tab` and `focus: true` tab creation when the user asks to bring managed Chrome forward for manual inspection or handoff.
+
+Targetless raw input is a focused-document operation. `press_key` without `target` and `interact` `click_at` return `focus_required` until `focus_tab` has focused the owned document. They do not report success for background raw CDP input delivery.
 
 The RFC `00004` installed runtime shipped with a focused-document recovery path for `click` and `press_key`. The non-intrusive interaction recon under this RFC supersedes that design interpretation: OS foreground application focus is not required for normal headed-browser page actions when the browser automation path uses target-session attachment, element preparation, actionability, and CDP input inside Chrome.
 
@@ -482,7 +484,7 @@ press_key({
 }) -> PageActionResult
 ```
 
-`press_key` dispatches browser-protocol keyboard input after preparing the owned target and focused element.
+`press_key` with `target` dispatches browser-protocol keyboard input after preparing the resolved element. Without `target`, it dispatches to the focused owned document and returns `focus_required` until the caller has used `focus_tab`.
 
 ## Screenshot
 
@@ -562,7 +564,7 @@ type FormResult = {
 - `scroll`
 - `click_at`
 
-Element operations use `ElementTarget`. Upload paths resolve inside the active workspace supplied by the MCP host. Dialog handling accepts `accept` or `dismiss` and optional prompt text. Coordinate input follows the same target-session attachment, hit-test, and actionability contract as referenced pointer actions.
+Element operations use `ElementTarget`. Upload paths resolve inside the active workspace supplied by the MCP host. Dialog handling accepts `accept` or `dismiss` and optional prompt text. Referenced pointer actions use target-session attachment, hit-test, and actionability. Coordinate `click_at` is targetless raw input and returns `focus_required` until `focus_tab` has focused the owned document.
 
 ## Console
 
@@ -869,13 +871,14 @@ The MCP server publishes these instructions with the catalog:
 > Use `fill` for one field, `fill_form` for a form, `wait_for` for asynchronous
 > state, and `screenshot` for visual appearance. Use `console` and `network`
 > for runtime diagnosis. Use `help` to select an operation in a specialized
-> domain. `click`, `press_key`, and pointer operations attach to the owned
-> target, prepare the resolved element, run actionability checks, and preserve
-> the user's active application during normal browser work. Target activation,
-> including CDP `Target.activateTarget`, is reserved for `focus_tab` and
-> `focus: true` tab creation when the user asks to bring managed Chrome forward
-> for handoff or manual inspection. CSS and `evaluate` are explicit escape
-> hatches for page state the semantic tools do not expose.
+> domain. `click`, targeted `press_key`, and referenced pointer operations
+> attach to the owned target, prepare the resolved element, run actionability
+> checks, and preserve the user's active application during normal browser work.
+> Targetless `press_key` and `interact` `click_at` require `focus_tab` first.
+> Target activation, including CDP `Target.activateTarget`, is reserved for
+> `focus_tab` and `focus: true` tab creation when the user asks to bring managed
+> Chrome forward for handoff or manual inspection. CSS and `evaluate` are
+> explicit escape hatches for page state the semantic tools do not expose.
 
 These instructions establish the decision path without duplicating individual
 input schemas.
