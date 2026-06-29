@@ -327,6 +327,7 @@ struct FakeBrowser {
     targets: Vec<CdpTarget>,
     next_target: u64,
     focused_target_id: Option<String>,
+    prepared_targets: Vec<String>,
     closed_targets: Vec<String>,
     clicked_selectors: Vec<String>,
     clicked_backend_nodes: Vec<i64>,
@@ -342,6 +343,7 @@ impl FakeBrowser {
             targets,
             next_target: 1,
             focused_target_id: None,
+            prepared_targets: Vec::new(),
             closed_targets: Vec::new(),
             clicked_selectors: Vec::new(),
             clicked_backend_nodes: Vec::new(),
@@ -386,6 +388,15 @@ impl FakeBrowser {
         }
 
         Ok(self.focused_target_id.as_deref() == Some(target_id))
+    }
+
+    fn prepare_target_for_action(&mut self, target_id: &str) -> Result<(), BrowserToolError> {
+        if self.targets.iter().any(|target| target.id == target_id) {
+            self.prepared_targets.push(target_id.to_string());
+            return Ok(());
+        }
+
+        Err(BrowserToolError::target_missing_for_target(target_id))
     }
 
     fn close_target(&mut self, target_id: &str) -> Result<(), BrowserToolError> {
@@ -762,7 +773,10 @@ impl BrowserBackend {
     async fn prepare_target_for_action(&self, target: &CdpTarget) -> Result<(), BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(browser) => browser.lock().unwrap().activate_target(&target.id),
+            Self::Fake(browser) => browser
+                .lock()
+                .unwrap()
+                .prepare_target_for_action(&target.id),
             Self::External(client) => client.prepare_target_for_action(target).await,
             Self::Managed(browser) => {
                 browser
@@ -6023,6 +6037,14 @@ mod tests {
             );
             assert_eq!(fake.typed_text(), &["hello".to_string()]);
             assert_eq!(fake.pressed_keys(), &["Enter".to_string()]);
+            assert_eq!(
+                fake.prepared_targets,
+                vec!["target-a".to_string(), "target-a".to_string()]
+            );
+            assert_eq!(
+                fake.focused_target_id, None,
+                "routine click and key actions must not activate the target"
+            );
         }
 
         let foreign_error = broker_evaluate(

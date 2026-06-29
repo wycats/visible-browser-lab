@@ -33,7 +33,7 @@ Inspect an unfamiliar page with `snapshot`. Its compact accessibility tree assig
 
 `fill` replaces one ordinary editable control. Use `fill_form` for two or more controls, including combined text, select, and checkbox updates. Use `type_text` for contenteditable controls and insertion at an established caret. Use `press_key` for named keys or shortcuts after the relevant element or document has been selected by snapshot, click, fill, or type_text.
 
-Mutating semantic actions return an accessibility diff by default; request `observe: "snapshot"` for the complete resulting tree or `observe: "none"` when no page observation is needed. Navigation, waits, snapshots, screenshots, evaluation, form updates, text insertion, click, key, pointer, diagnostics, and analysis preserve the user's active application. `focus_tab` is the explicit operation for bringing managed Chrome forward when the user asks for manual inspection or handoff.
+Mutating semantic actions return an accessibility diff by default; request `observe: "snapshot"` for the complete resulting tree or `observe: "none"` when no page observation is needed. Navigation, waits, snapshots, screenshots, evaluation, form updates, text insertion, click, key, pointer, diagnostics, and analysis preserve the user's active application. Routine actions attach to the owned target and prepare the resolved element without target activation. `focus_tab` and `focus: true` are the explicit operations for bringing managed Chrome forward when the user asks for manual inspection or handoff.
 
 Use `wait_for` for asynchronous text, element, URL, load, or expression state. Use `screenshot` for visual appearance. Use `console` and `network` for runtime diagnosis. Use `help` to select an operation in `interact`, `emulation`, `performance`, `audit`, `memory`, `screencast`, or `artifacts`. Use `evaluate` or a strict CSS target only when the accessibility snapshot and named semantic tools cannot represent the required state. Do not use them to verify a semantic action.
 
@@ -56,5 +56,5 @@ When one appears:
 - Use `target_id`, title, URL, and owner display information for diagnosis and handoff, not as substitutes for an owned `tab_id`.
 - Use `help` to inspect a domain operation before constructing specialized arguments.
 - Use key-by-key entry for rich text editors when normal typing is unreliable.
-- Keep the visible browser as the source of truth for what the user can see. Routine page actions preserve the user's active application; `focus_tab` is the explicit transition that brings managed Chrome forward.
+- Keep the visible browser as the source of truth for what the user can see. Routine page actions preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for `focus_tab` and `focus: true`.
 - For v0 local perf work, keep the target URL at `http://localhost:3002/` unless the user chooses another local port.

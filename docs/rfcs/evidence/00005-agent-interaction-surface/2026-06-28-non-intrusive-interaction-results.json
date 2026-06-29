@@ -119,6 +119,6 @@
   "conclusion": {
     "os_foreground_required_for_normal_page_actions": false,
     "closest_browser_lab_match": "playwright-connect-over-cdp",
-    "implementation_direction": "browser-protocol target activation, element focus, actionability, and CDP input while preserving the active application"
+    "implementation_direction": "target-session attachment, element preparation, actionability, and CDP input while preserving the active application"
   }
 }

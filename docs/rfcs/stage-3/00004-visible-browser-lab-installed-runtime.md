@@ -71,7 +71,7 @@ The launcher is implemented in this repository. General-purpose opener crates mo
 
 Chrome remains visible and available for user interaction. Session and tab creation preserve the user's active application and active Chrome tab unless the caller invokes `focus_tab` or requests `focus: true` while creating a tab.
 
-This section records the focus behavior shipped with the installed runtime. The RFC `00005` non-intrusive interaction recon later established that normal headed-browser page actions can use browser-side target activation, element focus, actionability checks, and CDP input while preserving the user's active application. That evidence supersedes the design interpretation that OS foreground focus is required for trusted browser automation input.
+This section records the focus behavior shipped with the installed runtime. The RFC `00005` non-intrusive interaction recon later established that normal headed-browser page actions can use target-session attachment, element preparation, actionability checks, and CDP input while preserving the user's active application. That evidence supersedes the design interpretation that OS foreground focus or CDP target activation is required for trusted browser automation input.
 
 `Target.createTarget` receives `background: true` for the default tab-creation path. The broker calls `Target.activateTarget` only for:
 
@@ -84,7 +84,7 @@ Navigation, screenshots, evaluation, text insertion, console reads, and network 
 
 `click` and `press_key` in the shipped runtime dispatch native mouse and keyboard events only while the owned target is the visible, focused document. After validating `agent_session_id` and `tab_id`, the broker evaluates `document.hasFocus()` and requires `document.visibilityState === "visible"` in the target. When either condition is false, the broker returns `focus_required` without dispatching input. The caller invokes `focus_tab` and retries the action.
 
-The replacement interaction contract keeps the same ownership boundary and observable action evidence while preparing the target inside Chrome instead of activating the Chrome application. It makes the owned target active within Chrome, focuses the resolved element inside the document when needed, performs actionability and hit-target checks, and dispatches browser input through CDP.
+The replacement interaction contract keeps the same ownership boundary and observable action evidence while attaching to the owned target without activating the Chrome application or invoking CDP `Target.activateTarget`. It prepares the resolved element inside the document when needed, performs actionability and hit-target checks, and dispatches browser input through CDP.
 
 The broker implements `click` through a CSS selector, a visible-element center point, and CDP mouse events. It implements `press_key` through CDP keyboard events. DOM-mediated click and keyboard fallbacks are not part of the tool contract.
 
@@ -136,7 +136,7 @@ The managed profile consumes persistent disk space and keeps browser state acros
 
 Desktop focus behavior crosses Chrome, the operating system, and the window manager. The platform adapters express the strongest supported no-activation request, and real-browser tests verify observable focus behavior on supported development and CI platforms.
 
-Normal browser workflows use browser-side target activation, element focus, actionability checks, and CDP input that preserve the user's active application. `focus_tab` remains available when the user asks to bring managed Chrome forward for manual inspection or handoff.
+Normal browser workflows use target-session attachment, element preparation, actionability checks, and CDP input that preserve the user's active application. `focus_tab` remains available when the user asks to bring managed Chrome forward for manual inspection or handoff.
 
 Browser discovery must track common installation paths. The explicit Chrome path override provides a stable route for custom installations.
 
@@ -157,9 +157,9 @@ A fixed debugging port simplifies startup but creates collisions between users, 
 - Default session and tab creation leave the user's active application and active Chrome tab unchanged on macOS.
 - `focus_tab` and `focus: true` activate the owned tab.
 - Navigation, screenshots, evaluation, text insertion, and diagnostics complete against a background owned tab without activating Chrome.
-- `click` and `press_key` return `focus_required` without dispatching input when the owned target lacks browser focus.
-- After `focus_tab`, retrying `click` or `press_key` dispatches the requested native input to the owned target.
-- RFC 00005 records the successor interaction contract for normal page actions: browser-protocol input after target preparation, without activating the Chrome application.
+- `click` and `press_key` in the installed-runtime focus-handoff release returned `focus_required` without dispatching input when the owned target lacked browser focus.
+- After `focus_tab`, retrying `click` or `press_key` dispatched the requested native input to the owned target.
+- RFC 00005 records the successor interaction contract for normal page actions: browser-protocol input after target-session attachment and element preparation, without activating Chrome through the operating system or CDP `Target.activateTarget`.
 - Handler termination invalidates the Chromiumoxide connection, and the next broker operation reconnects to a running endpoint.
 - Runtime directories contain no developer-specific absolute paths.
 - Package manifests and binary version output match the release version.

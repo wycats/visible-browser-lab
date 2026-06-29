@@ -6,7 +6,7 @@ Date: 2026-06-24
 
 Use `chromiumoxide 0.9.1` as the candidate CDP transport and generated protocol layer for the installed runtime. Integrate its low-level connection, command, page-session, and event APIs. Keep browser launch, tab ownership, selector semantics, diagnostics retention, and MCP error contracts in Visible Browser Lab.
 
-The spike correctly observed that a narrow raw-CDP sequence returned success without delivering mouse or key input to the page while another application was foregrounded. The later non-intrusive interaction recon under RFC `00005` showed that this observation did not establish an OS-foreground requirement. Playwright-over-CDP, Puppeteer, and ChromeDriver all delivered trusted page input in headed Chrome while preserving the user's active application. The missing piece is browser-side target activation, element focus, actionability, and hit-test preparation before CDP input dispatch.
+The spike correctly observed that a narrow raw-CDP sequence returned success without delivering mouse or key input to the page while another application was foregrounded. The later non-intrusive interaction recon under RFC `00005` showed that this observation did not establish an OS-foreground requirement. Playwright-over-CDP, Puppeteer, and ChromeDriver all delivered trusted page input in headed Chrome while preserving the user's active application. The missing piece is target-session attachment, element preparation, actionability, and hit-test preparation before CDP input dispatch.
 
 RFC `00004` records the focus handoff behavior shipped with the installed runtime. RFC `00005` defines the replacement interaction contract for normal page actions.
 
@@ -100,4 +100,4 @@ The spike left two apparent contracts before changing `click` and `press_key`:
 - **DOM-mediated background actions:** preserve application focus; click and key events are untrusted DOM events and may differ from physical input.
 - **Explicit trusted input:** preserve CDP input semantics; return `focus_required` until the caller explicitly invokes `focus_tab`.
 
-RFC `00004` shipped the explicit trusted-input handoff. The RFC `00005` non-intrusive interaction recon supersedes that decision for normal page actions: use browser-protocol target activation, element focus, actionability, and CDP input while preserving the user's active application. Keep `focus_tab` for user handoff to the visible browser window.
+RFC `00004` shipped the explicit trusted-input handoff. The RFC `00005` non-intrusive interaction recon supersedes that decision for normal page actions: use target-session attachment, element preparation, actionability, and CDP input while preserving the user's active application. Keep `focus_tab` for user handoff to the visible browser window.
