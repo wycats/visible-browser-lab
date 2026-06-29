@@ -223,7 +223,8 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
     ) -> Result<(), BrowserToolError> {
-        self.activate_target(&target.id).await
+        let _ = self.page(&target.id).await?;
+        Ok(())
     }
 
     pub async fn close_target(&self, target_id: &str) -> Result<(), BrowserToolError> {

@@ -103,8 +103,8 @@ runtime:
 
 This product feedback matches the recon conclusion. The shipped focus-handoff
 path can complete the workflow, and normal Browser Lab actions should move to
-browser-protocol target preparation and input so those clicks preserve the
-user's active application.
+target-session attachment, element preparation, and browser input so those
+clicks preserve the user's active application.
 
 ## Ecosystem Comparison
 
@@ -172,8 +172,8 @@ Observed implementation pattern:
 - Playwright, Puppeteer, and ChromeDriver deliver page input through browser
   automation channels. They do not move the user's physical pointer.
 - CDP provides the low-level input commands used by Puppeteer and available to
-  Playwright-over-CDP. Browser Lab needs the same target activation and focused
-  element setup that those tools perform inside the browser.
+  Playwright-over-CDP. Browser Lab needs the same target-session attachment and
+  focused element setup that those tools perform inside the browser.
 - WebDriver-style headed automation delegates input semantics to the remote end.
   It is useful prior art for actionability and remote-end ownership of browser
   input, even if Browser Lab continues to use CDP directly.
@@ -241,13 +241,13 @@ Findings:
 - A Chrome document can report `document.hasFocus() === true` and receive
   trusted automation input while Finder remains the frontmost macOS application.
 - Playwright-over-CDP is the closest match to Browser Lab's architecture: a
-  fresh headed Chrome profile, a CDP endpoint, browser-side target focus, locator
-  actionability, and trusted page events with no Chrome foreground activation.
+  fresh headed Chrome profile, a CDP endpoint, target-session attachment,
+  locator actionability, and trusted page events with no Chrome foreground
+  activation.
 - The current Browser Lab focused-document preflight conflates browser document
   focus with OS application foregrounding through the recovery path. The browser
-  automation path should make the Chrome target active inside the browser and
-  focus the resolved element inside the document, then dispatch browser input
-  through CDP.
+  automation path should attach to the owned target session and prepare the
+  resolved element inside the document, then dispatch browser input through CDP.
 - The raw-CDP follow-up attempted from Node was killed before producing output.
   It is not used as evidence. The completed Playwright-over-CDP and Puppeteer
   runs establish that CDP-backed headed automation can preserve the user's active
@@ -257,7 +257,7 @@ Findings:
 
 | Option | Preserves active app | Browser remains inspectable | Product behavior fidelity | Cross-platform shape | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Browser-protocol actionability plus CDP input | Yes in macOS headed experiments | Yes | High for ordinary controls, typed input, submit, menu, and iframe actions | Matches Playwright/Puppeteer CDP mechanics; portable through Chrome | Best fit for Browser Lab: implement browser-side target focus, element focus, actionability, hit-target checks, and CDP input without OS activation. |
+| Browser-protocol actionability plus CDP input | Yes in macOS headed experiments | Yes | High for ordinary controls, typed input, submit, menu, and iframe actions | Matches Playwright/Puppeteer CDP mechanics; portable through Chrome | Best fit for Browser Lab: implement target-session attachment, element preparation, actionability, hit-target checks, and CDP input without OS activation or CDP `Target.activateTarget`. |
 | Background semantic actions | Yes | Yes | High for ordinary DOM controls; lower for browser-native or site-specific trusted-input checks | Broker-owned and portable | Useful fallback for controls where DOM activation is the intended web-platform operation. Should report semantic delivery explicitly. |
 | Explicit focused-document handoff | Activates managed Chrome | Yes | Reserved for user-directed handoff to an interactive browser session | Implemented today | Keep as a named handoff operation for the user taking control of the browser window. |
 | Isolated display/session | Preserves main desktop when available | Separate inspection surface | High for test-like browser sessions | Strongest on Linux/Xvfb; macOS/Windows need separate runtime design | Useful for CI or remote automation sessions. It is a runtime mode, not the primary Browser Lab interaction mechanism. |
@@ -274,7 +274,7 @@ Findings:
 | Menus/popovers | Browser-protocol click after target resolution and hit-test evidence | Popover/menu state, target hit-test, topmost element stack | User handoff for manual menu selection. |
 | Dialogs | Browser-protocol trigger plus CDP dialog handler | Dialog event and accepted/dismissed result | User handoff for OS-level dialogs outside browser automation. |
 | File upload | File input assignment through workspace-contained path resolution | File input files list and page change | User handoff for an OS file picker session. |
-| Keyboard shortcuts | Browser target activation inside Chrome plus CDP key events | Page effect or key listener result | User handoff for application-level manual keyboard control. |
+| Keyboard shortcuts | Target-session attachment plus CDP key events | Page effect or key listener result | User handoff for application-level manual keyboard control. |
 | Iframe actions | Browser-protocol action after frame-aware reference resolution | Frame id, resolved element, frame-local hit-test, page effect | User handoff for manual frame interaction. |
 | Coordinate/pointer actions | CDP pointer path with hit-test evidence | Topmost element at point and page effect | User handoff for exploratory manual pointer control. |
 
@@ -317,8 +317,8 @@ target.
 - Define the exact action result schema extension for delivery mode, target
   focus, event trust, hit-test evidence, and post-action observation.
 - Build a raw Browser Lab reproduction that mirrors Playwright-over-CDP:
-  target activation inside Chrome, element focus, CDP mouse/key dispatch, and
-  no macOS application activation.
+  target-session attachment, element focus, CDP mouse/key dispatch, and no
+  macOS application activation.
 - Add a visible-mode macOS test harness that records the active application,
   activates Finder before browser actions, and treats a vanished previous
   application as a skipped restoration target.

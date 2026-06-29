@@ -39,7 +39,7 @@ capability flag. Its generated reference contains 23 default operations.
 | `browser_file_upload` | `interact(operation: "upload_files")` | Domain | Resolves workspace-relative paths and an explicit file-input target. |
 | `browser_fill_form` | `fill_form` | Explicit | Applies typed field operations sequentially and reports partial completion. |
 | `browser_handle_dialog` | `interact(operation: "handle_dialog")` | Domain | Accepts or dismisses the owned tab's pending JavaScript dialog. |
-| `browser_hover` | `interact(operation: "hover")` | Domain | Uses browser-protocol target preparation, actionability, and pointer input. |
+| `browser_hover` | `interact(operation: "hover")` | Domain | Uses target-session attachment, actionability, and pointer input. |
 | `browser_navigate` | `navigate(action: "url")` | Explicit | Navigates the owned tab without selecting a global page. |
 | `browser_navigate_back` | `navigate(action: "back")` | Explicit | Uses the owned tab's session history. |
 | `browser_network_request` | `network(operation: "get")` | Domain | Returns bounded request and response detail; large bodies become artifacts. |

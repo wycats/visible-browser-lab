@@ -442,7 +442,7 @@ The visible-browser-lab skill uses the broker workflow:
 2. Reuse the returned `agent_session_id` for the whole workflow.
 3. Use only owned `tab_id`s for browser actions.
 4. Use `global_readonly` listing only for target identification or explicit user-directed tab transfer.
-5. Use `focus_tab` as the explicit transition before native click or key input when the broker returns `focus_required` in the shipped focus-handoff path. RFC 00005 defines the successor interaction contract for normal page actions: browser-protocol target preparation and input that preserve the user's active application.
+5. Use `focus_tab` as the explicit transition before native click or key input when the broker returns `focus_required` in the shipped focus-handoff path. RFC 00005 defines the successor interaction contract for normal page actions: target-session attachment, element preparation, and browser-protocol input that preserve the user's active application.
 6. Use the facade MCP server for this workflow.
 
 ## Failure Modes
@@ -480,7 +480,7 @@ Available components:
 3. Detached broker startup, local IPC locking, stale endpoint cleanup, pid file handling, and newline-delimited broker RPC.
 4. Cross-platform broker IPC using local IPC transport so release binaries can be built for macOS, Linux, and Windows.
 5. Session and lease registries with opaque bearer IDs and ownership checks shared by owned-tab action tools.
-6. Broker-owned Chromiumoxide connections and handlers for target discovery, target creation, target activation, navigation, screenshot capture, target close, page evaluation, CSS selector click, text input, key press, console buffering, and network buffering.
+6. Broker-owned Chromiumoxide connections and handlers for target discovery, target creation, explicit target activation, navigation, screenshot capture, target close, page evaluation, CSS selector click, text input, key press, console buffering, and network buffering.
 7. MCP tools: `start_session`, `list_tabs`, `new_tab`, `claim_tab`, `release_tab`, `focus_tab`, `navigate`, `screenshot`, `close_tab`, `evaluate`, `click`, `type_text`, `press_key`, `console_messages`, and `network_events`.
 8. Plugin-facing MCP surfaces for the `visible-browser-lab` facade.
 9. Skill text for the explicit session, owned-tab action, and diagnostics workflow.
