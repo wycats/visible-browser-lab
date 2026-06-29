@@ -274,9 +274,9 @@ Findings:
 | Menus/popovers | Browser-protocol click after target resolution and hit-test evidence | Popover/menu state, target hit-test, topmost element stack | User handoff for manual menu selection. |
 | Dialogs | Browser-protocol trigger plus CDP dialog handler | Dialog event and accepted/dismissed result | User handoff for OS-level dialogs outside browser automation. |
 | File upload | File input assignment through workspace-contained path resolution | File input files list and page change | User handoff for an OS file picker session. |
-| Keyboard shortcuts | Target-session attachment plus CDP key events | Page effect or key listener result | User handoff for application-level manual keyboard control. |
+| Keyboard shortcuts | Targeted key operation after element preparation | Page effect or key listener result | Targetless raw key input requires focused-document handoff. |
 | Iframe actions | Browser-protocol action after frame-aware reference resolution | Frame id, resolved element, frame-local hit-test, page effect | User handoff for manual frame interaction. |
-| Coordinate/pointer actions | CDP pointer path with hit-test evidence | Topmost element at point and page effect | User handoff for exploratory manual pointer control. |
+| Coordinate/pointer actions | Referenced pointer action after hit-test evidence | Topmost element at point and page effect | Targetless coordinate input requires focused-document handoff. |
 
 ## Recommendation
 
@@ -286,18 +286,20 @@ Playwright-over-CDP, Puppeteer, and ChromeDriver:
 
 1. Keep ownership validation unchanged.
 2. Resolve the element through snapshot reference or CSS fallback.
-3. Make the owned target active inside Chrome without activating the Chrome
-   application.
+3. Attach to the owned target session without activating Chrome through the
+   operating system or CDP `Target.activateTarget`.
 4. Focus the resolved element inside the document when the operation needs
    keyboard or editable state.
 5. Run strict actionability and hit-test checks modeled on Playwright's locator
    pipeline.
-6. Dispatch browser input through CDP for clicks, typing, keyboard shortcuts,
-   iframe targets, and coordinate actions.
-7. Use semantic DOM activation as an explicit fallback for controls where the
+6. Dispatch browser input through CDP for element-targeted clicks, typing,
+   keyboard shortcuts, and iframe targets.
+7. Return `focus_required` for targetless raw key or coordinate input until the
+   caller explicitly focuses the owned document with `focus_tab`.
+8. Use semantic DOM activation as an explicit fallback for controls where the
    browser-protocol action reports no page effect and the requested operation is
    a web-platform activation.
-8. Return structured action evidence:
+9. Return structured action evidence:
    - delivery mode (`browser_protocol_input`, `semantic_dom_activation`, or
      `user_handoff`);
    - resolved element summary;

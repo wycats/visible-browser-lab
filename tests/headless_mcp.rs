@@ -163,7 +163,6 @@ fn complete_v03_domain_surface() -> Result<()> {
         json!({"operation":"drop","target":{"ref":file_drop_ref},"paths":["upload.txt"],"data":{"text/plain":"fixture"},"observe":"none"}),
         json!({"operation":"upload_files","target":{"css":"#upload"},"paths":["upload.txt"],"observe":"none"}),
         json!({"operation":"scroll","target":{"css":"#scroll-box"},"delta_y":120,"observe":"none"}),
-        json!({"operation":"click_at","x":2,"y":2,"button":"left","count":1,"observe":"none"}),
     ] {
         let mut arguments = arguments.as_object().cloned().unwrap();
         arguments.insert("agent_session_id".to_string(), json!(session_id));
@@ -175,6 +174,18 @@ fn complete_v03_domain_surface() -> Result<()> {
             false,
         )?;
     }
+    harness.client_mut().call_tool(
+        "focus_tab",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "interact",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"click_at","x":2,"y":2,"button":"left","count":1,"observe":"none"}),
+        Duration::from_secs(20),
+        false,
+    )?;
     harness.client_mut().call_tool(
         "fill_form",
         json!({
