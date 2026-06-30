@@ -6,6 +6,8 @@
 
 Visible Browser Lab should add a binary-resolved host package contract for future releases. The current publishing contract produces self-contained host packages: every host package contains the platform-specific `visible-browser-lab-mcp` binary. That contract gives network-free first startup, and it expands each release into `25` assets: `18` host-and-target plugin archives, `6` standalone binary archives, and `SHA256SUMS`.
 
+In this RFC, a **host package** is the release archive built for one host surface, such as Codex, Claude Code, or VS Code; the **plugin** is the installed Visible Browser Lab capability that host package registers with the host.
+
 The binary-resolved contract separates host package distribution from binary distribution. A release publishes one package for each host surface, one binary archive for each supported target, and one checksum manifest. Host installation or first MCP startup resolves the current platform, downloads the matching binary, verifies it, caches it, and runs the verified binary from the cache.
 
 Network access during installation or first startup is acceptable for this plugin class. Visible Browser Lab is used inside AI workflows that already require network access. The contract therefore optimizes for faster release pickup, fewer release assets, and a smaller host package surface while preserving verified binaries, deterministic cache behavior, and clear recovery when the first binary fetch cannot complete.
@@ -66,6 +68,8 @@ The host lifecycle resolves and verifies the binary before invoking the MCP serv
 6. runs the cached binary as the MCP server command.
 
 Cache identity includes plugin name, plugin version, target triple, asset name, and SHA-256 digest. A cache hit is valid only when the cached binary matches the release metadata for the installed host package.
+
+The cache directory is selected by the host lifecycle. When the host exposes a plugin cache root, the resolver stores binaries under that root at `visible-browser-lab/binaries/<plugin-version>/<target-triple>/<sha256>/`. When the host does not expose a cache root, the default cache root is the platform user-cache directory: `~/Library/Caches/visible-browser-lab/binaries` on macOS, `${XDG_CACHE_HOME:-~/.cache}/visible-browser-lab/binaries` on Linux, and `%LOCALAPPDATA%\\visible-browser-lab\\Cache\\binaries` on Windows. A temporary bundled resolver may support `VISIBLE_BROWSER_LAB_BINARY_CACHE_DIR` as an explicit override; a host-managed resolver uses the host's plugin-cache configuration surface for the same purpose.
 
 # Network and Recovery Contract
 
