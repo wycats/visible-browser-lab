@@ -39,11 +39,11 @@ use crate::{
         ClaimTabParams, ClickParams, CloseTabResult, ConsoleMessage, DomainParams,
         ElementReferenceTarget, ElementTarget, EvaluateResult, FillFormParams, FillFormResult,
         FillParams, FormField, ListTabsParams, ListTabsResult, ListTabsScope, NavigationAction,
-        NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionResult,
-        ReleaseTabResult, ScreenshotImage, ScreenshotParams, ScreenshotResult, SnapshotMode,
-        SnapshotParams, SnapshotResult, StartSessionParams, StartSessionResult, TabActionParams,
-        TabResult, V3EvaluateParams, V3NavigateParams, V3PressKeyParams, V3TypeTextParams,
-        WaitCondition, WaitForParams, WaitForResult,
+        NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionEffect,
+        PageActionEvidence, PageActionResult, ReleaseTabResult, ScreenshotImage, ScreenshotParams,
+        ScreenshotResult, SnapshotMode, SnapshotParams, SnapshotResult, StartSessionParams,
+        StartSessionResult, TabActionParams, TabResult, V3EvaluateParams, V3NavigateParams,
+        V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams, WaitForResult,
     },
     semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
@@ -331,6 +331,7 @@ struct FakeBrowser {
     closed_targets: Vec<String>,
     clicked_selectors: Vec<String>,
     clicked_backend_nodes: Vec<i64>,
+    semantic_activated_backend_nodes: Vec<i64>,
     filled_backend_nodes: Vec<(i64, String)>,
     typed_text: Vec<String>,
     pressed_keys: Vec<String>,
@@ -347,6 +348,7 @@ impl FakeBrowser {
             closed_targets: Vec::new(),
             clicked_selectors: Vec::new(),
             clicked_backend_nodes: Vec::new(),
+            semantic_activated_backend_nodes: Vec::new(),
             filled_backend_nodes: Vec::new(),
             typed_text: Vec::new(),
             pressed_keys: Vec::new(),
@@ -457,7 +459,7 @@ impl FakeBrowser {
         })
     }
 
-    fn click(&mut self, target: &CdpTarget, selector: &str) -> Result<(), BrowserToolError> {
+    fn click(&mut self, target: &CdpTarget, selector: &str) -> Result<Value, BrowserToolError> {
         if !self
             .targets
             .iter()
@@ -473,7 +475,14 @@ impl FakeBrowser {
         }
 
         self.clicked_selectors.push(selector.to_string());
-        Ok(())
+        Ok(json!({
+            "state":"ready",
+            "selector":selector,
+            "resolved_element":{"selector":selector},
+            "center_hit_test":{"topmost":"fake","target_contains_topmost":true},
+            "submit_candidate":selector == "#submit",
+            "dispatch":{"release_delivery":"chrome_ack","delivery_uncertain":false}
+        }))
     }
 
     fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
@@ -550,7 +559,7 @@ impl FakeBrowser {
         &mut self,
         target: &CdpTarget,
         backend_node_id: i64,
-    ) -> Result<(), BrowserToolError> {
+    ) -> Result<Value, BrowserToolError> {
         if !self
             .targets
             .iter()
@@ -559,7 +568,37 @@ impl FakeBrowser {
             return Err(BrowserToolError::target_missing_for_target(&target.id));
         }
         self.clicked_backend_nodes.push(backend_node_id);
-        Ok(())
+        let submit_candidate = backend_node_id == 2;
+        Ok(json!({
+            "state":"ready",
+            "resolved_element":{"backend_node_id":backend_node_id,"role": if backend_node_id == 2 { "button" } else { "unknown" }},
+            "center_hit_test":{"topmost":"fake","target_contains_topmost":true},
+            "submit_candidate":submit_candidate,
+            "dispatch":{"release_delivery":"chrome_ack","delivery_uncertain":false}
+        }))
+    }
+
+    fn semantic_activate_backend_node(
+        &mut self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<Value, BrowserToolError> {
+        let Some(existing) = self
+            .targets
+            .iter_mut()
+            .find(|candidate| candidate.id == target.id)
+        else {
+            return Err(BrowserToolError::target_missing_for_target(&target.id));
+        };
+        self.semantic_activated_backend_nodes.push(backend_node_id);
+        existing.url = "fake://semantic-submit".to_string();
+        existing.title = "fake://semantic-submit".to_string();
+        Ok(json!({
+            "state":"ready",
+            "semantic_activation":"form_request_submit",
+            "submit_candidate":true,
+            "resolved_element":{"backend_node_id":backend_node_id}
+        }))
     }
 
     fn fill_backend_node(
@@ -1089,7 +1128,7 @@ impl BrowserBackend {
         button: &str,
         count: u8,
         modifiers: &[String],
-    ) -> Result<(), BrowserToolError> {
+    ) -> Result<Value, BrowserToolError> {
         match self {
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().click(target, selector),
@@ -1109,7 +1148,7 @@ impl BrowserBackend {
         button: &str,
         count: u8,
         modifiers: &[String],
-    ) -> Result<(), BrowserToolError> {
+    ) -> Result<Value, BrowserToolError> {
         match self {
             #[cfg(test)]
             Self::Fake(browser) => browser
@@ -1120,6 +1159,26 @@ impl BrowserBackend {
                 self.cdp_client()
                     .await?
                     .click_backend_node(target, backend_node_id, button, count, modifiers)
+                    .await
+            }
+        }
+    }
+
+    async fn semantic_activate_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<Value, BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser
+                .lock()
+                .unwrap()
+                .semantic_activate_backend_node(target, backend_node_id),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .semantic_activate_backend_node(target, backend_node_id)
                     .await
             }
         }
@@ -2811,7 +2870,9 @@ async fn broker_click(
     state.browser.prepare_target_for_action(&target).await?;
     let button = params.button.as_deref().unwrap_or("left");
     let count = params.count.unwrap_or(1);
-    match resolve_element_target(
+    let baseline = click_effect_baseline(state, &target).await?;
+    let mut delivery_mode = "browser_protocol_input".to_string();
+    let mut delivery = match resolve_element_target(
         state,
         &params.agent_session_id,
         &params.tab_id,
@@ -2830,12 +2891,11 @@ async fn broker_click(
                     &params.modifiers,
                 )
             })
-            .await?;
+            .await?
         }
         ResolvedElementTarget::Css(selector) => {
-            state
-                .browser
-                .click(
+            retry_element_action(params.timeout_ms, || {
+                state.browser.click(
                     &target,
                     &selector,
                     params.timeout_ms.unwrap_or(DEFAULT_CLICK_TIMEOUT_MS),
@@ -2843,17 +2903,219 @@ async fn broker_click(
                     count,
                     &params.modifiers,
                 )
-                .await?;
+            })
+            .await?
         }
+    };
+
+    let submit_candidate = click_submit_candidate(&delivery);
+    let mut effect = if submit_candidate {
+        wait_for_submit_effect(state, &target, &baseline).await?
+    } else {
+        wait_for_click_effect(state, &target, &baseline).await?
+    };
+    if !(if submit_candidate {
+        effect_has_submit_signal(&effect)
+    } else {
+        effect_has_action_signal(&effect)
+    }) && submit_candidate
+        && button == "left"
+        && count == 1
+        && let Some(backend_node_id) = click_backend_node_id(&delivery)
+    {
+        let semantic = state
+            .browser
+            .semantic_activate_backend_node(&target, backend_node_id)
+            .await?;
+        delivery_mode = "semantic_dom_activation".to_string();
+        attach_delivery_detail(&mut delivery, "semantic_activation", semantic);
+        effect = wait_for_submit_effect(state, &target, &baseline).await?;
     }
-    post_action_observation(
+
+    let mut result = post_action_observation(
         state,
         &params.agent_session_id,
         &params.tab_id,
         &target,
         params.observe.unwrap_or_default(),
     )
-    .await
+    .await?;
+    let (accessibility_changed, accessibility_changed_node_count) =
+        observation_change_summary(&result.observation);
+    effect.accessibility_changed = accessibility_changed;
+    effect.accessibility_changed_node_count = accessibility_changed_node_count;
+    result.action = Some(PageActionEvidence {
+        delivery_mode,
+        release_delivery: click_release_delivery(&delivery),
+        delivery_uncertain: click_delivery_uncertain(&delivery),
+        resolved_element: delivery.get("resolved_element").cloned(),
+        center_hit_test: delivery.get("center_hit_test").cloned(),
+        effect,
+    });
+    Ok(result)
+}
+
+struct ClickEffectBaseline {
+    url: String,
+    network_since: u64,
+}
+
+async fn click_effect_baseline(
+    state: &BrokerState,
+    target: &CdpTarget,
+) -> Result<ClickEffectBaseline, BrowserToolError> {
+    let current = target_by_id(state, &target.id)
+        .await
+        .unwrap_or_else(|_| target.clone());
+    let network_since = state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .network_events(&target.id, None)
+        .into_iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(0);
+    Ok(ClickEffectBaseline {
+        url: current.url,
+        network_since,
+    })
+}
+
+async fn wait_for_click_effect(
+    state: &BrokerState,
+    target: &CdpTarget,
+    baseline: &ClickEffectBaseline,
+) -> Result<PageActionEffect, BrowserToolError> {
+    let deadline = Instant::now() + Duration::from_millis(750);
+    loop {
+        let effect = click_effect(state, target, baseline).await?;
+        if effect_has_action_signal(&effect) || Instant::now() >= deadline {
+            return Ok(effect);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_submit_effect(
+    state: &BrokerState,
+    target: &CdpTarget,
+    baseline: &ClickEffectBaseline,
+) -> Result<PageActionEffect, BrowserToolError> {
+    let deadline = Instant::now() + Duration::from_millis(2_000);
+    loop {
+        let effect = click_effect(state, target, baseline).await?;
+        if effect.url_changed {
+            return Ok(effect);
+        }
+        if effect_has_completed_submit_request(&effect) {
+            sleep(Duration::from_millis(100)).await;
+            return click_effect(state, target, baseline).await;
+        }
+        if Instant::now() >= deadline {
+            return Ok(effect);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn click_effect(
+    state: &BrokerState,
+    target: &CdpTarget,
+    baseline: &ClickEffectBaseline,
+) -> Result<PageActionEffect, BrowserToolError> {
+    let current = target_by_id(state, &target.id)
+        .await
+        .unwrap_or_else(|_| target.clone());
+    let network_events = state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .network_events(&target.id, Some(baseline.network_since));
+    let network_events = network_records(network_events)
+        .iter()
+        .map(network_record_value)
+        .collect::<Vec<_>>();
+    let post_url = current.url;
+    Ok(PageActionEffect {
+        pre_url: baseline.url.clone(),
+        url_changed: post_url != baseline.url,
+        post_url,
+        network_event_count: network_events.len(),
+        network_events,
+        accessibility_changed: false,
+        accessibility_changed_node_count: 0,
+    })
+}
+
+fn effect_has_action_signal(effect: &PageActionEffect) -> bool {
+    effect.url_changed || effect.network_event_count > 0
+}
+
+fn effect_has_submit_signal(effect: &PageActionEffect) -> bool {
+    effect.url_changed || effect_has_completed_submit_request(effect)
+}
+
+fn effect_has_completed_submit_request(effect: &PageActionEffect) -> bool {
+    effect.network_events.iter().any(|event| {
+        event
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method != "GET")
+            && (event.get("status").is_some_and(|status| !status.is_null())
+                || event
+                    .get("failed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || event
+                    .get("duration_ms")
+                    .is_some_and(|duration| !duration.is_null()))
+    })
+}
+
+fn click_submit_candidate(delivery: &Value) -> bool {
+    delivery
+        .get("submit_candidate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn click_backend_node_id(delivery: &Value) -> Option<i64> {
+    delivery
+        .get("resolved_element")
+        .and_then(|element| element.get("backend_node_id"))
+        .and_then(Value::as_i64)
+}
+
+fn click_release_delivery(delivery: &Value) -> String {
+    delivery
+        .get("dispatch")
+        .and_then(|dispatch| dispatch.get("release_delivery"))
+        .and_then(Value::as_str)
+        .unwrap_or("delivery_uncertain")
+        .to_string()
+}
+
+fn click_delivery_uncertain(delivery: &Value) -> bool {
+    delivery
+        .get("dispatch")
+        .and_then(|dispatch| dispatch.get("delivery_uncertain"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| click_release_delivery(delivery) == "delivery_uncertain")
+}
+
+fn attach_delivery_detail(delivery: &mut Value, key: &str, detail: Value) {
+    if let Some(object) = delivery.as_object_mut() {
+        object.insert(key.to_string(), detail);
+    }
+}
+
+fn observation_change_summary(observation: &Observation) -> (bool, usize) {
+    match observation {
+        Observation::Diff { diff } => (diff.changed_node_count > 0, diff.changed_node_count),
+        Observation::Snapshot { snapshot } => (true, snapshot.node_count),
+        Observation::None => (false, 0),
+    }
 }
 
 async fn broker_fill(
@@ -3184,6 +3446,7 @@ async fn post_action_observation(
                 .document_revision(tab_id)
                 .unwrap_or_else(|| format!("target:{}", target.id)),
             observation: Observation::None,
+            action: None,
         }),
         ObservationMode::Diff => {
             let (snapshot, diff) = snapshot_for_target(
@@ -3204,6 +3467,7 @@ async fn post_action_observation(
             Ok(PageActionResult {
                 document_revision: snapshot.document_revision,
                 observation: Observation::Diff { diff },
+                action: None,
             })
         }
         ObservationMode::Snapshot => {
@@ -3225,6 +3489,7 @@ async fn post_action_observation(
             Ok(PageActionResult {
                 document_revision: snapshot.document_revision.clone(),
                 observation: Observation::Snapshot { snapshot },
+                action: None,
             })
         }
     }
@@ -6020,6 +6285,19 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(clicked.observation, Observation::None));
+        let action = clicked.action.as_ref().unwrap();
+        assert_eq!(action.delivery_mode, "semantic_dom_activation");
+        assert_eq!(action.release_delivery, "chrome_ack");
+        assert!(action.effect.url_changed);
+        assert_eq!(action.effect.post_url, "fake://semantic-submit");
+        assert_eq!(
+            action
+                .resolved_element
+                .as_ref()
+                .and_then(|element| element.get("backend_node_id"))
+                .and_then(Value::as_i64),
+            Some(2)
+        );
 
         broker_type_text(
             &state,
@@ -6086,6 +6364,7 @@ mod tests {
         {
             let fake = fake.lock().unwrap();
             assert_eq!(fake.clicked_backend_nodes, vec![2]);
+            assert_eq!(fake.semantic_activated_backend_nodes, vec![2]);
             assert_eq!(
                 fake.filled_backend_nodes,
                 vec![(3, "person@example.test".to_string())]

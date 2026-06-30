@@ -1044,32 +1044,19 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
         selector: &str,
-        timeout_ms: u64,
+        _timeout_ms: u64,
         button: &str,
         count: u8,
         modifiers: &[String],
-    ) -> Result<(), BrowserToolError> {
-        let (page, connection) = self.page(&target.id).await?;
-        let point = self
-            .selector_point(
-                &page,
-                &connection,
-                selector,
-                Duration::from_millis(timeout_ms),
-            )
+    ) -> Result<Value, BrowserToolError> {
+        let backend_node_id = self.resolve_css_backend_node(target, selector).await?;
+        let mut evidence = self
+            .click_backend_node(target, backend_node_id, button, count, modifiers)
             .await?;
-
-        self.dispatch_click(
-            &page,
-            &connection,
-            point,
-            PointerClick {
-                button,
-                count,
-                modifiers,
-            },
-        )
-        .await
+        if let Some(object) = evidence.as_object_mut() {
+            object.insert("selector".to_string(), json!(selector));
+        }
+        Ok(evidence)
     }
 
     pub async fn click_backend_node(
@@ -1079,7 +1066,7 @@ impl CdpClient {
         button: &str,
         count: u8,
         modifiers: &[String],
-    ) -> Result<(), BrowserToolError> {
+    ) -> Result<Value, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
         let object_id = self
             .resolve_backend_node(&page, &connection, backend_node_id)
@@ -1093,7 +1080,7 @@ impl CdpClient {
   if (!this.isConnected) return { state: "stale" };
   this.scrollIntoView({ block: "center", inline: "center" });
   const first = this.getBoundingClientRect();
-  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  await new Promise(resolve => this.ownerDocument.defaultView.setTimeout(resolve, 50));
   const rect = this.getBoundingClientRect();
   if (Math.abs(first.x - rect.x) > 0.5 || Math.abs(first.y - rect.y) > 0.5 || Math.abs(first.width - rect.width) > 0.5 || Math.abs(first.height - rect.height) > 0.5) return { state: "unstable" };
   const style = this.ownerDocument.defaultView.getComputedStyle(this);
@@ -1104,12 +1091,47 @@ impl CdpClient {
   const y = rect.top + rect.height / 2;
   const hit = this.ownerDocument.elementFromPoint(x, y);
   if (hit !== this && !this.contains(hit)) return { state: "obscured" };
-  return { state: "ready", found: true, visible: true, x, y };
+  const tagName = this.tagName ? this.tagName.toLowerCase() : "";
+  const type = (this.getAttribute("type") || (tagName === "button" ? "submit" : "")).toLowerCase();
+  const form = this.form || this.closest("form");
+  const submitControl = (tagName === "button" && type !== "button" && type !== "reset") || (tagName === "input" && (type === "submit" || type === "image"));
+  const submitCandidate = submitControl && !!form && typeof form.requestSubmit === "function";
+  const text = (this.innerText || this.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const name = this.getAttribute("aria-label") || this.getAttribute("title") || text || this.getAttribute("value") || "";
+  const topmostText = hit ? ((hit.innerText || hit.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120)) : "";
+  return {
+    state: "ready",
+    found: true,
+    visible: true,
+    x,
+    y,
+    submit_candidate: submitCandidate,
+    resolved_element: {
+      tag_name: tagName,
+      id: this.id || null,
+      type: type || null,
+      role: this.getAttribute("role"),
+      name,
+      text,
+      disabled: this.matches(":disabled") || this.getAttribute("aria-disabled") === "true",
+      pointer_events: style.pointerEvents,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    },
+    center_hit_test: {
+      x,
+      y,
+      topmost_tag_name: hit && hit.tagName ? hit.tagName.toLowerCase() : null,
+      topmost_id: hit ? (hit.id || null) : null,
+      topmost_role: hit ? hit.getAttribute("role") : null,
+      topmost_text: topmostText,
+      target_contains_topmost: hit === this || this.contains(hit)
+    }
+  };
 }"#,
                 Vec::new(),
             )
             .await?;
-        actionable_state(actionability)?;
+        actionable_state(actionability.clone())?;
         let quads = self
             .runtime
             .page_command(
@@ -1132,17 +1154,80 @@ impl CdpClient {
                 )
             })
             .and_then(|quad| content_quad_point(quad.inner()))?;
-        self.dispatch_click(
-            &page,
-            &connection,
-            point,
-            PointerClick {
-                button,
-                count,
-                modifiers,
-            },
-        )
-        .await
+        let dispatch = self
+            .dispatch_click(
+                &page,
+                &connection,
+                point,
+                PointerClick {
+                    button,
+                    count,
+                    modifiers,
+                },
+            )
+            .await?;
+        let mut evidence = actionability;
+        if let Some(object) = evidence.as_object_mut() {
+            if let Some(resolved_element) = object
+                .get_mut("resolved_element")
+                .and_then(Value::as_object_mut)
+            {
+                resolved_element.insert("backend_node_id".to_string(), json!(backend_node_id));
+            }
+            object.insert("dispatch".to_string(), dispatch);
+        }
+        Ok(evidence)
+    }
+
+    pub async fn semantic_activate_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<Value, BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let mut result = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  const tagName = this.tagName ? this.tagName.toLowerCase() : "";
+  const type = (this.getAttribute("type") || (tagName === "button" ? "submit" : "")).toLowerCase();
+  const submitCandidate = (tagName === "button" && type !== "button" && type !== "reset") || (tagName === "input" && (type === "submit" || type === "image"));
+  const form = this.form || this.closest("form");
+  if (!submitCandidate || !form || typeof form.requestSubmit !== "function") return { state: "not_submit_control" };
+  form.requestSubmit(this);
+  return {
+    state: "ready",
+    semantic_activation: "form_request_submit",
+    submit_candidate: true,
+    resolved_element: {
+      backend_node_id: null,
+      tag_name: tagName,
+      id: this.id || null,
+      type: type || null,
+      role: this.getAttribute("role"),
+      name: this.getAttribute("aria-label") || this.getAttribute("title") || (this.innerText || this.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120)
+    }
+  };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result.clone())?;
+        if let Some(object) = result.as_object_mut()
+            && let Some(resolved_element) = object
+                .get_mut("resolved_element")
+                .and_then(Value::as_object_mut)
+        {
+            resolved_element.insert("backend_node_id".to_string(), json!(backend_node_id));
+        }
+        Ok(result)
     }
 
     pub async fn fill_backend_node(
@@ -1550,6 +1635,7 @@ impl CdpClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn scroll_backend_node(
@@ -2582,7 +2668,7 @@ impl CdpClient {
         connection: &RuntimeConnection,
         point: ClickPoint,
         click: PointerClick<'_>,
-    ) -> Result<(), BrowserToolError> {
+    ) -> Result<Value, BrowserToolError> {
         let button = match click.button {
             "left" => MouseButton::Left,
             "middle" => MouseButton::Middle,
@@ -2638,77 +2724,41 @@ impl CdpClient {
                     "dispatch mouse input",
                 );
                 if event_type == DispatchMouseEventType::MouseReleased {
+                    let release_delivery;
                     tokio::pin!(command);
                     tokio::select! {
                         biased;
                         result = &mut command => {
                             result?;
+                            release_delivery = "chrome_ack";
                         }
-                        _dialog = dialogs.next() => {}
-                        _ = sleep(Duration::from_millis(250)) => {}
+                        dialog = dialogs.next() => {
+                            if dialog.is_some() {
+                                release_delivery = "dialog_event";
+                            } else {
+                                command.await?;
+                                release_delivery = "chrome_ack";
+                            }
+                        }
+                        _ = sleep(Duration::from_millis(250)) => {
+                            release_delivery = "delivery_uncertain";
+                        }
+                    }
+                    if click_count == click.count {
+                        return Ok(json!({
+                            "release_delivery": release_delivery,
+                            "delivery_uncertain": release_delivery == "delivery_uncertain"
+                        }));
                     }
                 } else {
                     command.await?;
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn selector_point(
-        &self,
-        page: &Page,
-        connection: &RuntimeConnection,
-        selector: &str,
-        deadline: Duration,
-    ) -> Result<ClickPoint, BrowserToolError> {
-        let selector_json = serde_json::to_string(selector).map_err(|error| {
-            BrowserToolError::invalid_input(format!("invalid selector: {error}"))
-        })?;
-        let expression = format!(
-            r#"(() => {{
-  const selector = {selector_json};
-  const matches = document.querySelectorAll(selector);
-  if (matches.length !== 1) return {{ found: matches.length > 0, visible: false, count: matches.length }};
-  const element = matches[0];
-  element.scrollIntoView({{ block: "center", inline: "center" }});
-  const rect = element.getBoundingClientRect();
-  const style = window.getComputedStyle(element);
-  const visible = rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") !== 0;
-  if (!visible) return {{ found: true, visible: false }};
-  return {{ found: true, visible: true, count: 1, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }};
-}})()"#
-        );
-        let end = Instant::now() + deadline;
-
-        loop {
-            let remaining = end.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(BrowserToolError::operation_timeout(format!(
-                    "timed out waiting for visible selector `{selector}`"
-                )));
-            }
-
-            let result = match timeout(remaining, page.evaluate_expression(&expression)).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    return Err(self
-                        .runtime
-                        .page_error(connection, "evaluate click selector", error)
-                        .await);
-                }
-                Err(_) => {
-                    return Err(BrowserToolError::operation_timeout(format!(
-                        "timed out waiting for visible selector `{selector}`"
-                    )));
-                }
-            };
-
-            if let Some(point) = click_point(result.value().cloned(), selector)? {
-                return Ok(point);
-            }
-            sleep(remaining.min(Duration::from_millis(100))).await;
-        }
+        Ok(json!({
+            "release_delivery": "chrome_ack",
+            "delivery_uncertain": false
+        }))
     }
 }
 
@@ -2984,44 +3034,6 @@ struct PointerClick<'a> {
     modifiers: &'a [String],
 }
 
-fn click_point(
-    value: Option<Value>,
-    selector: &str,
-) -> Result<Option<ClickPoint>, BrowserToolError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if let Some(count) = value.get("count").and_then(Value::as_u64) {
-        if count == 0 {
-            return Err(BrowserToolError::element_not_found(selector));
-        }
-        if count > 1 {
-            return Err(BrowserToolError::element_ambiguous(
-                selector,
-                count as usize,
-            ));
-        }
-    }
-    if !value.get("found").and_then(Value::as_bool).unwrap_or(false)
-        || !value
-            .get("visible")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return Ok(None);
-    }
-
-    let x = value
-        .get("x")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| BrowserToolError::chrome_unavailable("selector result omitted x"))?;
-    let y = value
-        .get("y")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| BrowserToolError::chrome_unavailable("selector result omitted y"))?;
-    Ok(Some(ClickPoint { x, y }))
-}
-
 fn content_quad_point(quad: &[f64]) -> Result<ClickPoint, BrowserToolError> {
     if quad.len() != 8 {
         return Err(BrowserToolError::chrome_unavailable(format!(
@@ -3085,6 +3097,9 @@ fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
         )),
         Some("option_not_found") => Err(BrowserToolError::element_not_actionable(
             "one or more requested select options were not found",
+        )),
+        Some("not_submit_control") => Err(BrowserToolError::element_not_actionable(
+            "element is not a form submit control",
         )),
         Some(state) => Err(BrowserToolError::chrome_unavailable(format!(
             "element operation returned unknown state `{state}`"
@@ -3600,52 +3615,6 @@ mod tests {
         assert_eq!(enter.text, None);
         assert_eq!(enter.modifiers, 2);
         assert_eq!(enter.windows_virtual_key_code, Some(13));
-    }
-
-    #[test]
-    fn parses_selector_click_point() {
-        let point = click_point(
-            Some(json!({
-                "found": true,
-                "visible": true,
-                "x": 12.5,
-                "y": 30.0
-            })),
-            "#submit",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(point, ClickPoint { x: 12.5, y: 30.0 });
-
-        let missing = click_point(
-            Some(json!({
-                "found": false,
-                "visible": false,
-                "count": 0
-            })),
-            "#missing",
-        )
-        .unwrap_err();
-        assert_eq!(
-            missing.code,
-            crate::leases::BrowserToolErrorCode::ElementNotFound
-        );
-        assert!(missing.message.contains("#missing"));
-
-        let ambiguous = click_point(
-            Some(json!({
-                "found": true,
-                "visible": false,
-                "count": 2
-            })),
-            ".duplicate",
-        )
-        .unwrap_err();
-        assert_eq!(
-            ambiguous.code,
-            crate::leases::BrowserToolErrorCode::ElementAmbiguous
-        );
-        assert!(ambiguous.message.contains(".duplicate"));
     }
 
     #[test]

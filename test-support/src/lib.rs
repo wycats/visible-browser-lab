@@ -561,6 +561,78 @@ pub fn run_live_smoke(
     }
 
     client.call_tool(
+        "type_text",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "css": "#prompt" },
+            "text": "Create a tiny counter app with plus and minus buttons."
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let submitted = client.call_tool(
+        "click",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "target": { "css": "#submit" },
+            "observe": "diff",
+            "timeout_ms": 5000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let action = submitted
+        .get("action")
+        .context("submit click result omitted action evidence")?;
+    let delivery_mode = action
+        .get("delivery_mode")
+        .and_then(Value::as_str)
+        .context("submit click evidence omitted delivery_mode")?;
+    if !matches!(
+        delivery_mode,
+        "browser_protocol_input" | "semantic_dom_activation"
+    ) {
+        bail!("submit click reported unknown delivery mode: {submitted}");
+    }
+    let effect = action
+        .get("effect")
+        .context("submit click evidence omitted effect")?;
+    let url_changed = effect
+        .get("url_changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let network_event_count = effect
+        .get("network_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if !url_changed && network_event_count == 0 {
+        bail!("submit click evidence did not record URL or network effect: {submitted}");
+    }
+    let submit_state = client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": first_session,
+            "tab_id": transferable_tab.tab_id,
+            "source": "({ submitted: document.body.dataset.submitted, prompt: document.querySelector('#prompt').textContent, url: location.pathname })"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let submit_value = submit_state
+        .get("value")
+        .context("submit state omitted value")?;
+    if submit_value.get("submitted").and_then(Value::as_str) != Some("yes")
+        || submit_value.get("prompt").and_then(Value::as_str) != Some("")
+        || submit_value.get("url").and_then(Value::as_str) != Some("/submitted")
+    {
+        bail!(
+            "submit click did not produce the fixture form effect: action={action}; state={submit_state}"
+        );
+    }
+
+    client.call_tool(
         "evaluate",
         json!({
             "agent_session_id": first_session,
@@ -1132,6 +1204,10 @@ fn handle_fixture_connection(mut stream: TcpStream) {
 <label>Choice <select id="choice"><option value="one">One</option><option value="two">Two</option></select></label>
 <label><input id="checked" type="checkbox" /> Enabled</label>
 <div id="editable" contenteditable="true" aria-label="Editable value"></div>
+<form id="prompt-form">
+  <div id="prompt" contenteditable="true" role="textbox" aria-label="Prompt"></div>
+  <button id="submit" type="submit" data-testid="prompt-form-send-button" data-prompt-primary-action="send-prompt">Send</button>
+</form>
 <button id="hover" onmouseenter="document.body.dataset.hovered='yes'">Hover target</button>
 <img id="missing-alt" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" />
 <div id="drag-source" role="button" tabindex="0" draggable="true">Drag source</div>
@@ -1146,6 +1222,15 @@ document.querySelector('#entry').addEventListener('keydown', (event) => {
   document.body.dataset.key = event.key;
 });
 document.querySelector('#drop-target').addEventListener('drop', () => document.body.dataset.dropped='yes');
+document.querySelector('#prompt-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const editor = document.querySelector('#prompt');
+  document.body.dataset.submitStarted = 'yes';
+  await fetch('/chat/api/chat', { method: 'POST', body: editor.textContent || '' });
+  editor.textContent = '';
+  document.body.dataset.submitted = 'yes';
+  history.pushState({}, '', '/submitted');
+});
 </script>"#
                 .to_string(),
         ),

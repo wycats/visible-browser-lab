@@ -195,7 +195,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
         tool(
             "click",
             "Click",
-            "Click one accessibility reference after ownership and actionability checks. Use CSS only as an explicit fallback.",
+            "Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback.",
             click_schema(),
             action_result(),
             false,
@@ -1336,7 +1336,64 @@ fn page_action_properties() -> Vec<(&'static str, Value)> {
     vec![
         ("document_revision", string_schema()),
         ("observation", observation_schema()),
+        ("action", action_evidence_schema()),
     ]
+}
+
+fn action_evidence_schema() -> Value {
+    object_schema(
+        vec![
+            (
+                "delivery_mode",
+                enum_schema(&["browser_protocol_input", "semantic_dom_activation"]),
+            ),
+            (
+                "release_delivery",
+                enum_schema(&["chrome_ack", "dialog_event", "delivery_uncertain"]),
+            ),
+            ("delivery_uncertain", json!({"type":"boolean"})),
+            (
+                "resolved_element",
+                json!({"type":"object","additionalProperties":true}),
+            ),
+            (
+                "center_hit_test",
+                json!({"type":"object","additionalProperties":true}),
+            ),
+            (
+                "effect",
+                object_schema(
+                    vec![
+                        ("pre_url", string_schema()),
+                        ("post_url", string_schema()),
+                        ("url_changed", json!({"type":"boolean"})),
+                        ("network_event_count", integer_schema()),
+                        (
+                            "network_events",
+                            array_schema(json!({"type":"object","additionalProperties":true})),
+                        ),
+                        ("accessibility_changed", json!({"type":"boolean"})),
+                        ("accessibility_changed_node_count", integer_schema()),
+                    ],
+                    &[
+                        "pre_url",
+                        "post_url",
+                        "url_changed",
+                        "network_event_count",
+                        "network_events",
+                        "accessibility_changed",
+                        "accessibility_changed_node_count",
+                    ],
+                ),
+            ),
+        ],
+        &[
+            "delivery_mode",
+            "release_delivery",
+            "delivery_uncertain",
+            "effect",
+        ],
+    )
 }
 
 fn observation_schema() -> Value {
