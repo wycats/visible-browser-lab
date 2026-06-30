@@ -1381,8 +1381,6 @@ fn action_evidence_schema() -> Value {
                         "url_changed",
                         "network_event_count",
                         "network_events",
-                        "accessibility_changed",
-                        "accessibility_changed_node_count",
                     ],
                 ),
             ),

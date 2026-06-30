@@ -62,6 +62,7 @@ const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
 const DIAGNOSTICS_BUFFER_LIMIT: usize = 200;
+const ACTION_EVIDENCE_NETWORK_EVENT_LIMIT: usize = 20;
 const MAX_ANALYZABLE_TRACE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -3032,8 +3033,11 @@ async fn click_effect(
         .lock()
         .unwrap()
         .network_events(&target.id, Some(baseline.network_since));
-    let network_events = network_records(network_events)
+    let network_records = network_records(network_events);
+    let network_event_count = network_records.len();
+    let network_events = network_records
         .iter()
+        .take(ACTION_EVIDENCE_NETWORK_EVENT_LIMIT)
         .map(network_record_value)
         .collect::<Vec<_>>();
     let post_url = current.url;
@@ -3041,10 +3045,10 @@ async fn click_effect(
         pre_url: baseline.url.clone(),
         url_changed: post_url != baseline.url,
         post_url,
-        network_event_count: network_events.len(),
+        network_event_count,
         network_events,
-        accessibility_changed: false,
-        accessibility_changed_node_count: 0,
+        accessibility_changed: None,
+        accessibility_changed_node_count: None,
     })
 }
 
@@ -3110,11 +3114,13 @@ fn attach_delivery_detail(delivery: &mut Value, key: &str, detail: Value) {
     }
 }
 
-fn observation_change_summary(observation: &Observation) -> (bool, usize) {
+fn observation_change_summary(observation: &Observation) -> (Option<bool>, Option<usize>) {
     match observation {
-        Observation::Diff { diff } => (diff.changed_node_count > 0, diff.changed_node_count),
-        Observation::Snapshot { snapshot } => (true, snapshot.node_count),
-        Observation::None => (false, 0),
+        Observation::Diff { diff } => (
+            Some(diff.changed_node_count > 0),
+            Some(diff.changed_node_count),
+        ),
+        Observation::Snapshot { .. } | Observation::None => (None, None),
     }
 }
 

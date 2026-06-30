@@ -310,8 +310,10 @@ pub struct PageActionEffect {
     pub url_changed: bool,
     pub network_event_count: usize,
     pub network_events: Vec<Value>,
-    pub accessibility_changed: bool,
-    pub accessibility_changed_node_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility_changed_node_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
