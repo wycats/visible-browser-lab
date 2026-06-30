@@ -22,6 +22,8 @@ const CHROME_START_TIMEOUT: Duration = Duration::from_secs(15);
 const CHROME_START_RETRY: Duration = Duration::from_millis(50);
 const CHROME_PROFILE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_PAGE: &str = "data:text/html,<title>Visible%20Browser%20Lab</title>";
+const CHROME_LOG_CAPTURE_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_LOGS";
+const MAX_CHROME_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserLaunchMode {
@@ -59,6 +61,7 @@ pub async fn ensure_managed_chrome(
     tokio::fs::create_dir_all(&config.log_dir)
         .await
         .with_context(|| format!("failed to create `{}`", config.log_dir.display()))?;
+    truncate_large_chrome_logs(&config.log_dir)?;
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
     if let Some(endpoint) = healthy_active_endpoint(config).await {
@@ -419,18 +422,23 @@ fn launch_chrome(
     installation: &ChromeInstallation,
     launch_mode: BrowserLaunchMode,
 ) -> Result<Option<u32>> {
-    let args = chrome_arguments(config, launch_mode);
+    let capture_logs = chrome_log_capture_enabled();
+    let args = chrome_arguments_for(config, launch_mode, capture_logs);
 
     #[cfg(target_os = "macos")]
     if launch_mode == BrowserLaunchMode::Visible {
-        launch_macos_background(config, installation, &args)?;
+        launch_macos_background(config, installation, &args, capture_logs)?;
         return Ok(None);
     }
 
-    launch_direct(config, installation, &args, launch_mode)
+    launch_direct(config, installation, &args, launch_mode, capture_logs)
 }
 
-fn chrome_arguments(config: &RuntimeConfig, launch_mode: BrowserLaunchMode) -> Vec<OsString> {
+fn chrome_arguments_for(
+    config: &RuntimeConfig,
+    launch_mode: BrowserLaunchMode,
+    capture_logs: bool,
+) -> Vec<OsString> {
     let mut args = vec![
         "--remote-debugging-port=0".into(),
         format!("--user-data-dir={}", config.chrome_profile_dir.display()).into(),
@@ -439,9 +447,13 @@ fn chrome_arguments(config: &RuntimeConfig, launch_mode: BrowserLaunchMode) -> V
         "--disable-background-networking".into(),
         "--disable-component-update".into(),
         "--disable-sync".into(),
-        "--enable-logging".into(),
-        format!("--log-file={}", config.log_dir.join("chrome.log").display()).into(),
     ];
+    if capture_logs {
+        args.extend([
+            "--enable-logging".into(),
+            format!("--log-file={}", config.log_dir.join("chrome.log").display()).into(),
+        ]);
+    }
     if launch_mode == BrowserLaunchMode::Headless {
         args.push("--headless=new".into());
     }
@@ -484,6 +496,7 @@ fn launch_macos_background(
     config: &RuntimeConfig,
     installation: &ChromeInstallation,
     args: &[OsString],
+    capture_logs: bool,
 ) -> Result<()> {
     let application_bundle = installation.application_bundle.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -491,15 +504,20 @@ fn launch_macos_background(
             installation.executable.display()
         )
     })?;
-    let status = Command::new("/usr/bin/open")
+    let mut command = Command::new("/usr/bin/open");
+    command
         .arg("-g")
         .arg("-n")
         .arg("-a")
-        .arg(application_bundle)
-        .arg("--stdout")
-        .arg(config.log_dir.join("chrome.stdout.log"))
-        .arg("--stderr")
-        .arg(config.log_dir.join("chrome.stderr.log"))
+        .arg(application_bundle);
+    if capture_logs {
+        command
+            .arg("--stdout")
+            .arg(config.log_dir.join("chrome.stdout.log"))
+            .arg("--stderr")
+            .arg(config.log_dir.join("chrome.stderr.log"));
+    }
+    let status = command
         .arg("--args")
         .args(args)
         .status()
@@ -518,20 +536,24 @@ fn launch_direct(
     installation: &ChromeInstallation,
     args: &[OsString],
     launch_mode: BrowserLaunchMode,
+    capture_logs: bool,
 ) -> Result<Option<u32>> {
     #[cfg(target_os = "windows")]
     if launch_mode == BrowserLaunchMode::Visible {
         return launch_windows_background(installation, args);
     }
 
-    let stdout = append_log_file(&config.log_dir.join("chrome.stdout.log"))?;
-    let stderr = append_log_file(&config.log_dir.join("chrome.stderr.log"))?;
     let mut command = Command::new(&installation.executable);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+    command.args(args).stdin(Stdio::null());
+    if capture_logs {
+        let stdout = append_log_file(&config.log_dir.join("chrome.stdout.log"))?;
+        let stderr = append_log_file(&config.log_dir.join("chrome.stderr.log"))?;
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
 
     let child = command.spawn().with_context(|| {
         format!(
@@ -683,11 +705,50 @@ fn quote_windows_argument(argument: &std::ffi::OsStr) -> String {
 }
 
 fn append_log_file(path: &Path) -> Result<File> {
+    truncate_log_if_large(path)?;
     OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open `{}`", path.display()))
+}
+
+fn chrome_log_capture_enabled() -> bool {
+    std::env::var(CHROME_LOG_CAPTURE_ENV)
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn truncate_large_chrome_logs(log_dir: &Path) -> Result<()> {
+    for name in ["chrome.stderr.log", "chrome.stdout.log", "chrome.log"] {
+        truncate_log_if_large(&log_dir.join(name))?;
+    }
+    Ok(())
+}
+
+fn truncate_log_if_large(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() <= MAX_CHROME_LOG_BYTES {
+        return Ok(());
+    }
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to truncate oversized Chrome log `{}`",
+                path.display()
+            )
+        })?;
+    Ok(())
 }
 
 fn read_log_tail(path: &Path) -> Result<String> {
@@ -740,7 +801,7 @@ mod tests {
     #[test]
     fn chrome_arguments_use_dynamic_port_and_managed_profile() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments(&config, BrowserLaunchMode::Visible);
+        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -755,11 +816,39 @@ mod tests {
         assert!(!args.contains(&"--headless=new".into()));
     }
 
+    #[test]
+    fn chrome_logging_is_disabled_by_default() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(!args.contains(&"--enable-logging".into()));
+        assert!(!args.iter().any(|arg| arg.starts_with("--log-file=")));
+    }
+
+    #[test]
+    fn chrome_logging_can_be_enabled_for_diagnostics() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, true);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--enable-logging".into()));
+        assert!(args.contains(
+            &format!("--log-file={}", config.log_dir.join("chrome.log").display()).into()
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_visible_launch_suppresses_startup_window() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments(&config, BrowserLaunchMode::Visible);
+        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -773,7 +862,7 @@ mod tests {
     #[test]
     fn non_macos_visible_launch_keeps_startup_page() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments(&config, BrowserLaunchMode::Visible);
+        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -829,6 +918,17 @@ mod tests {
             startup_diagnostics(logs.path()),
             "chrome.log:\nchrome startup failure"
         );
+    }
+
+    #[test]
+    fn truncates_oversized_chrome_logs() {
+        let logs = tempfile::tempdir().unwrap();
+        let stderr = logs.path().join("chrome.stderr.log");
+        std::fs::write(&stderr, vec![b'x'; (MAX_CHROME_LOG_BYTES + 1) as usize]).unwrap();
+
+        truncate_large_chrome_logs(logs.path()).unwrap();
+
+        assert_eq!(std::fs::metadata(stderr).unwrap().len(), 0);
     }
 
     #[cfg(unix)]
