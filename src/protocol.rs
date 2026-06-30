@@ -303,10 +303,35 @@ pub enum Observation {
     Snapshot { snapshot: SnapshotResult },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageActionEffect {
+    pub pre_url: String,
+    pub post_url: String,
+    pub url_changed: bool,
+    pub network_event_count: usize,
+    pub network_events: Vec<Value>,
+    pub accessibility_changed: bool,
+    pub accessibility_changed_node_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageActionEvidence {
+    pub delivery_mode: String,
+    pub release_delivery: String,
+    pub delivery_uncertain: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_element: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center_hit_test: Option<Value>,
+    pub effect: PageActionEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PageActionResult {
     pub document_revision: String,
     pub observation: Observation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<PageActionEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
