@@ -1361,6 +1361,14 @@ fn action_evidence_schema() -> Value {
                 json!({"type":"object","additionalProperties":true}),
             ),
             (
+                "dispatch_point",
+                json!({"type":"object","additionalProperties":true}),
+            ),
+            (
+                "semantic_activation",
+                json!({"type":"object","additionalProperties":true}),
+            ),
+            (
                 "effect",
                 object_schema(
                     vec![

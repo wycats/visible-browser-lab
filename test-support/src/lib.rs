@@ -506,7 +506,7 @@ pub fn run_live_smoke(
         bail!("fill did not resolve the iframe element reference: {frame_value}");
     }
 
-    client.call_tool(
+    let frame_click = client.call_tool(
         "click",
         json!({
             "agent_session_id": first_session,
@@ -530,7 +530,7 @@ pub fn run_live_smoke(
     )?;
     if frame_clicked.get("value").and_then(Value::as_str) != Some("yes") {
         bail!(
-            "click did not use the iframe element's top-level viewport coordinates: {frame_clicked}"
+            "click did not use the iframe element's top-level viewport coordinates: clicked={frame_clicked}, action={frame_click}"
         );
     }
 
@@ -685,6 +685,7 @@ pub fn run_live_smoke(
         json!({
             "agent_session_id": first_session,
             "tab_id": transferable_tab.tab_id,
+            "target": { "ref": textbox_ref },
             "key": "Enter"
         }),
         Duration::from_secs(20),

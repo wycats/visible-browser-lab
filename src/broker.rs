@@ -1146,6 +1146,7 @@ impl BrowserBackend {
         &self,
         target: &CdpTarget,
         backend_node_id: i64,
+        frame_id: Option<&str>,
         button: &str,
         count: u8,
         modifiers: &[String],
@@ -1159,7 +1160,7 @@ impl BrowserBackend {
             _ => {
                 self.cdp_client()
                     .await?
-                    .click_backend_node(target, backend_node_id, button, count, modifiers)
+                    .click_backend_node(target, backend_node_id, frame_id, button, count, modifiers)
                     .await
             }
         }
@@ -1508,6 +1509,25 @@ impl BrowserBackend {
                 self.cdp_client()
                     .await?
                     .press_key(target, key, modifiers)
+                    .await
+            }
+        }
+    }
+
+    async fn press_key_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().press_key(target, key, modifiers),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .press_key_backend_node(target, backend_node_id, key, modifiers)
                     .await
             }
         }
@@ -2887,6 +2907,7 @@ async fn broker_click(
                 state.browser.click_backend_node(
                     &target,
                     element.backend_node_id,
+                    Some(&element.frame_id),
                     button,
                     count,
                     &params.modifiers,
@@ -2932,6 +2953,9 @@ async fn broker_click(
         attach_delivery_detail(&mut delivery, "semantic_activation", semantic);
         effect = wait_for_submit_effect(state, &target, &baseline).await?;
     }
+    if delivery.get("semantic_activation").is_some() {
+        delivery_mode = "semantic_dom_activation".to_string();
+    }
 
     let mut result = post_action_observation(
         state,
@@ -2951,6 +2975,8 @@ async fn broker_click(
         delivery_uncertain: click_delivery_uncertain(&delivery),
         resolved_element: delivery.get("resolved_element").cloned(),
         center_hit_test: delivery.get("center_hit_test").cloned(),
+        dispatch_point: delivery.get("dispatch_point").cloned(),
+        semantic_activation: delivery.get("semantic_activation").cloned(),
         effect,
     });
     Ok(result)
@@ -3607,26 +3633,38 @@ async fn broker_press_key_v3(
         {
             ResolvedElementTarget::Reference(element) => {
                 retry_element_action(params.timeout_ms, || {
-                    state
-                        .browser
-                        .type_text_backend_node(&target, element.backend_node_id, "")
+                    state.browser.press_key_backend_node(
+                        &target,
+                        element.backend_node_id,
+                        &params.key,
+                        &params.modifiers,
+                    )
                 })
                 .await?;
             }
             ResolvedElementTarget::Css(selector) => {
+                let backend_node_id = state
+                    .browser
+                    .resolve_css_backend_node(&target, &selector)
+                    .await?;
                 retry_element_action(params.timeout_ms, || {
-                    state.browser.type_text_css(&target, &selector, "")
+                    state.browser.press_key_backend_node(
+                        &target,
+                        backend_node_id,
+                        &params.key,
+                        &params.modifiers,
+                    )
                 })
                 .await?;
             }
         }
     } else {
         ensure_focused_document_for_raw_input(state, &target, &params.tab_id).await?;
+        state
+            .browser
+            .press_key(&target, &params.key, &params.modifiers)
+            .await?;
     }
-    state
-        .browser
-        .press_key(&target, &params.key, &params.modifiers)
-        .await?;
     post_action_observation(
         state,
         &params.agent_session_id,
