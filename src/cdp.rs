@@ -1051,7 +1051,7 @@ impl CdpClient {
     ) -> Result<Value, BrowserToolError> {
         let backend_node_id = self.resolve_css_backend_node(target, selector).await?;
         let mut evidence = self
-            .click_backend_node(target, backend_node_id, button, count, modifiers)
+            .click_backend_node(target, backend_node_id, None, button, count, modifiers)
             .await?;
         if let Some(object) = evidence.as_object_mut() {
             object.insert("selector".to_string(), json!(selector));
@@ -1063,6 +1063,7 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
         backend_node_id: i64,
+        frame_id: Option<&str>,
         button: &str,
         count: u8,
         modifiers: &[String],
@@ -1075,7 +1076,7 @@ impl CdpClient {
             .call_on_element(
                 &page,
                 &connection,
-                object_id,
+                object_id.clone(),
                 r#"async function() {
   if (!this.isConnected) return { state: "stale" };
   this.scrollIntoView({ block: "center", inline: "center" });
@@ -1091,6 +1092,7 @@ impl CdpClient {
   const y = rect.top + rect.height / 2;
   const hit = this.ownerDocument.elementFromPoint(x, y);
   if (hit !== this && !this.contains(hit)) return { state: "obscured" };
+  if (typeof this.focus === "function") this.focus({ preventScroll: true });
   const tagName = this.tagName ? this.tagName.toLowerCase() : "";
   const type = (this.getAttribute("type") || (tagName === "button" ? "submit" : "")).toLowerCase();
   const form = this.form || this.closest("form");
@@ -1132,28 +1134,11 @@ impl CdpClient {
             )
             .await?;
         actionable_state(actionability.clone())?;
-        let quads = self
-            .runtime
-            .page_command(
-                &connection,
-                page.execute(
-                    GetContentQuadsParams::builder()
-                        .backend_node_id(BackendNodeId::new(backend_node_id))
-                        .build(),
-                ),
-                "read referenced element content quad",
-            )
+        self.install_click_probe(&page, &connection, object_id.clone())
             .await?;
-        let point = quads
-            .result
-            .quads
-            .first()
-            .ok_or_else(|| {
-                BrowserToolError::element_not_actionable(
-                    "element has no content quad in the top-level viewport",
-                )
-            })
-            .and_then(|quad| content_quad_point(quad.inner()))?;
+        let (point, dispatch_point) = self
+            .backend_node_dispatch_point(&page, &connection, backend_node_id, frame_id)
+            .await?;
         let dispatch = self
             .dispatch_click(
                 &page,
@@ -1166,7 +1151,43 @@ impl CdpClient {
                 },
             )
             .await?;
+        let click_event =
+            if dispatch.get("release_delivery").and_then(Value::as_str) == Some("dialog_event") {
+                json!({
+                    "state": "skipped",
+                    "reason": "dialog_event"
+                })
+            } else {
+                self.read_click_probe(&page, &connection, object_id.clone())
+                    .await
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "state": "unknown",
+                            "error": error.message
+                        })
+                    })
+            };
         let mut evidence = actionability;
+        let submit_candidate = evidence
+            .get("submit_candidate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let semantic_activation = if !submit_candidate
+            && click_event
+                .get("observed")
+                .and_then(Value::as_bool)
+                .is_some_and(|observed| !observed)
+        {
+            let semantic = self
+                .semantic_click_object(&page, &connection, object_id)
+                .await?;
+            Some(json!({
+                "reason": "browser_protocol_click_event_not_observed",
+                "activation": semantic
+            }))
+        } else {
+            None
+        };
         if let Some(object) = evidence.as_object_mut() {
             if let Some(resolved_element) = object
                 .get_mut("resolved_element")
@@ -1175,6 +1196,11 @@ impl CdpClient {
                 resolved_element.insert("backend_node_id".to_string(), json!(backend_node_id));
             }
             object.insert("dispatch".to_string(), dispatch);
+            object.insert("dispatch_point".to_string(), dispatch_point);
+            object.insert("click_event".to_string(), click_event);
+            if let Some(semantic_activation) = semantic_activation {
+                object.insert("semantic_activation".to_string(), semantic_activation);
+            }
         }
         Ok(evidence)
     }
@@ -1840,16 +1866,188 @@ impl CdpClient {
         key: &str,
         modifiers: &[String],
     ) -> Result<(), BrowserToolError> {
-        let key_event = key_event_for(key, modifiers)?;
         let (page, connection) = self.page(&target.id).await?;
+        self.dispatch_key(&page, &connection, key, modifiers).await
+    }
 
-        for event_type in [DispatchKeyEventType::KeyDown, DispatchKeyEventType::KeyUp] {
-            let params = key_event.params(event_type)?;
-            self.runtime
-                .page_command(&connection, page.execute(params), "dispatch keyboard input")
+    pub async fn press_key_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let object_id = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let state = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id.clone(),
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  this.scrollIntoView({ block: "center", inline: "center" });
+  const rect = this.getBoundingClientRect();
+  const style = this.ownerDocument.defaultView.getComputedStyle(this);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return { state: "hidden" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if (typeof this.focus === "function") this.focus({ preventScroll: true });
+  return { state: "ready" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(state)?;
+        self.install_key_probe(&page, &connection, object_id.clone())
+            .await?;
+        self.dispatch_key(&page, &connection, key, modifiers)
+            .await?;
+        let key_event = self
+            .read_key_probe(&page, &connection, object_id.clone())
+            .await
+            .unwrap_or_else(|_| json!({ "state": "unknown" }));
+        if key_event
+            .get("observed")
+            .and_then(Value::as_bool)
+            .is_some_and(|observed| !observed)
+        {
+            self.semantic_key_object(&page, &connection, object_id, key, modifiers)
                 .await?;
         }
         Ok(())
+    }
+
+    async fn dispatch_key(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let key_event = key_event_for(key, modifiers)?;
+        for event_type in [DispatchKeyEventType::KeyDown, DispatchKeyEventType::KeyUp] {
+            let params = key_event.params(event_type)?;
+            self.runtime
+                .page_command(connection, page.execute(params), "dispatch keyboard input")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn install_key_probe(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+    ) -> Result<(), BrowserToolError> {
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  const key = "__visibleBrowserLabKeyProbe";
+  if (this[key] && this[key].listener) {
+    this.removeEventListener("keydown", this[key].listener, true);
+  }
+  const target = this;
+  const listener = function(event) {
+    target[key] = {
+      observed: true,
+      key: event.key,
+      code: event.code,
+      is_trusted: event.isTrusted,
+      default_prevented: event.defaultPrevented
+    };
+  };
+  this[key] = { observed: false, listener };
+  this.addEventListener("keydown", listener, { capture: true, once: true });
+  return { state: "ready" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result)
+    }
+
+    async fn read_key_probe(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+    ) -> Result<Value, BrowserToolError> {
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  const key = "__visibleBrowserLabKeyProbe";
+  const probe = this[key] || { observed: false };
+  if (probe.listener) this.removeEventListener("keydown", probe.listener, true);
+  delete this[key];
+  return {
+    state: "ready",
+    observed: !!probe.observed,
+    key: probe.key ?? null,
+    code: probe.code ?? null,
+    is_trusted: probe.is_trusted ?? null,
+    default_prevented: probe.default_prevented ?? null
+  };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result.clone())?;
+        Ok(result)
+    }
+
+    async fn semantic_key_object(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+        key: &str,
+        modifiers: &[String],
+    ) -> Result<(), BrowserToolError> {
+        let modifiers = modifiers.iter().map(|modifier| json!(modifier)).collect();
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function(key, modifiers) {
+  if (!this.isConnected) return { state: "stale" };
+  const set = new Set(modifiers || []);
+  const init = {
+    key,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    altKey: set.has("Alt"),
+    ctrlKey: set.has("Control") || set.has("Ctrl"),
+    metaKey: set.has("Meta") || set.has("Command"),
+    shiftKey: set.has("Shift")
+  };
+  const down = new KeyboardEvent("keydown", init);
+  const up = new KeyboardEvent("keyup", init);
+  this.dispatchEvent(down);
+  this.dispatchEvent(up);
+  return { state: "ready", semantic_activation: "keyboard_event", default_prevented: down.defaultPrevented || up.defaultPrevented };
+}"#,
+                vec![
+                    CallArgument::builder()
+                        .value(json!(key))
+                        .build(),
+                    CallArgument::builder().value(Value::Array(modifiers)).build(),
+                ],
+            )
+            .await?;
+        actionable_state(result)
     }
 
     pub async fn diagnostics_monitor(
@@ -2599,6 +2797,142 @@ impl CdpClient {
         response.result.result.value.ok_or_else(|| {
             BrowserToolError::chrome_unavailable("element operation omitted its result")
         })
+    }
+
+    async fn backend_node_dispatch_point(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+    ) -> Result<(ClickPoint, Value), BrowserToolError> {
+        let quads = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    GetContentQuadsParams::builder()
+                        .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .build(),
+                ),
+                "read referenced element content quad",
+            )
+            .await?;
+        let point = quads
+            .result
+            .quads
+            .first()
+            .ok_or_else(|| {
+                BrowserToolError::element_not_actionable(
+                    "element has no content quad in the top-level viewport",
+                )
+            })
+            .and_then(|quad| content_quad_point(quad.inner()))?;
+
+        Ok((
+            point,
+            json!({
+                "coordinate_space": "top_level_viewport",
+                "x": point.x,
+                "y": point.y,
+                "frame_id": frame_id
+            }),
+        ))
+    }
+
+    async fn install_click_probe(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+    ) -> Result<(), BrowserToolError> {
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  const key = "__visibleBrowserLabClickProbe";
+  if (this[key] && this[key].listener) {
+    this.removeEventListener("click", this[key].listener, true);
+  }
+  const target = this;
+  const listener = function(event) {
+    target[key] = {
+      observed: true,
+      is_trusted: event.isTrusted,
+      button: event.button,
+      detail: event.detail,
+      default_prevented: event.defaultPrevented
+    };
+  };
+  this[key] = { observed: false, listener };
+  this.addEventListener("click", listener, { capture: true, once: true });
+  return { state: "ready" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result)
+    }
+
+    async fn read_click_probe(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+    ) -> Result<Value, BrowserToolError> {
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  const key = "__visibleBrowserLabClickProbe";
+  const probe = this[key] || { observed: false };
+  if (probe.listener) this.removeEventListener("click", probe.listener, true);
+  delete this[key];
+  return {
+    state: "ready",
+    observed: !!probe.observed,
+    is_trusted: probe.is_trusted ?? null,
+    button: probe.button ?? null,
+    detail: probe.detail ?? null,
+    default_prevented: probe.default_prevented ?? null
+  };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result.clone())?;
+        Ok(result)
+    }
+
+    async fn semantic_click_object(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        object_id: RemoteObjectId,
+    ) -> Result<Value, BrowserToolError> {
+        let result = self
+            .call_on_element(
+                page,
+                connection,
+                object_id,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if (typeof this.click !== "function") return { state: "not_clickable" };
+  this.click();
+  return { state: "ready", semantic_activation: "element_click" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result.clone())?;
+        Ok(result)
     }
 
     async fn evaluate_on_object(

@@ -325,6 +325,10 @@ pub struct PageActionEvidence {
     pub resolved_element: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub center_hit_test: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_point: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_activation: Option<Value>,
     pub effect: PageActionEffect,
 }
 
