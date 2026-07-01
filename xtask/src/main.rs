@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use agent_surface_contract::{PRODUCTION_TOOLS, ToolDefinition, hybrid_catalog};
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde_json::{Value, json};
@@ -83,6 +84,7 @@ fn main() -> Result<()> {
         "validate" => validate(),
         "package" => package(PackageArgs::parse(args.collect())?),
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
+        "vscode-manifest" => vscode_manifest(VscodeManifestArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
@@ -105,6 +107,7 @@ usage:
   cargo xtask validate
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
   cargo xtask checksums [--dir <dir>]
+    cargo xtask vscode-manifest [--out <path>] [--version <semver>]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -181,6 +184,44 @@ impl PackageArgs {
 #[derive(Debug)]
 struct ChecksumsArgs {
     dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct VscodeManifestArgs {
+    out: Option<PathBuf>,
+    version: Option<String>,
+}
+
+impl VscodeManifestArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut out = None;
+        let mut version = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--out" => {
+                    index += 1;
+                    out = Some(PathBuf::from(
+                        args.get(index).context("missing value after --out")?,
+                    ));
+                }
+                "--version" => {
+                    index += 1;
+                    version = Some(
+                        args.get(index)
+                            .context("missing value after --version")?
+                            .to_string(),
+                    );
+                }
+                arg => bail!("unknown vscode-manifest argument `{arg}`"),
+            }
+
+            index += 1;
+        }
+
+        Ok(Self { out, version })
+    }
 }
 
 impl ChecksumsArgs {
@@ -330,12 +371,18 @@ impl InstallSmokeArgs {
 
 fn validate() -> Result<()> {
     let root = repo_root()?;
+    let package_version = cargo_package_version(&root)?;
 
     for path in [
         ".codex-plugin/plugin.json",
         "skills/visible-browser-lab/SKILL.md",
         "Cargo.toml",
         "Cargo.lock",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "vscode-extension/package.json",
+        "vscode-extension/src/extension.ts",
     ] {
         let path = root.join(path);
         if !path.is_file() {
@@ -343,23 +390,26 @@ fn validate() -> Result<()> {
         }
     }
     validate_source_package_contract(&root)?;
+    validate_vscode_extension_manifest(&vscode_extension_manifest(&package_version)?)?;
     agent_eval::validate_catalog()?;
 
-    for forbidden in [
-        "package.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "package-lock.json",
-    ] {
+    for forbidden in ["yarn.lock", "package-lock.json"] {
         let path = root.join(forbidden);
         if path.exists() {
-            bail!("Node packaging file is not allowed for trusted binary releases: {forbidden}");
+            bail!("unsupported Node package-manager file is present: {forbidden}");
         }
     }
 
     let gitignore =
         fs::read_to_string(root.join(".gitignore")).context("failed to read .gitignore")?;
-    for required in [".DS_Store", ".exo/runtime/", "target/", "out/"] {
+    for required in [
+        ".DS_Store",
+        ".exo/runtime/",
+        "target/",
+        "out/",
+        "vscode-extension/dist/",
+        "vscode-extension/node_modules/",
+    ] {
         if !gitignore.lines().any(|line| line.trim() == required) {
             bail!(".gitignore must ignore `{required}`");
         }
@@ -437,6 +487,190 @@ fn checksums(args: ChecksumsArgs) -> Result<()> {
     fs::write(&sums_path, output)
         .with_context(|| format!("failed to write `{}`", sums_path.display()))?;
     println!("wrote {}", sums_path.display());
+    Ok(())
+}
+
+fn vscode_manifest(args: VscodeManifestArgs) -> Result<()> {
+    let root = repo_root()?;
+    let version = release_version(&root, args.version.as_deref())?;
+    let manifest = vscode_extension_manifest(&version)?;
+    validate_vscode_extension_manifest(&manifest)?;
+
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    match args.out {
+        Some(path) => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            fs::create_dir_all(
+                path.parent()
+                    .context("VS Code manifest output omitted parent")?,
+            )?;
+            fs::write(&path, bytes)
+                .with_context(|| format!("failed to write `{}`", path.display()))?;
+            println!("wrote {}", path.display());
+        }
+        None => {
+            std::io::stdout().write_all(&bytes)?;
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn vscode_extension_manifest(version: &str) -> Result<Value> {
+    let tools = production_tool_definitions()?;
+    let language_model_tools = tools
+        .iter()
+        .map(vscode_language_model_tool)
+        .collect::<Vec<_>>();
+    let activation_events = tools
+        .iter()
+        .map(|tool| format!("onLanguageModelTool:{}", vscode_tool_name(&tool.name)))
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "name": "visible-browser-lab",
+        "displayName": "Visible Browser Lab",
+        "description": "Native VS Code language model tools for lease-scoped visible Chrome interaction.",
+        "version": version,
+        "publisher": "wycats",
+        "engines": {
+            "vscode": "^1.105.0"
+        },
+        "categories": ["AI", "Other"],
+        "activationEvents": activation_events,
+        "main": "./dist/extension.js",
+        "contributes": {
+            "languageModelTools": language_model_tools,
+            "configuration": {
+                "title": "Visible Browser Lab",
+                "properties": {
+                    "visibleBrowserLab.binaryPath": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Optional path to a development or custom `visible-browser-lab-mcp` binary. Empty uses the packaged binary."
+                    },
+                    "visibleBrowserLab.stateDir": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Optional runtime state directory passed through `VISIBLE_BROWSER_LAB_STATE_DIR`. Empty uses the platform cache directory."
+                    },
+                    "visibleBrowserLab.cdpEndpoint": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Optional Chrome DevTools HTTP endpoint passed through `VISIBLE_BROWSER_CDP_ENDPOINT`. Empty uses managed Chrome."
+                    },
+                    "visibleBrowserLab.cdpPort": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Optional Chrome DevTools port passed through `VISIBLE_BROWSER_CDP_PORT`. Ignored when an endpoint is configured."
+                    },
+                    "visibleBrowserLab.chromePath": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Optional Chromium-family executable path passed through `VISIBLE_BROWSER_LAB_CHROME_PATH`."
+                    }
+                }
+            }
+        },
+        "visibleBrowserLab": {
+            "serverInstructions": agent_surface_contract::SERVER_INSTRUCTIONS,
+            "runtimeBinary": "bin/visible-browser-lab-mcp"
+        }
+    }))
+}
+
+fn production_tool_definitions() -> Result<Vec<ToolDefinition>> {
+    let tools = hybrid_catalog()
+        .into_iter()
+        .filter(|definition| PRODUCTION_TOOLS.contains(&definition.name.as_str()))
+        .collect::<Vec<_>>();
+    if tools.len() != PRODUCTION_TOOLS.len() {
+        bail!(
+            "agent surface catalog mismatch: expected {} production tools, found {}",
+            PRODUCTION_TOOLS.len(),
+            tools.len()
+        );
+    }
+    Ok(tools)
+}
+
+fn vscode_language_model_tool(tool: &ToolDefinition) -> Value {
+    json!({
+        "name": vscode_tool_name(&tool.name),
+        "displayName": tool.title,
+        "userDescription": tool.description,
+        "modelDescription": vscode_model_description(tool),
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": vscode_tool_reference_name(&tool.name),
+        "icon": "$(browser)",
+        "inputSchema": tool.input_schema,
+    })
+}
+
+fn vscode_tool_name(tool_name: &str) -> String {
+    format!("visible_browser_lab_{tool_name}")
+}
+
+fn vscode_tool_reference_name(tool_name: &str) -> String {
+    format!("vbl_{tool_name}")
+}
+
+fn vscode_model_description(tool: &ToolDefinition) -> String {
+    format!(
+        "{} Backed by Visible Browser Lab's shared broker surface. Use start_session first and pass only tab_id values owned by that session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        tool.description
+    )
+}
+
+fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
+    let tools = production_tool_definitions()?;
+    let contributions = manifest["contributes"]["languageModelTools"]
+        .as_array()
+        .context("VS Code manifest omitted contributes.languageModelTools")?;
+    if contributions.len() != tools.len() {
+        bail!(
+            "VS Code manifest advertises {} tools; expected {}",
+            contributions.len(),
+            tools.len()
+        );
+    }
+
+    let activation_events = manifest["activationEvents"]
+        .as_array()
+        .context("VS Code manifest omitted activationEvents")?;
+    let mut reference_names = std::collections::BTreeSet::new();
+
+    for tool in &tools {
+        let expected_name = vscode_tool_name(&tool.name);
+        let contribution = contributions
+            .iter()
+            .find(|candidate| candidate["name"].as_str() == Some(&expected_name))
+            .with_context(|| format!("VS Code manifest omitted tool `{expected_name}`"))?;
+        if contribution["inputSchema"] != tool.input_schema {
+            bail!("VS Code input schema for `{expected_name}` does not match the shared catalog");
+        }
+        if contribution["displayName"].as_str() != Some(tool.title.as_str()) {
+            bail!("VS Code displayName for `{expected_name}` does not match the shared catalog");
+        }
+        let reference_name = contribution["toolReferenceName"]
+            .as_str()
+            .with_context(|| format!("VS Code tool `{expected_name}` omitted toolReferenceName"))?;
+        if !reference_names.insert(reference_name.to_string()) {
+            bail!("VS Code tool reference `{reference_name}` is not unique");
+        }
+        let activation_event = format!("onLanguageModelTool:{expected_name}");
+        if !activation_events
+            .iter()
+            .any(|event| event.as_str() == Some(&activation_event))
+        {
+            bail!("VS Code manifest omitted activation event `{activation_event}`");
+        }
+    }
+
     Ok(())
 }
 

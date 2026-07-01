@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    chrome::{ChromeInstallation, discover_chrome},
+    chrome::{ChromeFamily, ChromeInstallation, discover_chrome},
     config::{RuntimeConfig, RuntimeMode},
 };
 
@@ -429,7 +429,7 @@ fn launch_chrome(
     launch_mode: BrowserLaunchMode,
 ) -> Result<Option<u32>> {
     let capture_logs = chrome_log_capture_enabled();
-    let args = chrome_arguments_for(config, launch_mode, capture_logs);
+    let args = chrome_arguments_for(config, installation.family, launch_mode, capture_logs);
 
     #[cfg(target_os = "macos")]
     if launch_mode == BrowserLaunchMode::Visible {
@@ -442,6 +442,7 @@ fn launch_chrome(
 
 fn chrome_arguments_for(
     config: &RuntimeConfig,
+    family: ChromeFamily,
     launch_mode: BrowserLaunchMode,
     capture_logs: bool,
 ) -> Vec<OsString> {
@@ -454,6 +455,12 @@ fn chrome_arguments_for(
         "--disable-component-update".into(),
         "--disable-sync".into(),
     ];
+
+    #[cfg(target_os = "macos")]
+    if family == ChromeFamily::ChromeForTesting {
+        args.push("--use-mock-keychain".into());
+    }
+
     if capture_logs {
         args.extend([
             "--enable-logging".into(),
@@ -810,7 +817,12 @@ mod tests {
     #[test]
     fn chrome_arguments_use_dynamic_port_and_managed_profile() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -828,7 +840,12 @@ mod tests {
     #[test]
     fn chrome_logging_is_disabled_by_default() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -841,7 +858,12 @@ mod tests {
     #[test]
     fn chrome_logging_can_be_enabled_for_diagnostics() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, true);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            true,
+        );
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -855,9 +877,50 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn chrome_for_testing_uses_mock_keychain_on_macos() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::ChromeForTesting,
+            BrowserLaunchMode::Visible,
+            false,
+        );
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--use-mock-keychain".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordinary_chrome_does_not_use_mock_keychain_on_macos() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(!args.contains(&"--use-mock-keychain".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_visible_launch_suppresses_startup_window() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -871,7 +934,12 @@ mod tests {
     #[test]
     fn non_macos_visible_launch_keeps_startup_page() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
-        let args = chrome_arguments_for(&config, BrowserLaunchMode::Visible, false);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy())

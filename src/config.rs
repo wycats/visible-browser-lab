@@ -38,6 +38,8 @@ pub struct Cli {
 pub enum Command {
     #[command(about = "Run the tab-lease broker process")]
     Broker(BrokerArgs),
+    #[command(about = "Use the browser tool surface without the MCP transport")]
+    Surface(SurfaceArgs),
 }
 
 #[derive(Debug, Args)]
@@ -54,6 +56,29 @@ impl BrokerArgs {
 
         config
     }
+}
+
+#[derive(Debug, Args)]
+pub struct SurfaceArgs {
+    #[command(subcommand)]
+    pub command: SurfaceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SurfaceCommand {
+    #[command(about = "Print the agent tool catalog as JSON")]
+    Catalog,
+    #[command(about = "Invoke one browser tool with JSON parameters from stdin")]
+    Call(SurfaceCallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SurfaceCallArgs {
+    #[arg(value_name = "TOOL")]
+    pub tool: String,
+
+    #[arg(long, value_name = "DIR")]
+    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

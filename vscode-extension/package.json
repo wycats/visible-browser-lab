@@ -1,0 +1,70 @@
+{
+  "name": "visible-browser-lab",
+  "displayName": "Visible Browser Lab",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "Native VS Code language model tools for lease-scoped visible Chrome interaction.",
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "publisher": "wycats",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format": "oxfmt --write package.json tsconfig.json src",
+    "format:check": "oxfmt --check package.json tsconfig.json src",
+    "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.105.0",
+    "oxfmt": "^0.56.0",
+    "oxlint": "^1.71.0",
+    "oxlint-tsgolint": "^0.23.0",
+    "typescript": "^5.9.0"
+  },
+  "contributes": {
+    "languageModelTools": [],
+    "configuration": {
+      "title": "Visible Browser Lab",
+      "properties": {
+        "visibleBrowserLab.binaryPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional path to a development or custom `visible-browser-lab-mcp` binary. Empty uses the packaged binary."
+        },
+        "visibleBrowserLab.stateDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional runtime state directory passed through `VISIBLE_BROWSER_LAB_STATE_DIR`. Empty uses the platform cache directory."
+        },
+        "visibleBrowserLab.cdpEndpoint": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional Chrome DevTools HTTP endpoint passed through `VISIBLE_BROWSER_CDP_ENDPOINT`. Empty uses managed Chrome."
+        },
+        "visibleBrowserLab.cdpPort": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional Chrome DevTools port passed through `VISIBLE_BROWSER_CDP_PORT`. Ignored when an endpoint is configured."
+        },
+        "visibleBrowserLab.chromePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional Chromium-family executable path passed through `VISIBLE_BROWSER_LAB_CHROME_PATH`."
+        }
+      }
+    }
+  },
+  "activationEvents": [],
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "visibleBrowserLab": {
+    "serverInstructions": "Generated during packaging by `cargo xtask vscode-manifest`.",
+    "runtimeBinary": "bin/visible-browser-lab-mcp"
+  }
+}
