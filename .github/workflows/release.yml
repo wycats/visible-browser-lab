@@ -332,6 +332,41 @@ jobs:
         with:
           subject-path: out/packages/*
 
+  # Branch protection requires this single context. It reports success when
+  # the dry-run pipeline completed, or when the classifier decided the change
+  # does not affect release artifacts.
+  conclusion:
+    name: Release dry-run complete
+    needs:
+      - changes
+      - tests
+      - build
+      - package
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate required results
+        shell: bash
+        run: |
+          set -euo pipefail
+          changes='${{ needs.changes.result }}'
+          required='${{ needs.changes.outputs.required }}'
+          build='${{ needs.build.result }}'
+          package='${{ needs.package.result }}'
+          if [[ "$changes" != "success" ]]; then
+            echo "Classifier result: $changes" >&2
+            exit 1
+          fi
+          if [[ "$required" != "true" ]]; then
+            echo "Release dry-run not required for this change"
+            exit 0
+          fi
+          if [[ "$build" != "success" || "$package" != "success" ]]; then
+            echo "Build result: $build; package result: $package" >&2
+            exit 1
+          fi
+          echo "Release dry-run requirements satisfied"
+
   publish:
     name: Publish GitHub Release
     needs: package
