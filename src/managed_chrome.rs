@@ -61,7 +61,13 @@ pub async fn ensure_managed_chrome(
     tokio::fs::create_dir_all(&config.log_dir)
         .await
         .with_context(|| format!("failed to create `{}`", config.log_dir.display()))?;
-    truncate_large_chrome_logs(&config.log_dir)?;
+    if let Err(error) = truncate_large_chrome_logs(&config.log_dir) {
+        tracing::warn!(
+            %error,
+            log_dir = %config.log_dir.display(),
+            "failed to truncate oversized managed Chrome logs"
+        );
+    }
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
     if let Some(endpoint) = healthy_active_endpoint(config).await {
@@ -732,7 +738,10 @@ fn truncate_large_chrome_logs(log_dir: &Path) -> Result<()> {
 }
 
 fn truncate_log_if_large(path: &Path) -> Result<()> {
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_file() {
         return Ok(());
     };
     if metadata.len() <= MAX_CHROME_LOG_BYTES {
@@ -929,6 +938,35 @@ mod tests {
         truncate_large_chrome_logs(logs.path()).unwrap();
 
         assert_eq!(std::fs::metadata(stderr).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn skips_non_regular_chrome_log_paths() {
+        let logs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(logs.path().join("chrome.stderr.log")).unwrap();
+
+        truncate_large_chrome_logs(logs.path()).unwrap();
+
+        assert!(logs.path().join("chrome.stderr.log").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_chrome_log_paths() {
+        use std::os::unix::fs::symlink;
+
+        let logs = tempfile::tempdir().unwrap();
+        let target = logs.path().join("target.log");
+        let link = logs.path().join("chrome.stderr.log");
+        std::fs::write(&target, vec![b'x'; (MAX_CHROME_LOG_BYTES + 1) as usize]).unwrap();
+        symlink(&target, &link).unwrap();
+
+        truncate_large_chrome_logs(logs.path()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(target).unwrap().len(),
+            MAX_CHROME_LOG_BYTES + 1
+        );
     }
 
     #[cfg(unix)]
