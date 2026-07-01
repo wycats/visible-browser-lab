@@ -240,6 +240,13 @@ expensive Chrome state. If the spawn cost becomes user-visible, the CLI surface
 can evolve into a long-lived subprocess protocol behind the same VS Code tool
 contract.
 
+Cancellation in the first adapter is host-side: ending the wrapper process
+reports cancellation to VS Code, while a browser action the broker has already
+dispatched runs to completion. Lease ownership bounds the effect to the
+session's own tabs, and the structured result of a retried call reflects the
+true page state. A broker-level cancel channel that aborts in-flight Chrome
+operations is follow-up work on the same `surface` boundary.
+
 The repository gains a small amount of Node and TypeScript tooling for the VS
 Code extension. That is a real cost for a project whose release path has been
 intentionally Rust-native. The constraint is therefore explicit: Node builds the

@@ -107,7 +107,7 @@ usage:
   cargo xtask validate
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
   cargo xtask checksums [--dir <dir>]
-    cargo xtask vscode-manifest [--out <path>] [--version <semver>]
+    cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -190,12 +190,14 @@ struct ChecksumsArgs {
 struct VscodeManifestArgs {
     out: Option<PathBuf>,
     version: Option<String>,
+    sync: bool,
 }
 
 impl VscodeManifestArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         let mut out = None;
         let mut version = None;
+        let mut sync = false;
         let mut index = 0;
 
         while index < args.len() {
@@ -214,13 +216,14 @@ impl VscodeManifestArgs {
                             .to_string(),
                     );
                 }
+                "--sync" => sync = true,
                 arg => bail!("unknown vscode-manifest argument `{arg}`"),
             }
 
             index += 1;
         }
 
-        Ok(Self { out, version })
+        Ok(Self { out, version, sync })
     }
 }
 
@@ -371,7 +374,6 @@ impl InstallSmokeArgs {
 
 fn validate() -> Result<()> {
     let root = repo_root()?;
-    let package_version = cargo_package_version(&root)?;
 
     for path in [
         ".codex-plugin/plugin.json",
@@ -390,7 +392,7 @@ fn validate() -> Result<()> {
         }
     }
     validate_source_package_contract(&root)?;
-    validate_vscode_extension_manifest(&vscode_extension_manifest(&package_version)?)?;
+    validate_vscode_extension_package(&root)?;
     agent_eval::validate_catalog()?;
 
     for forbidden in ["yarn.lock", "package-lock.json"] {
@@ -496,6 +498,12 @@ fn vscode_manifest(args: VscodeManifestArgs) -> Result<()> {
     let manifest = vscode_extension_manifest(&version)?;
     validate_vscode_extension_manifest(&manifest)?;
 
+    if args.sync {
+        sync_vscode_extension_package(&root)?;
+        println!("synced vscode-extension/package.json tool contributions");
+        return Ok(());
+    }
+
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     match args.out {
         Some(path) => {
@@ -518,6 +526,51 @@ fn vscode_manifest(args: VscodeManifestArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn vscode_extension_package_path(root: &Path) -> PathBuf {
+    root.join("vscode-extension/package.json")
+}
+
+fn read_vscode_extension_package(root: &Path) -> Result<Value> {
+    let path = vscode_extension_package_path(root);
+    serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("failed to read `{}`", path.display()))?,
+    )
+    .with_context(|| format!("invalid JSON in `{}`", path.display()))
+}
+
+fn sync_vscode_extension_package(root: &Path) -> Result<()> {
+    let mut package = read_vscode_extension_package(root)?;
+    let tools = production_tool_definitions()?;
+
+    package["contributes"]["languageModelTools"] =
+        Value::Array(tools.iter().map(vscode_language_model_tool).collect());
+    package["activationEvents"] = Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                Value::String(format!(
+                    "onLanguageModelTool:{}",
+                    vscode_tool_name(&tool.name)
+                ))
+            })
+            .collect(),
+    );
+
+    let path = vscode_extension_package_path(root);
+    let mut bytes = serde_json::to_vec_pretty(&package)?;
+    bytes.push(b'\n');
+    fs::write(&path, bytes).with_context(|| format!("failed to write `{}`", path.display()))?;
+    Ok(())
+}
+
+fn validate_vscode_extension_package(root: &Path) -> Result<()> {
+    let package = read_vscode_extension_package(root)?;
+    validate_vscode_extension_manifest(&package).context(
+        "vscode-extension/package.json is out of sync with the shared catalog; \
+         run `cargo xtask vscode-manifest --sync`",
+    )
 }
 
 fn vscode_extension_manifest(version: &str) -> Result<Value> {
@@ -659,8 +712,17 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
         let reference_name = contribution["toolReferenceName"]
             .as_str()
             .with_context(|| format!("VS Code tool `{expected_name}` omitted toolReferenceName"))?;
+        let expected_reference = vscode_tool_reference_name(&tool.name);
+        if reference_name != expected_reference {
+            bail!(
+                "VS Code tool reference for `{expected_name}` is `{reference_name}`; expected `{expected_reference}`"
+            );
+        }
         if !reference_names.insert(reference_name.to_string()) {
             bail!("VS Code tool reference `{reference_name}` is not unique");
+        }
+        if contribution["canBeReferencedInPrompt"] != Value::Bool(true) {
+            bail!("VS Code tool `{expected_name}` must set canBeReferencedInPrompt to true");
         }
         let activation_event = format!("onLanguageModelTool:{expected_name}");
         if !activation_events

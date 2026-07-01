@@ -59,8 +59,9 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
       throw new Error(formatToolError(method, output.error));
     }
 
+    // LanguageModelTextPart is stable at the declared engine floor (1.105).
     return new vscode.LanguageModelToolResult([
-      vscode.LanguageModelDataPart.json(output.result ?? null),
+      new vscode.LanguageModelTextPart(JSON.stringify(output.result ?? null)),
     ]);
   }
 }
@@ -167,7 +168,7 @@ async function invokeSurfaceCall(
   token: vscode.CancellationToken,
 ): Promise<BrowserToolResult> {
   const binary = resolveBinary(context);
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const workspaceRoot = activeWorkspaceRoot();
   const args = ["surface", "call", method];
   if (workspaceRoot) {
     args.push("--workspace-root", workspaceRoot);
@@ -176,6 +177,19 @@ async function invokeSurfaceCall(
   const env = runtimeEnvironment();
   const stdout = await runProcess(binary, args, JSON.stringify(input), env, token);
   return browserToolResult(JSON.parse(stdout));
+}
+
+function activeWorkspaceRoot(): string | undefined {
+  // Prefer the folder that owns the active editor so multi-root windows scope
+  // uploads and artifact exports to the project the user is working in.
+  const activeDocument = vscode.window.activeTextEditor?.document.uri;
+  if (activeDocument) {
+    const folder = vscode.workspace.getWorkspaceFolder(activeDocument);
+    if (folder) {
+      return folder.uri.fsPath;
+    }
+  }
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
 function browserToolResult(value: unknown): BrowserToolResult {
@@ -244,6 +258,11 @@ function runProcess(
     let stdout = "";
     let stderr = "";
 
+    // Cancellation ends this wrapper process and reports cancellation to VS
+    // Code. A browser action the broker has already dispatched runs to
+    // completion; lease ownership keeps its effects scoped to this session's
+    // tabs, and a broker-level cancel channel is tracked as RFC 00006
+    // follow-up work.
     const cancellation = token.onCancellationRequested(() => {
       child.kill();
       reject(new vscode.CancellationError());
