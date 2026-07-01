@@ -214,6 +214,13 @@ jobs:
     needs:
       - build
       - release-version
+    # The default success() condition follows the transitive needs chain, and
+    # tests is intentionally skipped on pull requests. Package whenever the
+    # direct dependencies succeeded.
+    if: >-
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.release-version.result == 'success'
     runs-on: ubuntu-latest
     env:
       VISIBLE_BROWSER_LAB_RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
