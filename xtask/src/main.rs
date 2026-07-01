@@ -1612,15 +1612,30 @@ fn write_vsix_archive(
     let binary_name = binary_file_name(target);
     let target_platform = vsix_target_platform(target)?;
     let manifest = vsix_extension_manifest(root, version)?;
+    let engine = manifest["engines"]["vscode"]
+        .as_str()
+        .context("extension manifest omitted engines.vscode")?
+        .to_string();
 
-    let content_types = r#"<?xml version="1.0" encoding="utf-8"?>
+    // OPC requires a content type for every part. The Default covers Windows
+    // .exe binaries; the Override covers the extensionless Unix binary.
+    let mut content_types = String::from(
+        r#"<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="json" ContentType="application/json" />
   <Default Extension="js" ContentType="application/javascript" />
   <Default Extension="md" ContentType="text/markdown" />
   <Default Extension="vsixmanifest" ContentType="text/xml" />
-</Types>
-"#;
+  <Default Extension="exe" ContentType="application/octet-stream" />
+"#,
+    );
+    if !binary_name.ends_with(".exe") {
+        content_types.push_str(&format!(
+            "  <Override PartName=\"/extension/bin/{binary_name}\" ContentType=\"application/octet-stream\" />\n"
+        ));
+    }
+    content_types.push_str("</Types>\n");
+
     let vsix_manifest = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
@@ -1629,6 +1644,10 @@ fn write_vsix_archive(
     <DisplayName>Visible Browser Lab</DisplayName>
     <Description xml:space="preserve">Native VS Code language model tools for lease-scoped visible Chrome interaction.</Description>
     <Categories>AI,Other</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="{engine}" />
+      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace" />
+    </Properties>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Code" />
@@ -1693,6 +1712,25 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
+
+    // Enforce archive identity: the filename encodes version and target, and
+    // the packaged manifest must agree with both.
+    let identity = file_name
+        .strip_prefix("visible-browser-lab-vscode-")
+        .and_then(|rest| rest.strip_suffix(".vsix"))
+        .with_context(|| {
+            format!("VSIX `{file_name}` does not match `visible-browser-lab-vscode-<version>-<target>.vsix`")
+        })?;
+    let target = SUPPORTED_TARGETS
+        .iter()
+        .find(|target| identity.ends_with(&format!("-{target}")))
+        .copied()
+        .with_context(|| format!("VSIX `{file_name}` does not name a supported target"))?;
+    let version = identity
+        .strip_suffix(&format!("-{target}"))
+        .expect("target suffix was just matched");
+    let expected_binary = format!("extension/bin/{}", binary_file_name(target));
+
     let mut archive = open_zip(path)?;
     let mut names = Vec::new();
     for index in 0..archive.len() {
@@ -1708,20 +1746,29 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension.vsixmanifest",
         "extension/package.json",
         "extension/dist/extension.js",
+        "extension/skills/visible-browser-lab/SKILL.md",
     ] {
         if !names.iter().any(|name| name == required) {
             bail!("VSIX `{file_name}` is missing `{required}`");
         }
     }
-    let binary_count = names
+    let bin_entries = names
         .iter()
-        .filter(|name| name.starts_with("extension/bin/visible-browser-lab-mcp"))
-        .count();
-    if binary_count != 1 {
-        bail!("VSIX `{file_name}` must contain exactly one packaged binary, found {binary_count}");
+        .filter(|name| name.starts_with("extension/bin/"))
+        .collect::<Vec<_>>();
+    if bin_entries.len() != 1 || bin_entries[0] != &expected_binary {
+        bail!(
+            "VSIX `{file_name}` must contain exactly `{expected_binary}` under extension/bin/, found {bin_entries:?}"
+        );
     }
 
     let manifest = read_zip_json(path, "extension/package.json")?;
+    if manifest["version"].as_str() != Some(version) {
+        bail!(
+            "VSIX `{file_name}` manifest version `{}` does not match archive version `{version}`",
+            manifest["version"].as_str().unwrap_or("(missing)")
+        );
+    }
     validate_vscode_extension_manifest(&manifest).with_context(|| {
         format!("VSIX `{file_name}` manifest does not match the shared catalog")
     })?;
@@ -1807,9 +1854,10 @@ fn build_disposable_vsix(root: &Path) -> Result<PathBuf> {
         bail!("cargo build --release --bin {BINARY_NAME} failed");
     }
 
-    let target = host_target()?;
+    let host = host_target()?;
+    let target = vsix_smoke_release_target(&host)?;
     let version = release_version(root, None)?;
-    let binary = binary_path(root, &target, None)?;
+    let binary = binary_path(root, &host, None)?;
     let extension_dist = extension_dist_dir(root, None)?;
     let out_dir = root.join("target/vsix-smoke");
     fs::create_dir_all(&out_dir)?;
@@ -1818,6 +1866,21 @@ fn build_disposable_vsix(root: &Path) -> Result<PathBuf> {
     ));
     write_vsix_archive(root, &extension_dist, &target, &version, &binary, &archive)?;
     Ok(archive)
+}
+
+/// The disposable smoke labels its archive with a supported release target.
+/// GNU Linux development hosts map to the musl release target; the embedded
+/// binary is host-built and only executed on this same host.
+fn vsix_smoke_release_target(host: &str) -> Result<String> {
+    if SUPPORTED_TARGETS.contains(&host) {
+        return Ok(host.to_string());
+    }
+    let mapped = match host {
+        "x86_64-unknown-linux-gnu" => "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu" => "aarch64-unknown-linux-musl",
+        host => bail!("no release target mapping for vsix-smoke host `{host}`"),
+    };
+    Ok(mapped.to_string())
 }
 
 fn add_file<W: Write + Seek>(
