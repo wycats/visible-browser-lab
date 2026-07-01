@@ -66,6 +66,36 @@ pub const DOMAIN_OPERATIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
+pub const PRODUCTION_TOOLS: &[&str] = &[
+    "start_session",
+    "list_tabs",
+    "new_tab",
+    "claim_tab",
+    "release_tab",
+    "focus_tab",
+    "close_tab",
+    "snapshot",
+    "navigate",
+    "wait_for",
+    "click",
+    "fill",
+    "fill_form",
+    "type_text",
+    "press_key",
+    "screenshot",
+    "evaluate",
+    "interact",
+    "console",
+    "network",
+    "emulation",
+    "performance",
+    "audit",
+    "memory",
+    "screencast",
+    "artifacts",
+    "help",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {

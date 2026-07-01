@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -91,27 +93,10 @@ impl RealBrowser {
 
         let mut command = Command::new(&chrome_executable);
         command
-            .arg("--remote-debugging-port=0")
-            .arg(format!("--user-data-dir={}", profile_dir.path().display()))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-background-networking")
-            .arg("--disable-component-update")
-            .arg("--disable-sync")
-            .arg("about:blank")
+            .args(chrome_for_testing_arguments(profile_dir.path(), mode))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
-
-        if mode == BrowserMode::Headless {
-            command.arg("--headless=new");
-        }
-        if cfg!(target_os = "linux") {
-            command.arg("--disable-dev-shm-usage");
-            if env::var_os("CI").is_some() {
-                command.arg("--no-sandbox");
-            }
-        }
 
         let child = command.spawn().with_context(|| {
             format!(
@@ -178,8 +163,106 @@ pub fn chrome_for_testing_executable() -> Result<PathBuf> {
         let package = packages
             .pop()
             .context("Chrome for Testing manager returned no browser package")?;
-        Ok(package.browser_executable().to_path_buf())
+        let executable = package.browser_executable().to_path_buf();
+        prepare_chrome_for_testing_executable(&executable)?;
+        Ok(executable)
     })
+}
+
+fn chrome_for_testing_arguments(profile_dir: &Path, mode: BrowserMode) -> Vec<OsString> {
+    let mut args = vec![
+        "--remote-debugging-port=0".into(),
+        format!("--user-data-dir={}", profile_dir.display()).into(),
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--disable-background-networking".into(),
+        "--disable-component-update".into(),
+        "--disable-sync".into(),
+    ];
+
+    #[cfg(target_os = "macos")]
+    args.push("--use-mock-keychain".into());
+
+    if mode == BrowserMode::Headless {
+        args.push("--headless=new".into());
+    }
+    if cfg!(target_os = "linux") {
+        args.push("--disable-dev-shm-usage".into());
+        if env::var_os("CI").is_some() {
+            args.push("--no-sandbox".into());
+        }
+    }
+
+    args.push("about:blank".into());
+    args
+}
+
+fn prepare_chrome_for_testing_executable(executable: &Path) -> Result<()> {
+    remove_macos_quarantine(executable)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_quarantine(executable: &Path) -> Result<()> {
+    let Some(bundle) = executable.ancestors().find(|ancestor| {
+        ancestor
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("app")
+    }) else {
+        return Ok(());
+    };
+    let output = Command::new("/usr/bin/xattr")
+        .args(["-d", "-r", "com.apple.quarantine"])
+        .arg(bundle)
+        .output()
+        .with_context(|| format!("failed to inspect quarantine on `{}`", bundle.display()))?;
+    if output.status.success() || String::from_utf8_lossy(&output.stderr).contains("No such xattr")
+    {
+        return Ok(());
+    }
+    bail!(
+        "failed to remove quarantine from Chrome for Testing `{}`: {}",
+        bundle.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_macos_quarantine(_executable: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_for_testing_arguments_include_stable_profile_and_startup_flags() {
+        let args =
+            chrome_for_testing_arguments(Path::new("/tmp/vbl-cft-profile"), BrowserMode::Headless);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--remote-debugging-port=0".into()));
+        assert!(args.contains(&"--headless=new".into()));
+        assert!(args.contains(&"about:blank".into()));
+        assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chrome_for_testing_uses_mock_keychain_on_macos() {
+        let args =
+            chrome_for_testing_arguments(Path::new("/tmp/vbl-cft-profile"), BrowserMode::Visible);
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--use-mock-keychain".into()));
+    }
 }
 
 fn chrome_for_testing_cache_dir() -> PathBuf {

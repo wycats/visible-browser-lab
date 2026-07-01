@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "node", "promise"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn"
+  },
+  "rules": {},
+  "env": {
+    "builtin": true,
+    "node": true
+  },
+  "ignorePatterns": ["vscode-extension/dist/**"]
+}
