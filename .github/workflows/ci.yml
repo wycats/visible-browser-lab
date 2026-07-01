@@ -54,3 +54,34 @@ jobs:
     needs: changes
     if: needs.changes.outputs.required == 'true'
     uses: ./.github/workflows/tests.yml
+
+  # Branch protection requires this single context. It reports success when
+  # the tests passed, or when the classifier decided no tests were needed.
+  conclusion:
+    name: CI complete
+    needs:
+      - changes
+      - tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate required results
+        shell: bash
+        run: |
+          set -euo pipefail
+          changes='${{ needs.changes.result }}'
+          required='${{ needs.changes.outputs.required }}'
+          tests='${{ needs.tests.result }}'
+          if [[ "$changes" != "success" ]]; then
+            echo "Classifier result: $changes" >&2
+            exit 1
+          fi
+          if [[ "$required" == "true" && "$tests" != "success" ]]; then
+            echo "Tests result: $tests" >&2
+            exit 1
+          fi
+          if [[ "$required" != "true" && "$tests" != "skipped" && "$tests" != "success" ]]; then
+            echo "Tests result: $tests" >&2
+            exit 1
+          fi
+          echo "CI requirements satisfied"
