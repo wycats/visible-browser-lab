@@ -97,77 +97,27 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  test:
-    name: Native tests (${{ matrix.os }})
+  # Pull requests run these same tests through the CI workflow on the same
+  # commit, so the dry-run only repeats them for tag pushes and manual runs.
+  tests:
+    name: Tests
     needs: changes
-    if: needs.changes.outputs.required == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-15
-          - windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Rust stable
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Test workspace unit layers
-        run: cargo test --workspace --lib --bins
-
-      - name: Validate release inputs
-        run: cargo xtask validate
-
-  real-browser:
-    name: Real-browser MCP tests (${{ matrix.os }})
-    needs: changes
-    if: needs.changes.outputs.required == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-15
-          - windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Rust stable
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache Chrome for Testing
-        uses: actions/cache@v6
-        with:
-          path: target/chrome-for-testing
-          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Test real-browser MCP facade
-        env:
-          VISIBLE_BROWSER_LAB_CFT_CACHE_DIR: target/chrome-for-testing
-        run: cargo test --test headless_mcp
+    if: needs.changes.outputs.required == 'true' && github.event_name != 'pull_request'
+    uses: ./.github/workflows/tests.yml
 
   build:
     name: Build ${{ matrix.target }}
     needs:
-      - test
-      - real-browser
+      - changes
+      - tests
       - release-version
+    # Tests are skipped on pull requests because CI runs them on the same
+    # commit; the build proceeds as long as no needed job failed.
+    if: >-
+      !cancelled() &&
+      needs.changes.outputs.required == 'true' &&
+      needs.release-version.result == 'success' &&
+      (needs.tests.result == 'success' || needs.tests.result == 'skipped')
     runs-on: ${{ matrix.os }}
     env:
       VISIBLE_BROWSER_LAB_RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
@@ -192,7 +142,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The staged binary is fully determined by the runtime crates, the
+      # workspace lockfile, and the release version. Packaging-only changes
+      # reuse the cached binary instead of rebuilding the whole matrix.
+      - name: Restore cached release binary
+        id: binary-cache
+        uses: actions/cache@v6
+        with:
+          path: dist/binaries/${{ matrix.target }}
+          key: release-binary-${{ matrix.target }}-${{ needs.release-version.outputs.version }}-${{ hashFiles('src/**', 'agent-surface-contract/**', 'Cargo.toml', 'Cargo.lock') }}
+
       - name: Install Rust stable
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -201,7 +162,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
 
       - name: Install musl tools
-        if: contains(matrix.target, 'unknown-linux-musl')
+        if: steps.binary-cache.outputs.cache-hit != 'true' && contains(matrix.target, 'unknown-linux-musl')
         shell: bash
         run: |
           set -euo pipefail
@@ -209,25 +170,11 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build release binary
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         run: cargo build --release --target "${{ matrix.target }}" --bin visible-browser-lab-mcp
 
-      - name: Verify binary version
-        shell: bash
-        run: |
-          set -euo pipefail
-          target="${{ matrix.target }}"
-          binary="visible-browser-lab-mcp"
-          if [[ "$target" == *windows* ]]; then
-            binary="${binary}.exe"
-          fi
-          actual="$("target/${target}/release/${binary}" --version)"
-          expected="visible-browser-lab-mcp ${VISIBLE_BROWSER_LAB_RELEASE_VERSION}"
-          if [[ "$actual" != "$expected" ]]; then
-            echo "Binary version mismatch: expected '$expected', got '$actual'" >&2
-            exit 1
-          fi
-
       - name: Stage binary artifact
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -238,6 +185,22 @@ jobs:
           fi
           mkdir -p "dist/binaries/${target}"
           cp "target/${target}/release/${binary}" "dist/binaries/${target}/${binary}"
+
+      - name: Verify binary version
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="visible-browser-lab-mcp"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          actual="$("dist/binaries/${target}/${binary}" --version)"
+          expected="visible-browser-lab-mcp ${VISIBLE_BROWSER_LAB_RELEASE_VERSION}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Binary version mismatch: expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
