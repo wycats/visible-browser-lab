@@ -114,7 +114,7 @@ Real publication runs only from protected `v*` tags. Pull requests run the relea
 
 Repository protection is configured outside this repo: mandatory pull requests, required checks, resolved conversations, protected `main`, and protected `v*` tags.
 
-The `v0.1.0` release exercised this path and published 25 assets: 18 host plugin archives, 6 standalone binary archives, and `SHA256SUMS`. A release from current `main` packages the Stage 3 tab-lease facade from RFC 00001.
+The `v0.1.0` release exercised this path and published 25 assets: 18 host plugin archives, 6 standalone binary archives, and `SHA256SUMS`. RFC 00006 later replaced the Claude-format VS Code archive with a real per-target VSIX, so a release from current `main` publishes 12 Codex and Claude Code archives, 6 VS Code VSIX packages, 6 standalone binary archives, and `SHA256SUMS`.
 
 ## CI Shape
 
@@ -179,7 +179,7 @@ Release validation:
 - Run the release workflow in PR dry-run mode before merging the publishing change.
 - Verify GitHub Release assets, checksums, and attestations are generated from the same commit.
 - Verify Codex, Claude Code, and VS Code package archives can be unpacked and locate their packaged binary.
-- Verify the release contains 25 assets: 18 host plugin archives, 6 standalone binary archives, and `SHA256SUMS`.
+- Verify the release contains 25 assets: 12 Codex and Claude Code plugin archives, 6 VS Code VSIX packages, 6 standalone binary archives, and `SHA256SUMS`.
 - Verify release checksums with `shasum -a 256 -c SHA256SUMS`.
 - Verify artifact attestations with `gh attestation verify`.
 

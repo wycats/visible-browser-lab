@@ -65,12 +65,6 @@ const AGENT_HOSTS: &[AgentHost] = &[
         manifest_path: ".claude-plugin/plugin.json",
         plugin_format: PluginFormat::Claude,
     },
-    AgentHost {
-        id: "vscode",
-        display_name: "VS Code",
-        manifest_path: ".claude-plugin/plugin.json",
-        plugin_format: PluginFormat::Claude,
-    },
 ];
 
 fn main() -> Result<()> {
@@ -85,6 +79,7 @@ fn main() -> Result<()> {
         "package" => package(PackageArgs::parse(args.collect())?),
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "vscode-manifest" => vscode_manifest(VscodeManifestArgs::parse(args.collect())?),
+        "vsix-smoke" => vsix_smoke(VsixSmokeArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
@@ -105,9 +100,10 @@ fn print_usage() {
         "\
 usage:
   cargo xtask validate
-  cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>]
+  cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>] [--extension-dist <dir>]
   cargo xtask checksums [--dir <dir>]
-    cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
+  cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
+  cargo xtask vsix-smoke [--archive <path>]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -124,6 +120,7 @@ struct PackageArgs {
     binary: Option<PathBuf>,
     out_dir: PathBuf,
     version: Option<String>,
+    extension_dist: Option<PathBuf>,
 }
 
 impl PackageArgs {
@@ -132,6 +129,7 @@ impl PackageArgs {
         let mut binary = None;
         let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
         let mut version = None;
+        let mut extension_dist = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -163,6 +161,13 @@ impl PackageArgs {
                             .to_string(),
                     );
                 }
+                "--extension-dist" => {
+                    index += 1;
+                    extension_dist = Some(PathBuf::from(
+                        args.get(index)
+                            .context("missing value after --extension-dist")?,
+                    ));
+                }
                 arg => bail!("unknown package argument `{arg}`"),
             }
 
@@ -177,7 +182,35 @@ impl PackageArgs {
             binary,
             out_dir,
             version,
+            extension_dist,
         })
+    }
+}
+
+#[derive(Debug)]
+struct VsixSmokeArgs {
+    archive: Option<PathBuf>,
+}
+
+impl VsixSmokeArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut archive = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--archive" => {
+                    index += 1;
+                    archive = Some(PathBuf::from(
+                        args.get(index).context("missing value after --archive")?,
+                    ));
+                }
+                arg => bail!("unknown vsix-smoke argument `{arg}`"),
+            }
+            index += 1;
+        }
+
+        Ok(Self { archive })
     }
 }
 
@@ -443,6 +476,21 @@ fn package(args: PackageArgs) -> Result<()> {
         write_plugin_archive(&root, host, &args.target, &version, &binary, &archive)?;
         archives.push(archive);
     }
+
+    let extension_dist = extension_dist_dir(&root, args.extension_dist.as_deref())?;
+    let vsix = out_dir.join(format!(
+        "visible-browser-lab-vscode-{}-{}.vsix",
+        version, args.target
+    ));
+    write_vsix_archive(
+        &root,
+        &extension_dist,
+        &args.target,
+        &version,
+        &binary,
+        &vsix,
+    )?;
+    archives.push(vsix);
 
     let binary_archive = out_dir.join(format!(
         "visible-browser-lab-mcp-{}-{}.zip",
@@ -1511,6 +1559,330 @@ the host-specific visible-browser-lab package archives from the same release.
     Ok(())
 }
 
+fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBuf> {
+    let dist = override_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("vscode-extension/dist"));
+    if !dist.join("extension.js").is_file() {
+        bail!(
+            "extension host bundle not found at `{}`. Run `pnpm build` first.",
+            dist.join("extension.js").display()
+        );
+    }
+    Ok(dist)
+}
+
+/// Marketplace target-platform identifiers, one per supported Rust target.
+fn vsix_target_platform(target: &str) -> Result<&'static str> {
+    Ok(match target {
+        "aarch64-apple-darwin" => "darwin-arm64",
+        "x86_64-apple-darwin" => "darwin-x64",
+        "x86_64-unknown-linux-musl" => "linux-x64",
+        "aarch64-unknown-linux-musl" => "linux-arm64",
+        "x86_64-pc-windows-msvc" => "win32-x64",
+        "aarch64-pc-windows-msvc" => "win32-arm64",
+        target => bail!("no VS Code target platform mapping for `{target}`"),
+    })
+}
+
+fn vsix_extension_manifest(root: &Path, version: &str) -> Result<Value> {
+    let mut package = read_vscode_extension_package(root)?;
+    validate_vscode_extension_manifest(&package).context(
+        "vscode-extension/package.json is out of sync with the shared catalog; \
+         run `cargo xtask vscode-manifest --sync`",
+    )?;
+    package["version"] = Value::String(version.to_string());
+    // Local scripts and dev dependencies stay out of the installed extension.
+    if let Some(object) = package.as_object_mut() {
+        object.remove("scripts");
+        object.remove("devDependencies");
+        object.remove("private");
+    }
+    Ok(package)
+}
+
+fn write_vsix_archive(
+    root: &Path,
+    extension_dist: &Path,
+    target: &str,
+    version: &str,
+    binary: &Path,
+    archive: &Path,
+) -> Result<()> {
+    let binary_name = binary_file_name(target);
+    let target_platform = vsix_target_platform(target)?;
+    let manifest = vsix_extension_manifest(root, version)?;
+    let engine = manifest["engines"]["vscode"]
+        .as_str()
+        .context("extension manifest omitted engines.vscode")?
+        .to_string();
+
+    // OPC requires a content type for every part. The Default covers Windows
+    // .exe binaries; the Override covers the extensionless Unix binary.
+    let mut content_types = String::from(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="json" ContentType="application/json" />
+  <Default Extension="js" ContentType="application/javascript" />
+  <Default Extension="md" ContentType="text/markdown" />
+  <Default Extension="vsixmanifest" ContentType="text/xml" />
+  <Default Extension="exe" ContentType="application/octet-stream" />
+"#,
+    );
+    if !binary_name.ends_with(".exe") {
+        content_types.push_str(&format!(
+            "  <Override PartName=\"/extension/bin/{binary_name}\" ContentType=\"application/octet-stream\" />\n"
+        ));
+    }
+    content_types.push_str("</Types>\n");
+
+    let vsix_manifest = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Language="en-US" Id="visible-browser-lab" Version="{version}" Publisher="wycats" TargetPlatform="{target_platform}" />
+    <DisplayName>Visible Browser Lab</DisplayName>
+    <Description xml:space="preserve">Native VS Code language model tools for lease-scoped visible Chrome interaction.</Description>
+    <Categories>AI,Other</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="{engine}" />
+      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace" />
+    </Properties>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Code" />
+  </Installation>
+  <Dependencies />
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
+  </Assets>
+</PackageManifest>
+"#
+    );
+
+    let file = File::create(archive)
+        .with_context(|| format!("failed to create archive `{}`", archive.display()))?;
+    let mut zip = ZipWriter::new(file);
+
+    add_bytes(
+        &mut zip,
+        "[Content_Types].xml",
+        content_types.as_bytes(),
+        0o644,
+    )?;
+    add_bytes(
+        &mut zip,
+        "extension.vsixmanifest",
+        vsix_manifest.as_bytes(),
+        0o644,
+    )?;
+    add_bytes(
+        &mut zip,
+        "extension/package.json",
+        &serde_json::to_vec_pretty(&manifest)?,
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
+        "extension/dist/extension.js",
+        &extension_dist.join("extension.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
+        &format!("extension/bin/{binary_name}"),
+        binary,
+        executable_mode(target),
+    )?;
+    add_file(
+        &mut zip,
+        "extension/skills/visible-browser-lab/SKILL.md",
+        &root.join("skills/visible-browser-lab/SKILL.md"),
+        0o644,
+    )?;
+
+    zip.finish()
+        .with_context(|| format!("failed to finish archive `{}`", archive.display()))?;
+    validate_vsix_archive(archive)?;
+    Ok(())
+}
+
+fn validate_vsix_archive(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    // Enforce archive identity: the filename encodes version and target, and
+    // the packaged manifest must agree with both.
+    let identity = file_name
+        .strip_prefix("visible-browser-lab-vscode-")
+        .and_then(|rest| rest.strip_suffix(".vsix"))
+        .with_context(|| {
+            format!("VSIX `{file_name}` does not match `visible-browser-lab-vscode-<version>-<target>.vsix`")
+        })?;
+    let target = SUPPORTED_TARGETS
+        .iter()
+        .find(|target| identity.ends_with(&format!("-{target}")))
+        .copied()
+        .with_context(|| format!("VSIX `{file_name}` does not name a supported target"))?;
+    let version = identity
+        .strip_suffix(&format!("-{target}"))
+        .expect("target suffix was just matched");
+    let expected_binary = format!("extension/bin/{}", binary_file_name(target));
+
+    let mut archive = open_zip(path)?;
+    let mut names = Vec::new();
+    for index in 0..archive.len() {
+        let file = archive.by_index(index)?;
+        let name = file.name().to_string();
+        if forbidden_archive_path(&name) {
+            bail!("VSIX `{file_name}` contains forbidden path `{name}`");
+        }
+        names.push(name);
+    }
+    for required in [
+        "[Content_Types].xml",
+        "extension.vsixmanifest",
+        "extension/package.json",
+        "extension/dist/extension.js",
+        "extension/skills/visible-browser-lab/SKILL.md",
+    ] {
+        if !names.iter().any(|name| name == required) {
+            bail!("VSIX `{file_name}` is missing `{required}`");
+        }
+    }
+    let bin_entries = names
+        .iter()
+        .filter(|name| name.starts_with("extension/bin/"))
+        .collect::<Vec<_>>();
+    if bin_entries.len() != 1 || bin_entries[0] != &expected_binary {
+        bail!(
+            "VSIX `{file_name}` must contain exactly `{expected_binary}` under extension/bin/, found {bin_entries:?}"
+        );
+    }
+
+    let manifest = read_zip_json(path, "extension/package.json")?;
+    if manifest["version"].as_str() != Some(version) {
+        bail!(
+            "VSIX `{file_name}` manifest version `{}` does not match archive version `{version}`",
+            manifest["version"].as_str().unwrap_or("(missing)")
+        );
+    }
+    validate_vscode_extension_manifest(&manifest).with_context(|| {
+        format!("VSIX `{file_name}` manifest does not match the shared catalog")
+    })?;
+
+    Ok(())
+}
+
+fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
+    let root = repo_root()?;
+    let archive = match args.archive {
+        Some(archive) => archive,
+        None => build_disposable_vsix(&root)?,
+    };
+
+    // Validate the packaged manifest and structure.
+    validate_vsix_archive(&archive)?;
+
+    // Extract and check that the packaged binary's runtime catalog matches
+    // the packaged manifest's tool contributions.
+    let smoke_dir = tempfile::tempdir().context("failed to create vsix smoke directory")?;
+    extract_zip(&archive, smoke_dir.path())?;
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(smoke_dir.path().join("extension/package.json"))?)?;
+    let contributed = manifest["contributes"]["languageModelTools"]
+        .as_array()
+        .context("packaged manifest omitted languageModelTools")?
+        .len();
+
+    let binary_name = binary_file_name(&host_target()?);
+    let binary = smoke_dir.path().join("extension/bin").join(&binary_name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+    }
+    let output = Command::new(&binary)
+        .args(["surface", "catalog"])
+        .output()
+        .with_context(|| format!("failed to run packaged binary `{}`", binary.display()))?;
+    if !output.status.success() {
+        bail!(
+            "packaged binary surface catalog failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let catalog: Value = serde_json::from_slice(&output.stdout)
+        .context("packaged binary returned invalid catalog JSON")?;
+    let runtime = catalog["tools"]
+        .as_array()
+        .context("packaged catalog omitted tools")?
+        .len();
+
+    if contributed != runtime {
+        bail!(
+            "packaged manifest advertises {contributed} tools but the packaged binary serves {runtime}"
+        );
+    }
+
+    println!(
+        "vsix smoke passed: {} ({contributed} tools, catalog matches)",
+        archive.display()
+    );
+    Ok(())
+}
+
+fn build_disposable_vsix(root: &Path) -> Result<PathBuf> {
+    let status = Command::new("pnpm")
+        .args(["--filter", "visible-browser-lab", "build"])
+        .current_dir(root)
+        .status()
+        .context("failed to build extension host bundle")?;
+    if !status.success() {
+        bail!("pnpm --filter visible-browser-lab build failed");
+    }
+
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--bin", BINARY_NAME])
+        .current_dir(root)
+        .status()
+        .context("failed to build release binary for vsix smoke")?;
+    if !status.success() {
+        bail!("cargo build --release --bin {BINARY_NAME} failed");
+    }
+
+    let host = host_target()?;
+    let target = vsix_smoke_release_target(&host)?;
+    let version = release_version(root, None)?;
+    let binary = binary_path(root, &host, None)?;
+    let extension_dist = extension_dist_dir(root, None)?;
+    let out_dir = root.join("target/vsix-smoke");
+    fs::create_dir_all(&out_dir)?;
+    let archive = out_dir.join(format!(
+        "visible-browser-lab-vscode-{version}-{target}.vsix"
+    ));
+    write_vsix_archive(root, &extension_dist, &target, &version, &binary, &archive)?;
+    Ok(archive)
+}
+
+/// The disposable smoke labels its archive with a supported release target.
+/// GNU Linux development hosts map to the musl release target; the embedded
+/// binary is host-built and only executed on this same host.
+fn vsix_smoke_release_target(host: &str) -> Result<String> {
+    if SUPPORTED_TARGETS.contains(&host) {
+        return Ok(host.to_string());
+    }
+    let mapped = match host {
+        "x86_64-unknown-linux-gnu" => "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu" => "aarch64-unknown-linux-musl",
+        host => bail!("no release target mapping for vsix-smoke host `{host}`"),
+    };
+    Ok(mapped.to_string())
+}
+
 fn add_file<W: Write + Seek>(
     zip: &mut ZipWriter<W>,
     name: &str,
@@ -1699,7 +2071,9 @@ fn validate_archives(dir: &Path) -> Result<()> {
             continue;
         }
 
-        if name.starts_with("visible-browser-lab-mcp-") {
+        if name.ends_with(".vsix") {
+            validate_vsix_archive(&path)?;
+        } else if name.starts_with("visible-browser-lab-mcp-") {
             validate_binary_archive(&path)?;
         } else if name.starts_with("visible-browser-lab-") {
             validate_plugin_archive(&path)?;
@@ -1923,8 +2297,10 @@ fn archive_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_files(dir, &mut files)?;
     files.retain(|path| {
-        path.extension().and_then(|ext| ext.to_str()) == Some("zip")
-            || path.file_name().is_some_and(|name| name == "SHA256SUMS")
+        matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("zip") | Some("vsix")
+        ) || path.file_name().is_some_and(|name| name == "SHA256SUMS")
     });
     Ok(files)
 }
@@ -2139,11 +2515,27 @@ mod tests {
             write_plugin_archive(&root, host, target, version, &binary, &archive).unwrap();
         }
 
+        let dist = output.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(dist.join("extension.js"), b"// bundle").unwrap();
+        let vsix = output.path().join(format!(
+            "visible-browser-lab-vscode-{version}-{target}.vsix"
+        ));
+        write_vsix_archive(&root, &dist, target, version, &binary, &vsix).unwrap();
+
         let binary_archive = output
             .path()
             .join(format!("visible-browser-lab-mcp-{version}-{target}.zip"));
         write_binary_archive(target, version, &binary, &binary_archive).unwrap();
         validate_archives(output.path()).unwrap();
+    }
+
+    #[test]
+    fn every_release_target_maps_to_a_vsix_platform() {
+        for target in SUPPORTED_TARGETS {
+            vsix_target_platform(target).unwrap();
+        }
+        assert!(vsix_target_platform("wasm32-unknown-unknown").is_err());
     }
 
     #[test]
