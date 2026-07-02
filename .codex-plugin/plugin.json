@@ -1,6 +1,6 @@
 {
   "name": "visible-browser-lab",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Lease-scoped visible Chrome interaction, diagnostics, analysis, and artifacts",
   "author": {
     "name": "Yehuda Katz"
