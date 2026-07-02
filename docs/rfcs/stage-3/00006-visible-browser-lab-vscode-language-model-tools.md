@@ -4,18 +4,18 @@
 
 ## Summary
 
-Visible Browser Lab will ship a real VS Code extension that contributes native
+Visible Browser Lab ships a real VS Code extension that contributes native
 language model tools while preserving the browser semantics already exposed
 through MCP.
 
 The browser runtime remains Rust-owned. Tab leases, Chrome lifecycle, semantic
 snapshots, artifact ownership, diagnostics, help responses, and structured
 browser errors continue to flow through the broker and the shared agent surface.
-MCP and VS Code become two presentations of the same contract. MCP presents the
+MCP and VS Code are two presentations of the same contract. MCP presents the
 contract to portable agent hosts. VS Code presents it through the editor's
 language model tool API, where tool picker metadata, invocation messages,
 confirmation prompts, workspace context, cancellation, output channels, and
-Marketplace installation can make the same browser operations feel native.
+Marketplace installation make the same browser operations feel native.
 
 The release path keeps the existing six-target Rust binary matrix. The VS Code
 work adds one extension-host build and then combines that build with each
@@ -52,7 +52,7 @@ the same validation.
 
 ## Background
 
-The repository currently builds one runtime binary, `visible-browser-lab-mcp`.
+The repository builds one runtime binary, `visible-browser-lab-mcp`.
 When started without a subcommand it serves MCP over stdio. When started as the
 broker it owns the persistent Chrome connection, tab leases, diagnostics, and
 artifacts. The catalog and schemas live in `agent-surface-contract`, and the
@@ -60,13 +60,13 @@ MCP server adapts those definitions into `rmcp` types.
 
 RFC 00002 established trusted binary releases: CI builds macOS, Linux, and
 Windows binaries for both x86_64 and aarch64, packages host archives around the
-prebuilt binary, writes checksums, and publishes GitHub Release assets. Its
-current VS Code package is a placeholder in the Claude plugin format. It proves
-that the release machinery can produce an archive with a VS Code label, but it
-does not produce a VS Code extension and it cannot use the language model tool
-API.
+prebuilt binary, writes checksums, and publishes GitHub Release assets. Before
+this RFC, its VS Code package was a placeholder in the Claude plugin format. It
+proved that the release machinery could produce an archive with a VS Code
+label, but it did not produce a VS Code extension and could not use the
+language model tool API.
 
-This RFC replaces that placeholder with an extension whose native VS Code tool
+This RFC replaced that placeholder with an extension whose native VS Code tool
 surface is generated from the same catalog as the MCP server.
 
 ## Design Principles
@@ -144,29 +144,33 @@ collide with tools from other extensions. For example, the browser method
 `snapshot` is contributed as `visible_browser_lab_snapshot` and receives a
 prompt reference name such as `vbl_snapshot`.
 
-The extension's `package.json` is generated from the shared catalog. Each
-language model tool contribution receives the shared title, the shared input
-schema, a model description derived from the shared tool description, an
-activation event, and prompt-reference metadata. This generation step matters
-because VS Code language model tools are statically contributed. Runtime catalog
-discovery alone cannot make tools visible in the tool picker or available for
-agent mode.
+The extension's `package.json` tool contributions are generated from the shared
+catalog by `cargo xtask vscode-manifest --sync` and committed. Each language
+model tool contribution receives the shared title, the shared input schema, a
+model description derived from the shared tool description, an activation
+event, and an exact `vbl_<tool>` prompt reference name. `cargo xtask validate`
+fails when the committed contributions drift from the runtime catalog in any of
+those fields. This generation step matters because VS Code language model tools
+are statically contributed. Runtime catalog discovery alone cannot make tools
+visible in the tool picker or available for agent mode.
 
 At activation time the extension reads its own contributions and registers a
 generic `LanguageModelTool` implementation for each one. The implementation
 maps the contributed name back to the browser method, writes the invocation
 input to `visible-browser-lab-mcp surface call`, and returns the result as a
-`LanguageModelToolResult`. Structured browser errors are surfaced as tool
-errors whose message includes the error code, message, and recovery field. That
-keeps the language model's retry path aligned with MCP.
+`LanguageModelToolResult` containing a JSON text part, the result shape that is
+stable at the extension's declared engine floor. Structured browser errors are
+surfaced as tool errors whose message includes the error code, message, and
+recovery field. That keeps the language model's retry path aligned with MCP.
 
-The generic implementation is also where VS Code gets to be VS Code. It can
-provide `prepareInvocation` messages that say what is about to happen, such as
+The generic implementation is also where VS Code gets to be VS Code. It
+provides `prepareInvocation` messages that say what is about to happen, such as
 capturing a snapshot, navigating an owned tab, or clicking a referenced element.
-For operations that close, release, claim, or focus a tab, it can ask for
-confirmation with copy derived from the actual invocation input. It can pass the
-active workspace folder directly as `workspace_root`, observe the
-`CancellationToken`, and route runtime configuration through VS Code settings.
+For operations that close, release, claim, or focus a tab, it asks for
+confirmation with copy derived from the actual invocation input. It passes the
+workspace folder that owns the active editor as `workspace_root` (falling back
+to the first folder in multi-root windows), observes the `CancellationToken`,
+and routes runtime configuration through VS Code settings.
 
 None of these affordances change what the broker does. They change how clearly
 the editor explains and supervises the operation.
@@ -199,16 +203,30 @@ aarch64-pc-windows-msvc
 ```
 
 The VS Code work adds one extension-host build. Packaging then combines that
-single extension build with each target-specific Rust binary. The output is a
-real VS Code extension package per supported target, not a Claude-format archive
-with a VS Code label.
+single extension build with each target-specific Rust binary. Each output is a
+conformant `.vsix` per target: the OPC `[Content_Types].xml` covers every
+packaged part including the runtime binary, and the `extension.vsixmanifest`
+carries the Marketplace `TargetPlatform` for the Rust target alongside the
+`Microsoft.VisualStudio.Code.Engine` compatibility floor. Assembling a VSIX is
+zip work over prebuilt inputs, so the per-target cost is a few seconds of
+compression rather than a second build matrix.
 
-Package validation compares the generated VS Code language model tool
-contributions with the shared catalog. A release fails if the VS Code package
-omits a production tool, advertises a schema different from the runtime catalog,
-duplicates a prompt reference name, or omits the activation event for a
-registered tool. This check is the guardrail that keeps static VS Code metadata
-and runtime behavior in lockstep.
+Package validation enforces both identity and catalog agreement. The archive
+filename must encode a supported target and the release version, the packaged
+manifest must match both, exactly one runtime binary may appear under
+`extension/bin/`, and the packaged tool contributions must match the shared
+catalog. A release fails if the VS Code package omits a production tool,
+advertises a schema different from the runtime catalog, duplicates a prompt
+reference name, or omits the activation event for a registered tool.
+
+The release dry-run then validates the package exactly as the host loads it.
+`cargo xtask vsix-smoke` checks the archive, extracts it, and confirms the
+packaged binary's `surface catalog` agrees with the packaged manifest; with
+`--extension-host` it also launches a real VS Code stable extension host
+against the extracted extension, verifies that every contributed tool registers
+in `vscode.lm.tools`, and invokes `help` through the packaged binary. The
+release workflow runs this full smoke under xvfb against the linux-x64 VSIX
+before assets upload.
 
 ## User Experience
 
@@ -282,50 +300,67 @@ model would see one broad escape hatch instead of a catalog of precise browser
 operations, and VS Code could not tailor invocation or confirmation copy by
 operation. This would recreate the ergonomics problem the RFC is meant to solve.
 
-## Implementation Strategy
+## Implementation
 
-The implementation can proceed in layers that each leave the repository in a
-coherent state.
+The implementation landed in three pull requests, each leaving the repository
+in a coherent state.
 
-The first layer extracts the shared Rust surface and keeps MCP behavior stable.
-The MCP server should become a thin adapter, and the new `surface catalog` and
-`surface call` commands should prove that VS Code can reach the same runtime
-without speaking MCP.
+The foundation (#28) extracted the shared Rust surface and kept MCP behavior
+stable. `VisibleBrowserLabSurface` took ownership of the catalog, help routing,
+broker forwarding, and structured results; the MCP server became a thin
+adapter; and the `surface catalog` and `surface call` commands proved that a
+host can reach the same runtime without speaking MCP. The same PR introduced
+the generic VS Code extension adapter, the committed catalog-generated tool
+contributions, and the pnpm workspace with type-aware linting that keeps the
+extension package mechanically clean.
 
-The second layer introduces the VS Code extension as a generic adapter. It does
-not need bespoke TypeScript for every browser tool. It should register the
-generated language model tools, resolve the packaged or configured binary, pass
-workspace context to `surface call`, observe cancellation, and return structured
-JSON result parts.
+The packaging layer (#29) replaced the placeholder VS Code archive with real
+per-target VSIX artifacts and integrated them into release checksums,
+validation, and the dry-run. Review hardening from that PR produced the OPC
+content-type coverage, the Engine compatibility property, archive identity
+validation, and the exact-binary packaging check.
 
-The third layer moves packaging from a placeholder VS Code archive to real
-extension artifacts. This layer generates or validates the static
-`languageModelTools` contribution metadata from the shared catalog, builds the
-extension host code once, and packages it with each target-specific runtime
-binary.
+The validation layer (#30) added the extension-host smoke: an
+`@vscode/test-electron` harness that boots VS Code stable against the extracted
+VSIX, verifies activation and tool registration, and invokes `help` through the
+packaged binary. `help` is the invocation target because it is the one
+production tool that answers without starting a browser, so the smoke proves
+the extension-to-binary chain without Chrome in the packaging job.
 
-The final layer adds installation validation. A smoke should load the VS Code
-extension package, verify that the generated tools are registered, check the
-catalog against the packaged binary, and invoke at least a non-browser-starting
-tool such as `help`. A fuller smoke can later exercise managed Chrome from the
-installed extension, but the first validation should focus on package identity,
-tool registration, and the adapter boundary.
+## Stage 3 Criteria
 
-## Stage 2 Criteria
-
-This RFC is implementation-ready when the following contract is precise enough
-to build and validate:
+The implemented contract holds, with each criterion backed by shipped
+validation:
 
 - MCP and VS Code use one Rust surface for catalog, help, broker calls, and
-  structured errors.
-- The MCP server remains behaviorally unchanged after becoming a host adapter.
+  structured errors. `VisibleBrowserLabSurface` owns that behavior, and the MCP
+  module contains only type adaptation.
+- The MCP server remained behaviorally unchanged through the refactor; the
+  workspace unit suite and the real-browser MCP tests pass unchanged.
 - The VS Code extension contributes one native language model tool per
-  production browser tool.
-- VS Code tool contributions are generated from, or validated against, the
-  shared runtime catalog.
-- VS Code calls pass editor workspace context to the shared surface, observe
-  cancellation, and provide useful invocation and confirmation messages.
-- The release workflow reuses the existing Rust binary matrix and performs only
-  one additional extension-host build.
-- Release assets include real VS Code extension artifacts instead of the
-  current Claude-format placeholder package.
+  production browser tool: 27 committed contributions, verified registered in
+  `vscode.lm.tools` by the extension-host smoke.
+- Tool contributions are generated from the shared catalog by
+  `cargo xtask vscode-manifest --sync`, and `cargo xtask validate` fails on any
+  drift in names, schemas, display metadata, reference names, or activation
+  events.
+- VS Code calls pass the active editor's workspace folder to the shared
+  surface, observe cancellation at the process boundary, and provide
+  invocation and confirmation messages derived from the invocation input.
+- The release workflow reuses the existing Rust binary matrix and performs one
+  additional extension-host build, shared across all six VSIX targets.
+- Release assets include six conformant per-target VSIX packages; the
+  Claude-format placeholder is retired and RFC 00002's asset accounting is
+  updated.
+- The release dry-run validates the packaged extension exactly as VS Code
+  loads it: archive identity, catalog agreement with the packaged binary, and
+  a real extension-host launch with tool registration and a `help` invocation.
+
+## Remaining Work
+
+A broker-level cancel channel that aborts in-flight Chrome operations remains
+follow-up work on the `surface` boundary, as recorded in Drawbacks. Marketplace
+publishing is a separate decision from packaging; the artifacts carry the
+metadata publishing requires, and a `vsce`-based packager can replace the
+archive writer behind the same `cargo xtask package` interface if publishing
+demands it.
