@@ -12,15 +12,18 @@
   "main": "./dist/extension.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p test/tsconfig.json",
     "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
-    "format": "oxfmt --write package.json tsconfig.json src",
-    "format:check": "oxfmt --check package.json tsconfig.json src",
+    "format": "oxfmt --write package.json tsconfig.json src test",
+    "format:check": "oxfmt --check package.json tsconfig.json src test",
     "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test:extension-host": "pnpm run build:test && node dist-test/runner.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.105.0",
+    "@vscode/test-electron": "^2.5.2",
     "oxfmt": "^0.56.0",
     "oxlint": "^1.71.0",
     "oxlint-tsgolint": "^0.23.0",
