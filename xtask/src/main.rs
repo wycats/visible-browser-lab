@@ -80,6 +80,7 @@ fn main() -> Result<()> {
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "vscode-manifest" => vscode_manifest(VscodeManifestArgs::parse(args.collect())?),
         "vsix-smoke" => vsix_smoke(VsixSmokeArgs::parse(args.collect())?),
+        "dogfood" => dogfood(DogfoodArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
@@ -104,6 +105,9 @@ usage:
   cargo xtask checksums [--dir <dir>]
   cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
   cargo xtask vsix-smoke [--archive <path>] [--extension-host]
+  cargo xtask dogfood [--code <path>]
+      Builds the extension and binary from the working tree and installs the
+      VSIX into the local VS Code. Reload the window to pick it up.
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -191,6 +195,33 @@ impl PackageArgs {
 struct VsixSmokeArgs {
     archive: Option<PathBuf>,
     extension_host: bool,
+}
+
+#[derive(Debug)]
+struct DogfoodArgs {
+    code: Option<PathBuf>,
+}
+
+impl DogfoodArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut code = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--code" => {
+                    index += 1;
+                    code = Some(PathBuf::from(
+                        args.get(index).context("missing value after --code")?,
+                    ));
+                }
+                arg => bail!("unknown dogfood argument `{arg}`"),
+            }
+            index += 1;
+        }
+
+        Ok(Self { code })
+    }
 }
 
 impl VsixSmokeArgs {
@@ -1887,6 +1918,34 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
     }
 
     println!("vsix smoke passed");
+    Ok(())
+}
+
+/// Builds the extension bundle and release binary from the working tree,
+/// packages a VSIX, validates it, and installs it into the local VS Code.
+/// The window must be reloaded afterwards to pick up the new build.
+fn dogfood(args: DogfoodArgs) -> Result<()> {
+    let root = repo_root()?;
+    let archive = build_disposable_vsix(&root)?;
+    validate_vsix_archive(&archive)?;
+
+    let code = args.code.unwrap_or_else(|| PathBuf::from("code"));
+    let output = Command::new(&code)
+        .arg("--install-extension")
+        .arg(&archive)
+        .arg("--force")
+        .output()
+        .with_context(|| format!("failed to run `{}`", code.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`{} --install-extension` failed: {}",
+            code.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    println!("installed {}", archive.display());
+    println!("reload the VS Code window to activate the new build");
     Ok(())
 }
 
