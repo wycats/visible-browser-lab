@@ -103,7 +103,7 @@ usage:
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>] [--extension-dist <dir>]
   cargo xtask checksums [--dir <dir>]
   cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
-  cargo xtask vsix-smoke [--archive <path>]
+  cargo xtask vsix-smoke [--archive <path>] [--extension-host]
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -190,11 +190,13 @@ impl PackageArgs {
 #[derive(Debug)]
 struct VsixSmokeArgs {
     archive: Option<PathBuf>,
+    extension_host: bool,
 }
 
 impl VsixSmokeArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         let mut archive = None;
+        let mut extension_host = false;
         let mut index = 0;
 
         while index < args.len() {
@@ -205,12 +207,16 @@ impl VsixSmokeArgs {
                         args.get(index).context("missing value after --archive")?,
                     ));
                 }
+                "--extension-host" => extension_host = true,
                 arg => bail!("unknown vsix-smoke argument `{arg}`"),
             }
             index += 1;
         }
 
-        Ok(Self { archive })
+        Ok(Self {
+            archive,
+            extension_host,
+        })
     }
 }
 
@@ -1832,6 +1838,30 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
         "vsix smoke passed: {} ({contributed} tools, catalog matches)",
         archive.display()
     );
+
+    if args.extension_host {
+        run_extension_host_smoke(&root, smoke_dir.path())?;
+    }
+
+    Ok(())
+}
+
+/// Launches a real VS Code extension host against the extracted VSIX and runs
+/// the in-host suite: activation, tool registration, and a help invocation
+/// through the packaged binary.
+fn run_extension_host_smoke(root: &Path, smoke_dir: &Path) -> Result<()> {
+    let extension_dir = smoke_dir.join("extension");
+
+    let status = Command::new("pnpm")
+        .args(["--filter", "visible-browser-lab", "test:extension-host"])
+        .env("VBL_EXTENSION_PATH", &extension_dir)
+        .current_dir(root)
+        .status()
+        .context("failed to launch the VS Code extension host smoke")?;
+    if !status.success() {
+        bail!("VS Code extension host smoke failed");
+    }
+    println!("extension host smoke passed");
     Ok(())
 }
 
