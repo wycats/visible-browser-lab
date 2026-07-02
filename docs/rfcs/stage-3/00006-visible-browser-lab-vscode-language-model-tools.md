@@ -141,14 +141,23 @@ transport without changing the browser contract or the VS Code tool names.
 The extension contributes one language model tool for each production browser
 tool. The contributed names use a `visible_browser_lab_` prefix so they do not
 collide with tools from other extensions. For example, the browser method
-`snapshot` is contributed as `visible_browser_lab_snapshot` and receives a
-prompt reference name such as `vbl_snapshot`.
+`snapshot` is contributed as `visible_browser_lab_snapshot`.
+
+A small curated set of tools is additionally prompt-referenceable: the `help`
+front door is exposed as `#vbl`, and common inspection entry points such as
+`snapshot`, `screenshot`, and `navigate` receive `vbl_`-prefixed reference
+names. The rest of the catalog is model-only. Prompt references exist for
+users, and a user plausibly types `#vbl` or `#vbl_snapshot`; nobody types
+`#vbl_claim_tab`. Every prompt-referenceable tool also doubles its entry in
+the tool picker, so referenceability is a cost paid per tool rather than a
+free default.
 
 The extension's `package.json` tool contributions are generated from the shared
 catalog by `cargo xtask vscode-manifest --sync` and committed. Each language
 model tool contribution receives the shared title, the shared input schema, a
-model description derived from the shared tool description, an activation
-event, and an exact `vbl_<tool>` prompt reference name. `cargo xtask validate`
+model description derived from the shared tool description, and an activation
+event; curated tools also receive their exact prompt reference name. `cargo
+xtask validate`
 fails when the committed contributions drift from the runtime catalog in any of
 those fields. This generation step matters because VS Code language model tools
 are statically contributed. Runtime catalog discovery alone cannot make tools

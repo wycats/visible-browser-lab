@@ -705,25 +705,42 @@ fn production_tool_definitions() -> Result<Vec<ToolDefinition>> {
     Ok(tools)
 }
 
+/// Tools a user can attach by hand with `#` in the chat input. Every
+/// prompt-referenceable tool doubles its entry in the tool picker, so this
+/// stays limited to the tools a user plausibly types: `#vbl` pulls in the
+/// help front door, and the rest are common inspection entry points.
+const PROMPT_REFERENCED_TOOLS: &[(&str, &str)] = &[
+    ("help", "vbl"),
+    ("snapshot", "vbl_snapshot"),
+    ("screenshot", "vbl_screenshot"),
+    ("navigate", "vbl_navigate"),
+];
+
 fn vscode_language_model_tool(tool: &ToolDefinition) -> Value {
-    json!({
+    let mut contribution = json!({
         "name": vscode_tool_name(&tool.name),
         "displayName": tool.title,
         "userDescription": tool.description,
         "modelDescription": vscode_model_description(tool),
-        "canBeReferencedInPrompt": true,
-        "toolReferenceName": vscode_tool_reference_name(&tool.name),
         "icon": "$(browser)",
         "inputSchema": tool.input_schema,
-    })
+    });
+    if let Some(reference) = vscode_tool_reference_name(&tool.name) {
+        contribution["canBeReferencedInPrompt"] = Value::Bool(true);
+        contribution["toolReferenceName"] = Value::String(reference.to_string());
+    }
+    contribution
 }
 
 fn vscode_tool_name(tool_name: &str) -> String {
     format!("visible_browser_lab_{tool_name}")
 }
 
-fn vscode_tool_reference_name(tool_name: &str) -> String {
-    format!("vbl_{tool_name}")
+fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
+    PROMPT_REFERENCED_TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, reference)| *reference)
 }
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
@@ -763,20 +780,46 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
         if contribution["displayName"].as_str() != Some(tool.title.as_str()) {
             bail!("VS Code displayName for `{expected_name}` does not match the shared catalog");
         }
-        let reference_name = contribution["toolReferenceName"]
-            .as_str()
-            .with_context(|| format!("VS Code tool `{expected_name}` omitted toolReferenceName"))?;
-        let expected_reference = vscode_tool_reference_name(&tool.name);
-        if reference_name != expected_reference {
+        match vscode_tool_reference_name(&tool.name) {
+            Some(expected_reference) => {
+                let reference_name =
+                    contribution["toolReferenceName"]
+                        .as_str()
+                        .with_context(|| {
+                            format!("VS Code tool `{expected_name}` omitted toolReferenceName")
+                        })?;
+                if reference_name != expected_reference {
+                    bail!(
+                        "VS Code tool reference for `{expected_name}` is `{reference_name}`; expected `{expected_reference}`"
+                    );
+                }
+                if !reference_names.insert(reference_name.to_string()) {
+                    bail!("VS Code tool reference `{reference_name}` is not unique");
+                }
+                if contribution["canBeReferencedInPrompt"] != Value::Bool(true) {
+                    bail!(
+                        "VS Code tool `{expected_name}` must set canBeReferencedInPrompt to true"
+                    );
+                }
+            }
+            None => {
+                if !contribution["toolReferenceName"].is_null() {
+                    bail!(
+                        "VS Code tool `{expected_name}` is not prompt-referenceable and must omit toolReferenceName"
+                    );
+                }
+                if contribution["canBeReferencedInPrompt"] == Value::Bool(true) {
+                    bail!(
+                        "VS Code tool `{expected_name}` is not prompt-referenceable and must not set canBeReferencedInPrompt"
+                    );
+                }
+            }
+        }
+        if contribution["inputSchema"]["type"] != "object" {
             bail!(
-                "VS Code tool reference for `{expected_name}` is `{reference_name}`; expected `{expected_reference}`"
+                "VS Code input schema for `{expected_name}` must declare `\"type\": \"object\"`; \
+                 VS Code drops schemas without it"
             );
-        }
-        if !reference_names.insert(reference_name.to_string()) {
-            bail!("VS Code tool reference `{reference_name}` is not unique");
-        }
-        if contribution["canBeReferencedInPrompt"] != Value::Bool(true) {
-            bail!("VS Code tool `{expected_name}` must set canBeReferencedInPrompt to true");
         }
         let activation_event = format!("onLanguageModelTool:{expected_name}");
         if !activation_events
@@ -2496,6 +2539,23 @@ fn git_head() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_referenced_tools_are_production_tools_with_unique_references() {
+        let mut references = std::collections::BTreeSet::new();
+        for (name, reference) in PROMPT_REFERENCED_TOOLS {
+            assert!(
+                PRODUCTION_TOOLS.contains(name),
+                "`{name}` is not a production tool"
+            );
+            assert!(
+                references.insert(*reference),
+                "reference `{reference}` is duplicated"
+            );
+        }
+        assert_eq!(vscode_tool_reference_name("help"), Some("vbl"));
+        assert_eq!(vscode_tool_reference_name("claim_tab"), None);
+    }
 
     #[test]
     fn release_version_normalizes_tag_prefix() {

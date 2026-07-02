@@ -515,7 +515,11 @@ fn compact_domain_input_schema(domain: &str, operations: &[&str]) -> Value {
         definitions.insert("e".to_string(), element_target());
         definitions.insert("o".to_string(), observation_mode_schema());
     }
-    json!({"$defs": definitions, "oneOf": variants})
+    // Every variant is an object, so the top-level `type` is redundant for
+    // validation. It is required anyway: the MCP spec and VS Code's language
+    // model tool contribution both demand `"type": "object"` at the top level,
+    // and VS Code drops schemas without it.
+    json!({"type": "object", "$defs": definitions, "oneOf": variants})
 }
 
 fn compact_domain_output_schema(domain: &str, operations: &[&str]) -> Value {
@@ -2002,6 +2006,13 @@ pub fn validate_catalog_contract() -> Result<()> {
             || !tool.annotations.is_object()
         {
             bail!("tool `{}` has incomplete MCP metadata", tool.name);
+        }
+        if tool.input_schema["type"] != "object" {
+            bail!(
+                "tool `{}` input schema must declare `\"type\": \"object\"` at the top level; \
+                 MCP and VS Code language model tools both require it",
+                tool.name
+            );
         }
         serde_json::from_value::<Tool>(serde_json::to_value(tool)?).map_err(|error| {
             anyhow::anyhow!("tool `{}` is not valid MCP metadata: {error}", tool.name)
