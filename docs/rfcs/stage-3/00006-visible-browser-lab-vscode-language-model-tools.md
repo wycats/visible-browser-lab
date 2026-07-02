@@ -156,12 +156,23 @@ The extension's `package.json` tool contributions are generated from the shared
 catalog by `cargo xtask vscode-manifest --sync` and committed. Each language
 model tool contribution receives the shared title, the shared input schema, a
 model description derived from the shared tool description, and an activation
-event; curated tools also receive their exact prompt reference name. `cargo
-xtask validate`
-fails when the committed contributions drift from the runtime catalog in any of
-those fields. This generation step matters because VS Code language model tools
-are statically contributed. Runtime catalog discovery alone cannot make tools
-visible in the tool picker or available for agent mode.
+event; curated tools also receive their exact prompt reference name.
+`cargo xtask validate` fails when the committed contributions drift from the
+runtime catalog in any of those fields. This generation step matters because
+VS Code language model tools are statically contributed. Runtime catalog
+discovery alone cannot make tools visible in the tool picker or available for
+agent mode.
+
+The contribution surface also carries a schema requirement that JSON Schema
+itself does not impose. The nine specialized-domain tools express their input
+contracts as `oneOf` variants, and every variant is an object, so a top-level
+`"type": "object"` declaration is redundant for validation. It is required
+anyway: MCP mandates it, and VS Code silently drops input schemas without it,
+leaving the model to invoke those tools with no parameter information beyond
+the description text. The shared catalog declares the top-level type on the
+compact domain schemas, the contract validator rejects any tool input schema
+that omits it, and manifest validation independently checks the committed
+contributions.
 
 At activation time the extension reads its own contributions and registers a
 generic `LanguageModelTool` implementation for each one. The implementation
@@ -240,12 +251,14 @@ before assets upload.
 ## User Experience
 
 For a VS Code user, installing Visible Browser Lab should look like installing
-an ordinary extension. The extension contributes named browser tools that can be
-enabled, disabled, and referenced in chat. The first browser task starts or
-reuses the managed Chrome profile unless the user configured an external CDP
-endpoint. When an agent invokes a tool, VS Code shows a tool-specific progress
-message. When the operation affects visible browser ownership or focus, VS Code
-can ask for confirmation before the broker runs it.
+an ordinary extension. The extension contributes named browser tools that can
+be enabled and disabled in the tool picker, and the curated entry points can be
+attached by hand: `#vbl` invokes the help front door, and references such as
+`#vbl_snapshot` attach the common inspection tools. The first browser task
+starts or reuses the managed Chrome profile unless the user configured an
+external CDP endpoint. When an agent invokes a tool, VS Code shows a
+tool-specific progress message. When the operation affects visible browser
+ownership or focus, VS Code can ask for confirmation before the broker runs it.
 
 The agent-facing workflow remains the one taught by RFC 00005: start a session,
 work only with owned tab IDs, inspect pages through snapshots, act through
@@ -312,7 +325,8 @@ operation. This would recreate the ergonomics problem the RFC is meant to solve.
 ## Implementation
 
 The implementation landed in three pull requests, each leaving the repository
-in a coherent state.
+in a coherent state, followed by a fourth that reconciled the contribution
+surface with live use.
 
 The foundation (#28) extracted the shared Rust surface and kept MCP behavior
 stable. `VisibleBrowserLabSurface` took ownership of the catalog, help routing,
@@ -336,6 +350,19 @@ packaged binary. `help` is the invocation target because it is the one
 production tool that answers without starting a browser, so the smoke proves
 the extension-to-binary chain without Chrome in the packaging job.
 
+Live dogfooding (#33) drove the installed extension from a working chat
+session and surfaced two defects the packaging smoke could not see. Every
+contributed tool was prompt-referenceable, so the chat tool picker listed each
+tool twice, once by name and once by reference name; and the domain tools
+reached the model with empty parameter schemas because their compact schemas
+omitted the top-level object type. The fix curated the prompt-reference set,
+declared the type in the shared catalog, and added regression guards in both
+the contract validator and manifest validation. The same PR added
+`cargo xtask dogfood` (aliased as `cargo dogfood:vscode`), which builds the
+working tree into a validated VSIX and installs it into the developer's own
+VS Code, so the loop that found these defects is one command and a window
+reload.
+
 ## Stage 3 Criteria
 
 The implemented contract holds, with each criterion backed by shipped
@@ -353,6 +380,12 @@ validation:
   `cargo xtask vscode-manifest --sync`, and `cargo xtask validate` fails on any
   drift in names, schemas, display metadata, reference names, or activation
   events.
+- Every tool input schema declares the top-level object type that MCP requires
+  and VS Code depends on; the contract validator and the manifest validator
+  each reject a schema without it.
+- Prompt referenceability is curated rather than default: `help` is
+  referenceable as `#vbl`, inspection entry points keep `vbl_`-prefixed names,
+  and validation rejects reference metadata on any other tool.
 - VS Code calls pass the active editor's workspace folder to the shared
   surface, observe cancellation at the process boundary, and provide
   invocation and confirmation messages derived from the invocation input.
