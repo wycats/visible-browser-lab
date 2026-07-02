@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-PROFILE_DIR="${VISIBLE_BROWSER_PROFILE_DIR:-/Users/wycats/.cache/v0-visible-browser-profile}"
+PROFILE_DIR="${VISIBLE_BROWSER_PROFILE_DIR:-$HOME/.cache/v0-visible-browser-profile}"
 CDP_PORT="${VISIBLE_BROWSER_CDP_PORT:-9222}"
 START_URL="${1:-http://localhost:3002/}"
 
