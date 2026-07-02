@@ -834,14 +834,17 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
                 }
             }
             None => {
-                if !contribution["toolReferenceName"].is_null() {
+                let keys = contribution
+                    .as_object()
+                    .with_context(|| format!("VS Code tool `{expected_name}` is not an object"))?;
+                if keys.contains_key("toolReferenceName") {
                     bail!(
                         "VS Code tool `{expected_name}` is not prompt-referenceable and must omit toolReferenceName"
                     );
                 }
-                if contribution["canBeReferencedInPrompt"] == Value::Bool(true) {
+                if keys.contains_key("canBeReferencedInPrompt") {
                     bail!(
-                        "VS Code tool `{expected_name}` is not prompt-referenceable and must not set canBeReferencedInPrompt"
+                        "VS Code tool `{expected_name}` is not prompt-referenceable and must omit canBeReferencedInPrompt"
                     );
                 }
             }
