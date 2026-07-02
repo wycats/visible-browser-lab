@@ -479,43 +479,42 @@ fn domain_tool(
 }
 
 fn compact_domain_input_schema(domain: &str, operations: &[&str]) -> Value {
-    let scope_name = if domain == "artifacts" { "s" } else { "p" };
-    let scope = if domain == "artifacts" {
-        object_schema(
-            vec![("agent_session_id", string_schema())],
-            &["agent_session_id"],
-        )
+    // One flat object per domain: the operation discriminator is an enum and
+    // the properties are the union of every operation's fields. Field types
+    // are consistent across operations within a domain, so the union is
+    // well defined; per-operation required fields are enforced by the broker,
+    // which returns a structured invalid_input error naming the field.
+    //
+    // The earlier design expressed each operation as a `oneOf` variant, which
+    // validated more precisely but did not survive model-facing schema
+    // pipelines: VS Code's chat layer types arguments from the top-level
+    // `properties` map, and with an empty map every argument reached the
+    // broker as a string. Property-level composition (nested `oneOf` such as
+    // element targets) survives those pipelines; top-level composition does
+    // not.
+    let mut properties = if domain == "artifacts" {
+        Map::from_iter([("agent_session_id".to_string(), string_schema())])
     } else {
-        page_scope_schema()
+        page_scope_properties()
     };
-    let variants = operations
-        .iter()
-        .map(|operation| {
-            let mut properties =
-                Map::from_iter([("operation".to_string(), const_string(operation))]);
-            for (name, mut schema) in operation_fields(domain, operation) {
-                replace_nested_schema(&mut schema, &element_target(), "#/$defs/e");
-                replace_nested_schema(&mut schema, &observation_mode_schema(), "#/$defs/o");
-                properties.insert(name.to_string(), schema);
+    properties.insert("operation".to_string(), enum_schema(operations));
+    for operation in operations {
+        for (name, schema) in operation_fields(domain, operation) {
+            if let Some(existing) = properties.get(name) {
+                assert_eq!(
+                    existing, &schema,
+                    "field `{name}` has conflicting schemas across `{domain}` operations"
+                );
             }
-            let mut required = vec!["operation"];
-            required.extend(operation_required(domain, operation));
-            json!({
-                "allOf": [
-                    {"$ref": format!("#/$defs/{scope_name}")},
-                    {"type":"object", "properties":properties, "required":required}
-                ],
-                "unevaluatedProperties": false
-            })
-        })
-        .collect::<Vec<_>>();
-    let variants = merge_equivalent_input_variants(variants);
-    let mut definitions = Map::from_iter([(scope_name.to_string(), scope)]);
-    if domain == "interact" {
-        definitions.insert("e".to_string(), element_target());
-        definitions.insert("o".to_string(), observation_mode_schema());
+            properties.insert(name.to_string(), schema);
+        }
     }
-    json!({"$defs": definitions, "oneOf": variants})
+    let mut required = vec!["agent_session_id"];
+    if domain != "artifacts" {
+        required.push("tab_id");
+    }
+    required.push("operation");
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 
 fn compact_domain_output_schema(domain: &str, operations: &[&str]) -> Value {
@@ -594,34 +593,6 @@ fn compact_domain_output_schema(domain: &str, operations: &[&str]) -> Value {
         schema["$defs"] = Value::Object(definitions);
     }
     schema
-}
-
-fn merge_equivalent_input_variants(variants: Vec<Value>) -> Vec<Value> {
-    let mut groups: Vec<(Value, Vec<String>)> = Vec::new();
-    for mut variant in variants {
-        let operation = variant["allOf"][1]["properties"]["operation"]["const"]
-            .as_str()
-            .expect("operation discriminator")
-            .to_string();
-        variant["allOf"][1]["properties"]["operation"] = json!({"const":"$operation"});
-        if let Some((_, operations)) = groups.iter_mut().find(|(existing, _)| *existing == variant)
-        {
-            operations.push(operation);
-        } else {
-            groups.push((variant, vec![operation]));
-        }
-    }
-    groups
-        .into_iter()
-        .map(|(mut variant, operations)| {
-            variant["allOf"][1]["properties"]["operation"] = if operations.len() == 1 {
-                const_string(&operations[0])
-            } else {
-                enum_schema(&operations.iter().map(String::as_str).collect::<Vec<_>>())
-            };
-            variant
-        })
-        .collect()
 }
 
 fn replace_nested_schema(value: &mut Value, needle: &Value, reference: &str) {
@@ -2002,6 +1973,13 @@ pub fn validate_catalog_contract() -> Result<()> {
             || !tool.annotations.is_object()
         {
             bail!("tool `{}` has incomplete MCP metadata", tool.name);
+        }
+        if tool.input_schema["type"] != "object" {
+            bail!(
+                "tool `{}` input schema must declare `\"type\": \"object\"` at the top level; \
+                 MCP and VS Code language model tools both require it",
+                tool.name
+            );
         }
         serde_json::from_value::<Tool>(serde_json::to_value(tool)?).map_err(|error| {
             anyhow::anyhow!("tool `{}` is not valid MCP metadata: {error}", tool.name)

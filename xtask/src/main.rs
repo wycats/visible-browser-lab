@@ -80,6 +80,7 @@ fn main() -> Result<()> {
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "vscode-manifest" => vscode_manifest(VscodeManifestArgs::parse(args.collect())?),
         "vsix-smoke" => vsix_smoke(VsixSmokeArgs::parse(args.collect())?),
+        "dogfood" => dogfood(DogfoodArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
@@ -104,6 +105,9 @@ usage:
   cargo xtask checksums [--dir <dir>]
   cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
   cargo xtask vsix-smoke [--archive <path>] [--extension-host]
+  cargo xtask dogfood [--code <path>]
+      Builds the extension and binary from the working tree and installs the
+      VSIX into the local VS Code. Reload the window to pick it up.
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
@@ -191,6 +195,33 @@ impl PackageArgs {
 struct VsixSmokeArgs {
     archive: Option<PathBuf>,
     extension_host: bool,
+}
+
+#[derive(Debug)]
+struct DogfoodArgs {
+    code: Option<PathBuf>,
+}
+
+impl DogfoodArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut code = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--code" => {
+                    index += 1;
+                    code = Some(PathBuf::from(
+                        args.get(index).context("missing value after --code")?,
+                    ));
+                }
+                arg => bail!("unknown dogfood argument `{arg}`"),
+            }
+            index += 1;
+        }
+
+        Ok(Self { code })
+    }
 }
 
 impl VsixSmokeArgs {
@@ -705,25 +736,42 @@ fn production_tool_definitions() -> Result<Vec<ToolDefinition>> {
     Ok(tools)
 }
 
+/// Tools a user can attach by hand with `#` in the chat input. Every
+/// prompt-referenceable tool doubles its entry in the tool picker, so this
+/// stays limited to the tools a user plausibly types: `#vbl` pulls in the
+/// help front door, and the rest are common inspection entry points.
+const PROMPT_REFERENCED_TOOLS: &[(&str, &str)] = &[
+    ("help", "vbl"),
+    ("snapshot", "vbl_snapshot"),
+    ("screenshot", "vbl_screenshot"),
+    ("navigate", "vbl_navigate"),
+];
+
 fn vscode_language_model_tool(tool: &ToolDefinition) -> Value {
-    json!({
+    let mut contribution = json!({
         "name": vscode_tool_name(&tool.name),
         "displayName": tool.title,
         "userDescription": tool.description,
         "modelDescription": vscode_model_description(tool),
-        "canBeReferencedInPrompt": true,
-        "toolReferenceName": vscode_tool_reference_name(&tool.name),
         "icon": "$(browser)",
         "inputSchema": tool.input_schema,
-    })
+    });
+    if let Some(reference) = vscode_tool_reference_name(&tool.name) {
+        contribution["canBeReferencedInPrompt"] = Value::Bool(true);
+        contribution["toolReferenceName"] = Value::String(reference.to_string());
+    }
+    contribution
 }
 
 fn vscode_tool_name(tool_name: &str) -> String {
     format!("visible_browser_lab_{tool_name}")
 }
 
-fn vscode_tool_reference_name(tool_name: &str) -> String {
-    format!("vbl_{tool_name}")
+fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
+    PROMPT_REFERENCED_TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, reference)| *reference)
 }
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
@@ -763,20 +811,49 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
         if contribution["displayName"].as_str() != Some(tool.title.as_str()) {
             bail!("VS Code displayName for `{expected_name}` does not match the shared catalog");
         }
-        let reference_name = contribution["toolReferenceName"]
-            .as_str()
-            .with_context(|| format!("VS Code tool `{expected_name}` omitted toolReferenceName"))?;
-        let expected_reference = vscode_tool_reference_name(&tool.name);
-        if reference_name != expected_reference {
+        match vscode_tool_reference_name(&tool.name) {
+            Some(expected_reference) => {
+                let reference_name =
+                    contribution["toolReferenceName"]
+                        .as_str()
+                        .with_context(|| {
+                            format!("VS Code tool `{expected_name}` omitted toolReferenceName")
+                        })?;
+                if reference_name != expected_reference {
+                    bail!(
+                        "VS Code tool reference for `{expected_name}` is `{reference_name}`; expected `{expected_reference}`"
+                    );
+                }
+                if !reference_names.insert(reference_name.to_string()) {
+                    bail!("VS Code tool reference `{reference_name}` is not unique");
+                }
+                if contribution["canBeReferencedInPrompt"] != Value::Bool(true) {
+                    bail!(
+                        "VS Code tool `{expected_name}` must set canBeReferencedInPrompt to true"
+                    );
+                }
+            }
+            None => {
+                let keys = contribution
+                    .as_object()
+                    .with_context(|| format!("VS Code tool `{expected_name}` is not an object"))?;
+                if keys.contains_key("toolReferenceName") {
+                    bail!(
+                        "VS Code tool `{expected_name}` is not prompt-referenceable and must omit toolReferenceName"
+                    );
+                }
+                if keys.contains_key("canBeReferencedInPrompt") {
+                    bail!(
+                        "VS Code tool `{expected_name}` is not prompt-referenceable and must omit canBeReferencedInPrompt"
+                    );
+                }
+            }
+        }
+        if contribution["inputSchema"]["type"] != "object" {
             bail!(
-                "VS Code tool reference for `{expected_name}` is `{reference_name}`; expected `{expected_reference}`"
+                "VS Code input schema for `{expected_name}` must declare `\"type\": \"object\"`; \
+                 VS Code drops schemas without it"
             );
-        }
-        if !reference_names.insert(reference_name.to_string()) {
-            bail!("VS Code tool reference `{reference_name}` is not unique");
-        }
-        if contribution["canBeReferencedInPrompt"] != Value::Bool(true) {
-            bail!("VS Code tool `{expected_name}` must set canBeReferencedInPrompt to true");
         }
         let activation_event = format!("onLanguageModelTool:{expected_name}");
         if !activation_events
@@ -1847,6 +1924,34 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Builds the extension bundle and release binary from the working tree,
+/// packages a VSIX, validates it, and installs it into the local VS Code.
+/// The window must be reloaded afterwards to pick up the new build.
+fn dogfood(args: DogfoodArgs) -> Result<()> {
+    let root = repo_root()?;
+    let archive = build_disposable_vsix(&root)?;
+    validate_vsix_archive(&archive)?;
+
+    let code = args.code.unwrap_or_else(|| PathBuf::from("code"));
+    let output = Command::new(&code)
+        .arg("--install-extension")
+        .arg(&archive)
+        .arg("--force")
+        .output()
+        .with_context(|| format!("failed to run `{}`", code.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`{} --install-extension` failed: {}",
+            code.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    println!("installed {}", archive.display());
+    println!("reload the VS Code window to activate the new build");
+    Ok(())
+}
+
 /// Launches a real VS Code extension host against the extracted VSIX and runs
 /// the in-host suite: activation, tool registration, and a help invocation
 /// through the packaged binary.
@@ -2496,6 +2601,23 @@ fn git_head() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_referenced_tools_are_production_tools_with_unique_references() {
+        let mut references = std::collections::BTreeSet::new();
+        for (name, reference) in PROMPT_REFERENCED_TOOLS {
+            assert!(
+                PRODUCTION_TOOLS.contains(name),
+                "`{name}` is not a production tool"
+            );
+            assert!(
+                references.insert(*reference),
+                "reference `{reference}` is duplicated"
+            );
+        }
+        assert_eq!(vscode_tool_reference_name("help"), Some("vbl"));
+        assert_eq!(vscode_tool_reference_name("claim_tab"), None);
+    }
 
     #[test]
     fn release_version_normalizes_tag_prefix() {

@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Dogfood: install extension into this VS Code",
+      "type": "shell",
+      "command": "cargo xtask dogfood",
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}
