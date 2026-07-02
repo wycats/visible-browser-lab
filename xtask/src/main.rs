@@ -1835,7 +1835,7 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
     }
 
     println!(
-        "vsix smoke passed: {} ({contributed} tools, catalog matches)",
+        "package check passed: {} ({contributed} tools, catalog matches)",
         archive.display()
     );
 
@@ -1843,6 +1843,7 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
         run_extension_host_smoke(&root, smoke_dir.path())?;
     }
 
+    println!("vsix smoke passed");
     Ok(())
 }
 
