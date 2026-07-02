@@ -163,16 +163,21 @@ VS Code language model tools are statically contributed. Runtime catalog
 discovery alone cannot make tools visible in the tool picker or available for
 agent mode.
 
-The contribution surface also carries a schema requirement that JSON Schema
-itself does not impose. The nine specialized-domain tools express their input
-contracts as `oneOf` variants, and every variant is an object, so a top-level
-`"type": "object"` declaration is redundant for validation. It is required
-anyway: MCP mandates it, and VS Code silently drops input schemas without it,
-leaving the model to invoke those tools with no parameter information beyond
-the description text. The shared catalog declares the top-level type on the
-compact domain schemas, the contract validator rejects any tool input schema
-that omits it, and manifest validation independently checks the committed
-contributions.
+The contribution surface also carries schema requirements that JSON Schema
+itself does not impose. Two of them shaped the shared catalog. First, a
+top-level `"type": "object"` declaration: MCP mandates it, and VS Code
+silently drops input schemas without it, leaving the model to invoke tools
+with no parameter information beyond the description text. The contract
+validator rejects any tool input schema that omits it, and manifest validation
+independently checks the committed contributions. Second, top-level
+composition does not survive the chat layer: the specialized-domain tools
+originally expressed their input contracts as `oneOf` variants, and VS Code
+typed their arguments from the empty top-level `properties` map, so every
+argument reached the broker as a string. The domain input schemas are now
+flat objects whose `operation` property is an enum and whose properties are
+the union of every operation's fields, with per-operation field requirements
+enforced by the broker. Property-level composition, such as element targets,
+survives the pipeline and remains expressed in schema.
 
 At activation time the extension reads its own contributions and registers a
 generic `LanguageModelTool` implementation for each one. The implementation
@@ -351,13 +356,17 @@ production tool that answers without starting a browser, so the smoke proves
 the extension-to-binary chain without Chrome in the packaging job.
 
 Live dogfooding (#33) drove the installed extension from a working chat
-session and surfaced two defects the packaging smoke could not see. Every
+session and surfaced three defects the packaging smoke could not see. Every
 contributed tool was prompt-referenceable, so the chat tool picker listed each
-tool twice, once by name and once by reference name; and the domain tools
-reached the model with empty parameter schemas because their compact schemas
-omitted the top-level object type. The fix curated the prompt-reference set,
-declared the type in the shared catalog, and added regression guards in both
-the contract validator and manifest validation. The same PR added
+tool twice, once by name and once by reference name. The domain tools reached
+the model with empty parameter schemas because their compact schemas omitted
+the top-level object type. And after that fix shipped, a live `interact` call
+still failed: the chat layer types arguments from the top-level `properties`
+map, so the `oneOf`-based domain schemas made every argument arrive as a
+string, which the broker correctly rejected. The fixes curated the
+prompt-reference set, declared the top-level type, flattened the domain input
+schemas to single objects with an `operation` enum, and added regression
+guards in the contract validator and manifest validation. The same PR added
 `cargo xtask dogfood` (aliased as `cargo dogfood:vscode`), which builds the
 working tree into a validated VSIX and installs it into the developer's own
 VS Code, so the loop that found these defects is one command and a window

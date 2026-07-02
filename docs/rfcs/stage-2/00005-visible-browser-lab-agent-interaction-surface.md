@@ -618,6 +618,17 @@ Inline reads are bounded. Export paths are relative to the active workspace root
 Each domain tool accepts `PageScope` plus one tagged operation. `artifacts` uses
 `agent_session_id` and verifies artifact ownership directly.
 
+The tagged unions below are the semantic contract: they define which field
+combinations are valid for each operation, and the broker enforces them,
+returning a structured `invalid_input` error naming the offending field. The
+published JSON Schema for each domain tool is deliberately flatter than the
+union: one object whose `operation` property is an enum and whose properties
+are the union of every operation's fields. Model-facing schema pipelines type
+tool arguments from the top-level `properties` map and do not reliably
+preserve top-level `oneOf` composition; a flat schema keeps argument types
+intact everywhere, while property-level composition such as `ElementTarget`
+survives those pipelines and remains expressed in schema.
+
 ```ts
 type InteractInput = PageScope & (
   | { operation: "select_options"; target: ElementTarget; values: string[];
@@ -945,7 +956,7 @@ The stable catalog presents 27 tools. Explicit page tools and task-named domains
 
 Accessibility references depend on the live document. Dynamic pages can replace nodes between observation and action. The broker reports a stale reference and makes a fresh snapshot the recovery path.
 
-Grouped domain tools place operation validation in the broker. Tagged operation schemas, output schemas, help results, and deterministic contract tests keep those operations discoverable.
+Grouped domain tools place operation validation in the broker. The published domain input schemas are flat, so schema validation alone does not express which fields each operation requires; broker errors, output schemas, help results, and deterministic contract tests keep those operations discoverable and correct.
 
 Full accessibility snapshots and browser artifacts can be large. Snapshot modes, depth and node limits, compact diffs, bounded diagnostic results, pagination, and artifact handles control context growth.
 
@@ -980,7 +991,7 @@ The Stage 2 evidence consists of:
 
 - a capability matrix covering 23 default Playwright MCP operations and 29 default Chrome DevTools MCP operations;
 - one shared 27-tool contract and 63-tool comparison catalog consumed by the production MCP server and evaluation server;
-- an `o200k_base` catalog measurement of 15,668 tokens for the hybrid catalog and 27,193 tokens for the comparison catalog, a ratio of 57.62 percent;
+- an `o200k_base` catalog measurement of 15,668 tokens for the hybrid catalog and 27,193 tokens for the comparison catalog, a ratio of 57.62 percent, at promotion; the flattened domain input schemas later reduced the measurement to 15,002 against 30,307, a ratio of 49.50 percent;
 - 29 successful tasks and 29 correct first selections across 30 isolated GPT-5.5 medium-reasoning trials, with zero semantic fallback violations and zero foreign-tab actions;
 - real-browser tests for the ownership boundary, accessibility references, actionability, all 45 domain operations, artifact containment, trace and heap analysis, and silent AV1-in-WebM capture;
 - strict workspace Clippy, workspace tests, Windows ARM64 compilation, release-input validation, and deterministic catalog validation.
