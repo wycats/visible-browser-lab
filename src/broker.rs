@@ -2449,12 +2449,15 @@ async fn broker_navigate_v3(
     }
     state.references().lock().unwrap().reset_tab(&params.tab_id);
     update_owned_target_snapshot(state, &params.tab_id, &target)?;
+    // Navigation establishes a new document and invalidates prior element
+    // references, so the default observation is a full snapshot rather than a
+    // diff against the previous document's tree.
     post_action_observation(
         state,
         &params.agent_session_id,
         &params.tab_id,
         &target,
-        params.observe.unwrap_or_default(),
+        params.observe.unwrap_or(ObservationMode::Snapshot),
     )
     .await
 }
