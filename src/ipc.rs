@@ -67,27 +67,25 @@ pub async fn accept(listener: &BrokerListener) -> std::io::Result<BrokerStream> 
     listener.accept().await
 }
 
+#[cfg(windows)]
 pub fn default_endpoint_display(state_dir: &Path) -> String {
-    #[cfg(windows)]
-    {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
-        let mut hasher = DefaultHasher::new();
-        state_dir.hash(&mut hasher);
-        return format!(
-            "visible-browser-lab-v{BROKER_PROTOCOL_VERSION}-{:016x}",
-            hasher.finish()
-        );
-    }
+    let mut hasher = DefaultHasher::new();
+    state_dir.hash(&mut hasher);
+    format!(
+        "visible-browser-lab-v{BROKER_PROTOCOL_VERSION}-{:016x}",
+        hasher.finish()
+    )
+}
 
-    #[cfg(not(windows))]
-    {
-        state_dir
-            .join(format!("broker-v{BROKER_PROTOCOL_VERSION}.sock"))
-            .to_string_lossy()
-            .into_owned()
-    }
+#[cfg(not(windows))]
+pub fn default_endpoint_display(state_dir: &Path) -> String {
+    state_dir
+        .join(format!("broker-v{BROKER_PROTOCOL_VERSION}.sock"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn endpoint_name(display: &str) -> Result<Name<'static>> {

@@ -121,6 +121,10 @@ pub struct CatalogMeasurement {
 }
 
 pub fn hybrid_catalog() -> Vec<ToolDefinition> {
+    // Annotation values are the conservative contract from RFC 00005: a tool
+    // that can mutate page, lease, or artifact state never claims read-only,
+    // and a domain tool advertises the most conservative value any of its
+    // operations requires.
     vec![
         tool(
             "start_session",
@@ -131,6 +135,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             false,
             false,
             false,
+            true,
         ),
         tool(
             "list_tabs",
@@ -140,6 +145,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             list_tabs_result(),
             true,
             false,
+            true,
             true,
         ),
         tool(
@@ -151,6 +157,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             false,
             false,
             false,
+            true,
         ),
         tool(
             "claim_tab",
@@ -159,8 +166,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             claim_tab_schema(),
             tab_result(),
             false,
+            true,
             false,
-            false,
+            true,
         ),
         tool(
             "release_tab",
@@ -169,7 +177,8 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             page_scope_schema(),
             boolean_result("released"),
             false,
-            false,
+            true,
+            true,
             true,
         ),
         tool(
@@ -181,6 +190,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             false,
             false,
             true,
+            true,
         ),
         tool(
             "close_tab",
@@ -191,6 +201,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             false,
             true,
             true,
+            true,
         ),
         tool(
             "snapshot",
@@ -199,6 +210,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             snapshot_schema(),
             snapshot_result(),
             true,
+            false,
             false,
             true,
         ),
@@ -211,6 +223,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             false,
             false,
             false,
+            true,
         ),
         tool(
             "wait_for",
@@ -221,6 +234,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             true,
             false,
             true,
+            true,
         ),
         tool(
             "click",
@@ -229,8 +243,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             click_schema(),
             action_result(),
             false,
+            true,
             false,
-            false,
+            true,
         ),
         tool(
             "fill",
@@ -239,8 +254,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             fill_schema(),
             action_result(),
             false,
-            false,
-            false,
+            true,
+            true,
+            true,
         ),
         tool(
             "fill_form",
@@ -249,8 +265,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             fill_form_schema(),
             form_result(),
             false,
-            false,
-            false,
+            true,
+            true,
+            true,
         ),
         tool(
             "type_text",
@@ -259,8 +276,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             type_text_schema(),
             action_result(),
             false,
+            true,
             false,
-            false,
+            true,
         ),
         tool(
             "press_key",
@@ -269,8 +287,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             press_key_schema(),
             action_result(),
             false,
+            true,
             false,
-            false,
+            true,
         ),
         tool(
             "screenshot",
@@ -278,7 +297,8 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Capture an owned page or referenced element as a renderable image artifact.",
             screenshot_schema(),
             screenshot_result(),
-            true,
+            false,
+            false,
             false,
             true,
         ),
@@ -288,6 +308,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Evaluate JavaScript for page state that semantic snapshots and diagnostics do not expose.",
             evaluate_schema(),
             evaluation_result(),
+            false,
             true,
             false,
             true,
@@ -298,12 +319,18 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Perform select, checkbox, hover, drag, drop, upload, dialog, scroll, or coordinate interaction.",
             operations("interact"),
             false,
+            true,
+            false,
+            true,
         ),
         domain_tool(
             "console",
             "Console Diagnostics",
             "List, inspect, or clear lease-scoped console diagnostics.",
             operations("console"),
+            false,
+            true,
+            true,
             true,
         ),
         domain_tool(
@@ -311,6 +338,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Network Diagnostics",
             "List, inspect, or clear lease-scoped network diagnostics.",
             operations("network"),
+            false,
+            true,
+            true,
             true,
         ),
         domain_tool(
@@ -319,6 +349,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Configure viewport, network, CPU, geolocation, media, user agent, or headers for an owned target.",
             operations("emulation"),
             false,
+            false,
+            true,
+            true,
         ),
         domain_tool(
             "performance",
@@ -326,12 +359,18 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Capture traces, read web vitals, and analyze broker-produced performance artifacts.",
             operations("performance"),
             false,
+            false,
+            false,
+            true,
         ),
         domain_tool(
             "audit",
             "Audit",
             "Run accessibility, best-practices, SEO, or agentic-browsing audits against an owned tab.",
             operations("audit"),
+            false,
+            false,
+            false,
             true,
         ),
         domain_tool(
@@ -340,6 +379,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Capture and inspect bounded heap-snapshot artifacts for an owned tab.",
             operations("memory"),
             false,
+            true,
+            false,
+            true,
         ),
         domain_tool(
             "screencast",
@@ -347,12 +389,18 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             "Start, stop, or inspect an owned-tab screencast recording.",
             operations("screencast"),
             false,
+            false,
+            false,
+            true,
         ),
         domain_tool(
             "artifacts",
             "Artifacts",
             "List, inspect, read, export, or delete browser artifacts owned by the session.",
             operations("artifacts"),
+            false,
+            true,
+            false,
             false,
         ),
         tool(
@@ -364,6 +412,7 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
             true,
             false,
             true,
+            false,
         ),
     ]
 }
@@ -438,6 +487,7 @@ fn tool(
     read_only: bool,
     destructive: bool,
     idempotent: bool,
+    open_world: bool,
 ) -> ToolDefinition {
     ToolDefinition {
         name: name.to_string(),
@@ -450,17 +500,21 @@ fn tool(
             "readOnlyHint": read_only,
             "destructiveHint": destructive,
             "idempotentHint": idempotent,
-            "openWorldHint": true
+            "openWorldHint": open_world
         }),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn domain_tool(
     name: &str,
     title: &str,
     description: &str,
     ops: &[&str],
     read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
 ) -> ToolDefinition {
     let description = format!(
         "{description} Set `operation` to one of: {}.",
@@ -473,8 +527,9 @@ fn domain_tool(
         compact_domain_input_schema(name, ops),
         compact_domain_output_schema(name, ops),
         read_only,
-        false,
-        read_only,
+        destructive,
+        idempotent,
+        open_world,
     )
 }
 
@@ -2127,6 +2182,35 @@ mod tests {
             assert!(tool.input_schema.is_object());
             assert!(tool.output_schema.is_object());
             assert!(tool.annotations.is_object());
+        }
+    }
+
+    #[test]
+    fn annotations_stay_conservative_about_mutation_and_reach() {
+        let read_only: BTreeSet<&str> = ["list_tabs", "wait_for", "snapshot", "help"]
+            .into_iter()
+            .collect();
+        let closed_world: BTreeSet<&str> = ["artifacts", "help"].into_iter().collect();
+        for tool in hybrid_catalog() {
+            let name = tool.name.as_str();
+            let hint = |key: &str| {
+                tool.annotations[key]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{name} is missing annotation {key}"))
+            };
+            assert_eq!(
+                hint("readOnlyHint"),
+                read_only.contains(name),
+                "{name} readOnlyHint"
+            );
+            assert_eq!(
+                hint("openWorldHint"),
+                !closed_world.contains(name),
+                "{name} openWorldHint"
+            );
+            if hint("readOnlyHint") {
+                assert!(!hint("destructiveHint"), "{name} read-only yet destructive");
+            }
         }
     }
 

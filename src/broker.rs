@@ -2449,12 +2449,15 @@ async fn broker_navigate_v3(
     }
     state.references().lock().unwrap().reset_tab(&params.tab_id);
     update_owned_target_snapshot(state, &params.tab_id, &target)?;
+    // Navigation establishes a new document and invalidates prior element
+    // references, so the default observation is a full snapshot rather than a
+    // diff against the previous document's tree.
     post_action_observation(
         state,
         &params.agent_session_id,
         &params.tab_id,
         &target,
-        params.observe.unwrap_or_default(),
+        params.observe.unwrap_or(ObservationMode::Snapshot),
     )
     .await
 }
@@ -3735,6 +3738,12 @@ async fn broker_interact(
                 .get("data")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let data_is_empty = data.as_object().is_some_and(serde_json::Map::is_empty);
+            if paths.is_empty() && data_is_empty {
+                return Err(BrowserToolError::invalid_input(
+                    "`drop` requires at least one non-empty `paths` or `data` member",
+                ));
+            }
             retry_element_action(timeout_ms, || {
                 state.browser.drop_data_backend_node(
                     &target,
@@ -3759,6 +3768,11 @@ async fn broker_interact(
         }
         "handle_dialog" => {
             let action = string_argument(&params.arguments, "action")?;
+            if action != "accept" && action != "dismiss" {
+                return Err(BrowserToolError::invalid_input(
+                    "`action` must be `accept` or `dismiss`",
+                ));
+            }
             state
                 .browser
                 .handle_dialog(
@@ -3771,6 +3785,11 @@ async fn broker_interact(
         "scroll" => {
             let delta_x = number_argument_or(&params.arguments, "delta_x", 0.0)?;
             let delta_y = number_argument_or(&params.arguments, "delta_y", 0.0)?;
+            if delta_x == 0.0 && delta_y == 0.0 {
+                return Err(BrowserToolError::invalid_input(
+                    "`scroll` requires a non-zero `delta_x` or `delta_y`",
+                ));
+            }
             if params.arguments.contains_key("target") {
                 let element =
                     resolve_domain_backend_element(state, &params, tab_id, &target, "target")
