@@ -2193,7 +2193,11 @@ mod tests {
         let closed_world: BTreeSet<&str> = ["artifacts", "help"].into_iter().collect();
         for tool in hybrid_catalog() {
             let name = tool.name.as_str();
-            let hint = |key: &str| tool.annotations[key].as_bool().unwrap();
+            let hint = |key: &str| {
+                tool.annotations[key]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{name} is missing annotation {key}"))
+            };
             assert_eq!(
                 hint("readOnlyHint"),
                 read_only.contains(name),
