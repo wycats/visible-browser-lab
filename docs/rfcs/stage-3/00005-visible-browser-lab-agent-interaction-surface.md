@@ -105,7 +105,7 @@ The server instructions and skill describe the normal workflow. Tool description
 
 ## Tool Descriptions and Annotations
 
-The catalog uses these agent-facing descriptions and MCP annotations:
+The catalog uses these agent-facing descriptions and MCP annotations. Domain tools additionally append a generated suffix listing their operations (`Set \`operation\` to one of: ...`), so the published description always names every legal operation without hand-maintained duplication:
 
 | Tool | Description | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 | --- | --- | --- | --- | --- | --- |
@@ -119,7 +119,7 @@ The catalog uses these agent-facing descriptions and MCP annotations:
 | `snapshot` | Inspect the compact accessibility tree and obtain lease-scoped element references for semantic actions. | true | false | false | true |
 | `navigate` | Navigate an owned tab by URL, history, or reload while preserving application focus. | false | false | false | true |
 | `wait_for` | Wait for semantic text, element state, URL, page load, or JavaScript state in an owned tab. | true | false | true | true |
-| `click` | Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. | false | true | false | true |
+| `click` | Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback. | false | true | false | true |
 | `fill` | Replace the value of one referenced editable control and return a compact accessibility observation. | false | true | true | true |
 | `fill_form` | Fill two or more referenced form controls sequentially and report completed fields. | false | true | true | true |
 | `type_text` | Insert text at the selection of one referenced editable element while preserving application focus. | false | true | false | true |
@@ -1081,16 +1081,17 @@ validation:
   and zero foreign-tab actions.
 - Real-browser tests cover the ownership boundary, accessibility references,
   actionability, all 45 domain operations, artifact containment, trace and
-  heap analysis, and silent AV1-in-WebM capture; the workspace suite passes
-  with strict Clippy across all six release targets.
+  heap analysis, and silent AV1-in-WebM capture; CI gates every push on
+  formatting, warning-free Clippy across the workspace, the workspace unit
+  suites, and release-input validation on Linux, macOS, and Windows.
 - Routine page actions preserve the user's active application; targetless
   raw input requires explicit `focus_tab` handoff, verified by real-browser
   tests and recorded in the non-intrusive interaction evidence.
 - The surface has operated as the production contract since the 0.3.0
-  release, through the MCP server and the VS Code extension, including live
-  dogfooding sessions that exercised session lifecycle, semantic actions,
-  specialized interaction, emulation, and artifact flows against the
-  installed packages.
+  release through the MCP server, and since the 0.4.0 release through the
+  VS Code extension, including live dogfooding sessions that exercised
+  session lifecycle, semantic actions, specialized interaction, emulation,
+  and artifact flows against the installed packages.
 
 # Remaining Work
 
