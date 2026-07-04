@@ -205,7 +205,6 @@ fn activate_x11_process(pid: u32) -> Result<()> {
         protocol::xproto::{
             AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask, Window,
         },
-        wrapper::ConnectionExt as _,
     };
 
     let (connection, screen_number) = x11rb::connect(None).context("failed to connect to X11")?;
@@ -442,7 +441,7 @@ fn launch_chrome(
 
 fn chrome_arguments_for(
     config: &RuntimeConfig,
-    family: ChromeFamily,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] family: ChromeFamily,
     launch_mode: BrowserLaunchMode,
     capture_logs: bool,
 ) -> Vec<OsString> {
@@ -647,7 +646,7 @@ fn launch_windows_background(
         .encode_utf16()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    let mut startup = STARTUPINFOW {
+    let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         dwFlags: STARTF_USESHOWWINDOW,
         wShowWindow: SW_SHOWNOACTIVATE as u16,
@@ -664,7 +663,7 @@ fn launch_windows_background(
             CREATE_NEW_PROCESS_GROUP,
             std::ptr::null(),
             std::ptr::null(),
-            &mut startup,
+            &startup,
             &mut process,
         )
     };
