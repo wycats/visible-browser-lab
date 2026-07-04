@@ -8,7 +8,7 @@ Visible Browser Lab exposes one lease-scoped browser interface for agents that i
 
 Agents inspect unfamiliar pages through compact accessibility snapshots. Snapshots issue short element references that remain subordinate to `agent_session_id` and `tab_id`; the broker validates tab ownership before resolving a reference or invoking Chrome. CSS selectors remain available as an explicit fallback for pages whose useful targets are absent from the accessibility representation.
 
-The v0.3 interface is one coherent contract for tab ownership, semantic page interaction, browser diagnostics, and generated artifacts.
+The interface shipped in the 0.3 release line and is one coherent contract for tab ownership, semantic page interaction, browser diagnostics, and generated artifacts.
 
 # Motivation
 
@@ -47,14 +47,14 @@ Release, close, takeover, missing-target recovery, broker restart, and top-level
 
 ## Compatibility Floor
 
-The v0.3 surface provides a task-oriented mapping for the default capabilities exposed by these package versions:
+The surface provides a task-oriented mapping for the default capabilities exposed by these package versions:
 
 - `@playwright/mcp` 0.0.76 core automation and tab management.
 - `chrome-devtools-mcp` 1.3.0 input, navigation, emulation, performance, network, and debugging operations enabled by the plugin configuration, including heap capture.
 
 The mapping preserves each browser outcome through a task-oriented operation. Shared operations appear once. Lease tools provide tab selection, and accessibility references provide element identity within an owned document.
 
-The version-pinned [capability matrix](../evidence/00005-agent-interaction-surface/capability-matrix.md) maps all 23 default Playwright MCP operations and all 29 functional Chrome DevTools MCP operations available under the original configuration. Chrome DevTools MCP's feature-gated memory-analysis, screencast, and coordinate-input operations are identified separately; v0.3 includes them as deliberate product capabilities.
+The version-pinned [capability matrix](../evidence/00005-agent-interaction-surface/capability-matrix.md) maps all 23 default Playwright MCP operations and all 29 functional Chrome DevTools MCP operations available under the original configuration. Chrome DevTools MCP's feature-gated memory-analysis, screencast, and coordinate-input operations are identified separately; the surface includes them as deliberate product capabilities.
 
 Extension management, experimental third-party developer tools, experimental WebMCP, and Playwright opt-in config, routing, storage, DevTools, PDF, vision, and verification packs remain separate capabilities.
 
@@ -105,41 +105,47 @@ The server instructions and skill describe the normal workflow. Tool description
 
 ## Tool Descriptions and Annotations
 
-The catalog uses these agent-facing descriptions and MCP annotations:
+The catalog uses these agent-facing descriptions and MCP annotations. Domain tools additionally append a generated suffix listing their operations (`Set \`operation\` to one of: ...`), so the published description always names every legal operation without hand-maintained duplication:
 
 | Tool | Description | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 | --- | --- | --- | --- | --- | --- |
-| `start_session` | Start one browser task and optionally create its first owned tab. Use this before every other browser tool. | false | false | false | true |
-| `list_tabs` | List this session's tab leases, or inspect the shared read-only target inventory. | true | false | true | true |
-| `new_tab` | Create a background tab owned by this session. Request focus only for user handoff to the visible browser. | false | false | false | true |
-| `claim_tab` | Claim an unowned target, or perform a user-instructed takeover that returns a new tab lease. | false | true | false | true |
-| `release_tab` | End ownership while leaving the Chrome target open and claimable. | false | true | true | true |
-| `focus_tab` | Bring an owned tab to the foreground for user handoff or manual inspection. | false | false | true | true |
-| `close_tab` | Close an owned Chrome target and its lease. | false | true | true | true |
-| `snapshot` | Inspect user-perceivable page structure and obtain element references for later actions. | true | false | false | true |
-| `navigate` | Change the owned tab's URL or session history and observe the resulting document. | false | false | false | true |
-| `wait_for` | Wait for page text, element state, URL, load state, expression, or a bounded delay. | true | false | true | true |
-| `click` | Invoke one referenced or explicitly selected element after target-session attachment and actionability checks. | false | true | false | true |
-| `fill` | Replace the value of one editable control without activating Chrome. | false | true | true | true |
-| `fill_form` | Apply two or more typed field updates and report partial completion on failure. | false | true | true | true |
-| `type_text` | Insert text at an editable target's current selection without activating Chrome. | false | true | false | true |
-| `press_key` | Dispatch one browser-protocol key sequence to a resolved element, or to the focused owned document after explicit handoff. | false | true | false | true |
-| `screenshot` | Capture visual page state as MCP image content and an owned artifact. | false | false | false | true |
-| `evaluate` | Read or modify page state with JavaScript when the semantic tools do not expose it. | false | true | false | true |
-| `interact` | Perform a specialized user interaction such as hover, drag, upload, dialog handling, scrolling, or coordinate input. | false | true | false | true |
-| `console` | List, inspect, or clear console diagnostics collected for an owned tab. | false | true | true | true |
-| `network` | List, inspect, or clear network diagnostics collected for an owned tab. | false | true | true | true |
-| `emulation` | Set or reset the owned target's viewport, network, CPU, location, media, user agent, or request headers. | false | false | true | true |
-| `performance` | Record, summarize, or analyze performance data from an owned tab. | false | false | false | true |
-| `audit` | Run accessibility, SEO, best-practices, and agentic-browsing checks against an owned tab. | false | false | false | true |
-| `memory` | Capture and inspect an owned tab's JavaScript heap artifacts. | false | true | false | true |
-| `screencast` | Start, stop, or inspect a recording bound to an owned tab. | false | false | false | true |
-| `artifacts` | List, inspect, read, export, or delete outputs owned by the browser session. | false | true | false | false |
-| `help` | Select a browser tool or domain operation from the task the agent needs to perform. | true | false | true | false |
+| `start_session` | Start one lease-scoped browser session and optionally create its first background tab. | false | false | false | true |
+| `list_tabs` | List caller-owned tab leases, or request the read-only target inventory without foreign action handles. | true | false | true | true |
+| `new_tab` | Create a background browser tab and lease it to the caller's session. | false | false | false | true |
+| `claim_tab` | Claim an unowned target, or perform an explicitly instructed ownership transfer. | false | true | false | true |
+| `release_tab` | Release an owned tab lease while leaving its browser target open and claimable. | false | true | true | true |
+| `focus_tab` | Bring an owned tab and its browser window to the foreground for explicit user handoff or manual inspection. | false | false | true | true |
+| `close_tab` | Close an owned browser target and complete its lease. | false | true | true | true |
+| `snapshot` | Inspect the compact accessibility tree and obtain lease-scoped element references for semantic actions. | true | false | false | true |
+| `navigate` | Navigate an owned tab by URL, history, or reload while preserving application focus. | false | false | false | true |
+| `wait_for` | Wait for semantic text, element state, URL, page load, or JavaScript state in an owned tab. | true | false | true | true |
+| `click` | Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback. | false | true | false | true |
+| `fill` | Replace the value of one referenced editable control and return a compact accessibility observation. | false | true | true | true |
+| `fill_form` | Fill two or more referenced form controls sequentially and report completed fields. | false | true | true | true |
+| `type_text` | Insert text at the selection of one referenced editable element while preserving application focus. | false | true | false | true |
+| `press_key` | Dispatch one key to a referenced element, or to the focused owned document after explicit handoff. | false | true | false | true |
+| `screenshot` | Capture an owned page or referenced element as a renderable image artifact. | false | false | false | true |
+| `evaluate` | Evaluate JavaScript for page state that semantic snapshots and diagnostics do not expose. | false | true | false | true |
+| `interact` | Perform select, checkbox, hover, drag, drop, upload, dialog, scroll, or coordinate interaction. | false | true | false | true |
+| `console` | List, inspect, or clear lease-scoped console diagnostics. | false | true | true | true |
+| `network` | List, inspect, or clear lease-scoped network diagnostics. | false | true | true | true |
+| `emulation` | Configure viewport, network, CPU, geolocation, media, user agent, or headers for an owned target. | false | false | true | true |
+| `performance` | Capture traces, read web vitals, and analyze broker-produced performance artifacts. | false | false | false | true |
+| `audit` | Run accessibility, best-practices, SEO, or agentic-browsing audits against an owned tab. | false | false | false | true |
+| `memory` | Capture and inspect bounded heap-snapshot artifacts for an owned tab. | false | true | false | true |
+| `screencast` | Start, stop, or inspect an owned-tab screencast recording. | false | false | false | true |
+| `artifacts` | List, inspect, read, export, or delete browser artifacts owned by the session. | false | true | false | false |
+| `help` | Choose the preferred explicit tool or specialized-domain operation for a browser task. | true | false | true | false |
 
-MCP annotations apply to the complete top-level tool. A domain tool advertises
-the conservative value required by any of its operations. Each domain result
-also returns the selected operation so callers can interpret its effect.
+Each domain tool's published description also appends its operation list:
+"Set `operation` to one of: ...". MCP annotations apply to the complete
+top-level tool. A domain tool advertises the conservative value required by
+any of its operations: `console` and `network` are not read-only because
+their `clear` operations irreversibly discard diagnostics, and `evaluate` is
+not read-only because it runs arbitrary page JavaScript. A contract test pins
+the read-only set, the closed-world set, and the invariant that read-only
+tools are never destructive. Each domain result also returns the selected
+operation so callers can interpret its effect.
 
 ## Shared Schema Types
 
@@ -176,10 +182,36 @@ type Observation =
   | { mode: "diff"; diff: SnapshotDiff }
   | { mode: "snapshot"; snapshot: SnapshotResult };
 
+type PageActionEffect = {
+  pre_url: string;
+  post_url: string;
+  url_changed: boolean;
+  network_event_count: number;
+  network_events: JsonValue[];
+  accessibility_changed?: boolean;
+  accessibility_changed_node_count?: number;
+};
+
+type PageActionEvidence = {
+  delivery_mode: "browser_protocol_input" | "semantic_dom_activation";
+  release_delivery: "chrome_ack" | "dialog_event" | "delivery_uncertain";
+  delivery_uncertain: boolean;
+  resolved_element?: JsonValue;
+  center_hit_test?: JsonValue;
+  effect: PageActionEffect;
+};
+
 type PageActionResult = {
   document_revision: DocumentRevision;
   observation: Observation;
+  action?: PageActionEvidence;
 };
+
+`click` populates `action` with delivery and effect evidence so quiet submit
+flows are verifiable: whether input was delivered through the browser
+protocol or fell back to semantic DOM activation, whether Chrome
+acknowledged the release, and what URL, network, and accessibility changes
+followed within the observation window.
 
 type ArtifactSummary = {
   artifact_id: ArtifactId;
@@ -747,8 +779,8 @@ type ArtifactsInput = { agent_session_id: AgentSessionId } & (
 `drop` requires at least one non-empty `paths` or `data` member. `scroll`
 requires a non-zero delta. `set_network` accepts either one preset or explicit
 network values. Empty headers reset the request-header override. Pagination
-limits default to 100 and are capped at 1,000; inline diagnostic and artifact
-reads default to 256 KiB and are capped at 1 MiB.
+limits default to 100 and are capped at 500; inline diagnostic and artifact
+reads default to 64 KiB and are capped at 1 MiB.
 
 ## Domain Output Schemas
 
@@ -877,19 +909,24 @@ type HelpResult = {
 The MCP server publishes these instructions with the catalog:
 
 > Start each browser task with `start_session` and retain its
-> `agent_session_id`. Use only `tab_id` values owned by that session. Inspect an
-> unfamiliar page with `snapshot`, then act through its element references.
-> Use `fill` for one field, `fill_form` for a form, `wait_for` for asynchronous
-> state, and `screenshot` for visual appearance. Use `console` and `network`
+> `agent_session_id`. Use only `tab_id` values owned by that session. Inspect
+> an unfamiliar page with `snapshot`, then act through its element references.
+> Use `fill` for one ordinary field. Use `fill_form` for two or more controls,
+> including combined select and checkbox updates. Use `type_text` for
+> contenteditable controls and insertion at an established caret. Use
+> `press_key` with a target for named keys or shortcuts against a resolved
+> element. Use targetless `press_key` and `interact` `click_at` only after
+> `focus_tab` has focused the owned document. Use `wait_for` for asynchronous
+> state and `screenshot` for visual appearance. Use `console` and `network`
 > for runtime diagnosis. Use `help` to select an operation in a specialized
-> domain. `click`, targeted `press_key`, and referenced pointer operations
-> attach to the owned target, prepare the resolved element, run actionability
-> checks, and preserve the user's active application during normal browser work.
-> Targetless `press_key` and `interact` `click_at` require `focus_tab` first.
-> Target activation, including CDP `Target.activateTarget`, is reserved for
-> `focus_tab` and `focus: true` tab creation when the user asks to bring managed
-> Chrome forward for handoff or manual inspection. CSS and `evaluate` are
-> explicit escape hatches for page state the semantic tools do not expose.
+> domain. Routine `click`, targeted key, and referenced pointer actions attach
+> to the owned target, prepare the resolved element, and preserve the user's
+> active application. Target activation, including CDP `Target.activateTarget`,
+> is reserved for `focus_tab` and `focus: true` tab creation when the user
+> asks to bring Chrome forward for manual inspection or handoff. CSS and
+> `evaluate` are escape hatches only when `snapshot` and the named semantic
+> tools cannot represent the required state; do not use them to verify a
+> semantic action.
 
 These instructions establish the decision path without duplicating individual
 input schemas.
@@ -909,7 +946,9 @@ The installed skill teaches one ordered workflow:
 9. Use `evaluate` or a CSS target when the semantic page model cannot represent the required state or element.
 10. Release a tab that another agent may continue, or close a tab whose browser work is complete.
 
-Domain tool descriptions enumerate their operations. An invalid operation returns `unsupported_operation` with recovery `help`.
+Domain tool descriptions enumerate their operations. An unknown tool name
+returns `unsupported_operation` with recovery `help`; an unknown operation
+within a domain returns `invalid_input` naming the operation.
 
 # Errors and Recovery
 
@@ -919,12 +958,17 @@ The browser error contract adds:
 - `element_ambiguous` -> `snapshot`
 - `element_stale` -> `snapshot`
 - `element_not_actionable` -> `wait_for`
-- `dialog_not_open` -> `help`
-- `artifact_not_found` -> `artifacts`
+- `focus_required` -> `focus_tab`
 - `unsupported_operation` -> `help`
-- `analysis_unavailable` -> `help`
 
-Every structured error includes a stable code, a concrete message, and one recovery operation. Ownership errors continue to return before element, diagnostic, artifact, or analyzer resolution.
+`invalid_input`, `artifact_not_found`, `artifact_error`,
+`workspace_unavailable`, and `path_outside_workspace` return a concrete
+message without a recovery operation: the message itself names the offending
+field, artifact, or path, and no single follow-up call repairs it.
+
+Every structured error includes a stable code and a concrete message, and
+names a recovery operation when one exists. Ownership errors continue to
+return before element, diagnostic, artifact, or analyzer resolution.
 
 # Implementation Shape
 
@@ -970,28 +1014,92 @@ A DOM-derived semantic tree can run as injected JavaScript. Chrome's Accessibili
 
 Bundled Playwright and Chrome DevTools MCP processes would preserve their internal behavior. A Chromiumoxide core keeps ownership validation, target selection, focus policy, runtime packaging, errors, outputs, analysis, and artifact generation inside one broker contract.
 
-# Stage 2 Criteria
+# Implementation
 
-Stage 2 promotion requires:
+The surface shipped in the 0.3 release line and hardened through live use in
+the 0.4 line. The trajectory after the Stage 2 draft:
 
-- The version-pinned capability matrix maps every default operation from `@playwright/mcp` 0.0.76 and `chrome-devtools-mcp` 1.3.0 to an explicit tool, domain operation, lease operation, or named semantic equivalent.
-- Exact MCP input and output schemas exist for the stable catalog.
-- The server instructions, skill, tool descriptions, help topics, annotations, and output schemas describe one decision path.
-- A production-path prototype returns compact AX snapshots, resolves lease-scoped references across main frames and iframes, performs ref-based click and fill, reports stale references, and returns post-action observations.
-- At least 30 isolated Codex trials cover page discovery, forms, waits, history, frames, dialogs and files, console and network diagnosis, performance, emulation, ownership refusal, and specialized-domain discovery.
-- At least 90 percent of trials complete the browser task.
-- At least 85 percent select the correct first relevant explicit tool or domain.
-- Semantic tasks do not use CSS or `evaluate` unless the task requests that path.
-- No trial acts on an unowned tab.
-- The hybrid catalog's serialized schema token count is at most 60 percent of a one-tool-per-operation catalog covering the same capability matrix.
-- The in-process performance analyzer compiles for all six release targets and preserves one public output contract.
-- Unit, fake-CDP, headless real-browser, visible macOS, Windows compile, package validation, and deterministic catalog checks pass.
+The v0.3 implementation delivered the complete catalog: 27 tools, 45 domain
+operations, the accessibility snapshot model, lease-scoped element references,
+actionability, post-action observations, bounded diagnostics, the in-process
+performance analyzer, heap analysis, audits, silent AV1-in-WebM screencast,
+and session-owned artifacts.
 
-The Stage 2 evidence consists of:
+The non-intrusive interaction recon (recorded in this RFC's evidence)
+overturned the draft's focus interpretation: OS foreground focus is not
+required for normal headed-browser page actions. Routine `click`, targeted
+key, and referenced pointer actions now attach to the owned target, prepare
+the resolved element inside the document, and dispatch input through CDP
+without activating Chrome. Targetless raw input (`press_key` without `target`,
+`interact` `click_at`) returns `focus_required` until `focus_tab` has focused
+the owned document. This superseded RFC 00004's focused-document recovery
+path for `click`.
 
-- a capability matrix covering 23 default Playwright MCP operations and 29 default Chrome DevTools MCP operations;
-- one shared 27-tool contract and 63-tool comparison catalog consumed by the production MCP server and evaluation server;
-- an `o200k_base` catalog measurement of 15,668 tokens for the hybrid catalog and 27,193 tokens for the comparison catalog, a ratio of 57.62 percent, at promotion; the flattened domain input schemas later reduced the measurement to 15,002 against 30,307, a ratio of 49.50 percent;
-- 29 successful tasks and 29 correct first selections across 30 isolated GPT-5.5 medium-reasoning trials, with zero semantic fallback violations and zero foreign-tab actions;
-- real-browser tests for the ownership boundary, accessibility references, actionability, all 45 domain operations, artifact containment, trace and heap analysis, and silent AV1-in-WebM capture;
-- strict workspace Clippy, workspace tests, Windows ARM64 compilation, release-input validation, and deterministic catalog validation.
+Click delivery and effect evidence landed after quiet submit flows proved
+hard to verify: `click` results now carry a `PageActionEvidence` record with
+the delivery mode, Chrome's release acknowledgement, the resolved element,
+the hit-test, and URL, network, and accessibility effects.
+
+The domain input schemas flattened after live dogfooding of the VS Code
+extension (RFC 00006) showed that model-facing schema pipelines type
+arguments from the top-level `properties` map and drop top-level `oneOf`
+composition. The tagged unions remain the broker-enforced semantic contract;
+the published schemas are one flat object per domain with an `operation`
+enum. The flatten also reduced the hybrid catalog's token measurement.
+
+The annotation contract was implemented faithfully during Stage 3
+preparation: falsifying this document against the code showed the catalog
+builders had hardcoded `openWorldHint: true`, reused read-only as idempotent
+for domain tools, and claimed read-only for `evaluate`, `console`, and
+`network`. The catalog now declares all four hints per tool, a contract test
+pins the conservative sets, and navigation defaults to `observe: "snapshot"`
+as this document specifies.
+
+# Stage 3 Criteria
+
+The implemented contract holds, with each criterion backed by shipped
+validation:
+
+- The version-pinned capability matrix maps every default operation from
+  `@playwright/mcp` 0.0.76 and `chrome-devtools-mcp` 1.3.0 to an explicit
+  tool, domain operation, lease operation, or named semantic equivalent.
+- One shared catalog crate defines the 27-tool contract consumed by the
+  production MCP server, the VS Code extension manifest, and the evaluation
+  server; a deterministic validation command fails on any drift.
+- Every tool publishes a description, input schema, output schema, and all
+  four MCP annotations; contract tests pin the read-only set, the
+  closed-world set, and the read-only-never-destructive invariant.
+- The published domain input schemas are flat objects with an `operation`
+  enum, verified to survive model-facing schema pipelines in live VS Code
+  use; the broker enforces the per-operation tagged unions and returns
+  structured `invalid_input` errors naming the offending field.
+- The hybrid catalog's `o200k_base` serialization measures 15,002 tokens
+  against 30,307 for the 63-tool comparison catalog, a ratio of 49.50
+  percent, within the 60 percent budget.
+- 29 of 30 isolated GPT-5.5 medium-reasoning trials completed the browser
+  task with 29 correct first selections, zero semantic fallback violations,
+  and zero foreign-tab actions.
+- Real-browser tests cover the ownership boundary, accessibility references,
+  actionability, all 45 domain operations, artifact containment, trace and
+  heap analysis, and silent AV1-in-WebM capture; CI gates every push on
+  formatting, warning-free Clippy across the workspace, the workspace unit
+  suites, and release-input validation on Linux, macOS, and Windows.
+- Routine page actions preserve the user's active application; targetless
+  raw input requires explicit `focus_tab` handoff, verified by real-browser
+  tests and recorded in the non-intrusive interaction evidence.
+- The surface has operated as the production contract since the 0.3.0
+  release through the MCP server, and since the 0.4.0 release through the
+  VS Code extension, including live dogfooding sessions that exercised
+  session lifecycle, semantic actions, specialized interaction, emulation,
+  and artifact flows against the installed packages.
+
+# Remaining Work
+
+The evaluation evidence is a point-in-time measurement against GPT-5.5; it
+demonstrates the catalog design meets its selection and token budgets but is
+not re-run per release. Re-measurement matters when the catalog shape
+changes, and `cargo xtask catalog-measurement` regenerates the token
+evidence on demand.
+
+A broker-level cancel channel that aborts in-flight Chrome operations
+remains follow-up work shared with RFC 00006.
