@@ -263,6 +263,90 @@ mod tests {
 
         assert!(args.contains(&"--use-mock-keychain".into()));
     }
+
+    /// Chrome opens speculative preconnect sockets that never send a request.
+    /// A silent connection must not wedge the accept loop or block a real
+    /// request that arrives while the silent socket is still open.
+    #[test]
+    fn fixture_server_survives_silent_preconnect_sockets() {
+        let server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+
+        // Open silent connections that send nothing, like Chrome preconnects.
+        let _silent: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect(&address).expect("silent connect"))
+            .collect();
+        // Give the accept loop time to pick the silent sockets up first.
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(&address).expect("real connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+
+        assert!(
+            response.contains(r#"{"ok":true}"#),
+            "real request must be served while silent sockets are open: {response}"
+        );
+    }
+
+    /// Requests split across multiple TCP segments must still be served; a
+    /// single read may return before the full request line has arrived. The
+    /// split lands mid-path so a truncated read parses the wrong path.
+    #[test]
+    fn fixture_server_reads_slowly_delivered_requests() {
+        let server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+
+        let mut stream = TcpStream::connect(&address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream.write_all(b"GET /data.js").expect("write start");
+        stream.flush().expect("flush");
+        thread::sleep(Duration::from_millis(150));
+        stream
+            .write_all(b"on HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .expect("write rest");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(
+            response.contains(r#"{"ok":true}"#),
+            "split request must be served the JSON fixture: {response}"
+        );
+    }
+
+    /// A connection whose request bytes arrive after accept must still be
+    /// served. Accepted sockets can inherit the listener's non-blocking flag,
+    /// and an eager read that treats `WouldBlock` as EOF drops the connection.
+    #[test]
+    fn fixture_server_waits_for_late_request_bytes() {
+        let server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+
+        let mut stream = TcpStream::connect(&address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        // Let the accept loop pick this connection up before any bytes exist.
+        thread::sleep(Duration::from_millis(200));
+        stream
+            .write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .expect("write request");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        assert!(
+            response.contains(r#"{"ok":true}"#),
+            "late-arriving request must be served: {response}"
+        );
+    }
 }
 
 fn chrome_for_testing_cache_dir() -> PathBuf {
@@ -1224,7 +1308,13 @@ impl FixtureServer {
                 }
 
                 match listener.accept() {
-                    Ok((stream, _)) => handle_fixture_connection(stream),
+                    Ok((stream, _)) => {
+                        // Handle each connection on its own thread. Chrome opens
+                        // speculative preconnect sockets that never send a request;
+                        // handling connections serially lets one silent socket wedge
+                        // the accept loop and time out every navigation.
+                        thread::spawn(move || handle_fixture_connection(stream));
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
                     }
@@ -1257,11 +1347,36 @@ impl Drop for FixtureServer {
 }
 
 fn handle_fixture_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 2048];
-    let Ok(bytes) = stream.read(&mut buffer) else {
+    // Accepted sockets inherit the listener's non-blocking flag on some
+    // platforms; switch to blocking reads with a timeout so speculative
+    // preconnect sockets that never send bytes release the thread.
+    if stream.set_nonblocking(false).is_err() {
         return;
+    }
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .is_err()
+    {
+        return;
+    }
+
+    let mut buffer = Vec::with_capacity(2048);
+    let mut chunk = [0; 2048];
+    let request = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(bytes) => {
+                buffer.extend_from_slice(&chunk[..bytes]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break String::from_utf8_lossy(&buffer).into_owned();
+                }
+                if buffer.len() > 16 * 1024 {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
     };
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
     let path = request
         .lines()
         .next()

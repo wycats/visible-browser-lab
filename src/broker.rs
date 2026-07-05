@@ -3738,8 +3738,17 @@ async fn broker_interact(
                 .get("data")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let data_is_empty = data.as_object().is_some_and(serde_json::Map::is_empty);
-            if paths.is_empty() && data_is_empty {
+            let Some(data_entries) = data.as_object() else {
+                return Err(BrowserToolError::invalid_input(
+                    "`drop` requires `data` to be an object mapping MIME types to string values",
+                ));
+            };
+            if data_entries.values().any(|value| !value.is_string()) {
+                return Err(BrowserToolError::invalid_input(
+                    "`drop` requires every `data` value to be a string",
+                ));
+            }
+            if paths.is_empty() && data_entries.is_empty() {
                 return Err(BrowserToolError::invalid_input(
                     "`drop` requires at least one non-empty `paths` or `data` member",
                 ));
