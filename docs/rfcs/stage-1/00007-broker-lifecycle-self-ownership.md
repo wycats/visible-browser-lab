@@ -4,129 +4,140 @@
 
 # Summary
 
-The Visible Browser Lab broker gains an intrinsic lifecycle: it continuously verifies its own tenancy claim (state directory, socket, pid file) and exits when the claim is gone or when it has been idle past a bounded window. Today every lifecycle correction is extrinsic — a *future client* must connect to the same socket and notice a mismatch. This RFC makes the broker able to answer "should I still exist?" from its own observations, and keeps the extrinsic probe as a second line of defense.
+The Visible Browser Lab broker gains an intrinsic lifecycle. It re-verifies its own tenancy claim — the state directory, socket, and pid file that justify its existence — on a short cadence, and it exits on its own when that claim disappears or when it has served no one for a bounded window. Today, every lifecycle correction is extrinsic: a future client must connect to the same socket and notice that something is wrong. After this RFC, the broker can answer the question "should I still exist?" from its own observations, and the extrinsic probe becomes a second line of defense rather than the only one.
 
 # Motivation
 
-## The broker outlives every reason for its existence
+The broker is spawned fully detached. Nothing waits on it, nothing supervises it, and its accept loop has no exit condition. Sessions and leases live until a client releases them, and the process itself lives until something outside it decides otherwise. This was a deliberate simplification: the broker exists to outlive any single client, so tying it to a parent process was wrong, and in the common case it works exactly as intended.
 
-`spawn_broker` starts the broker fully detached: no parent process ties, nothing ever waits on it. Its accept loop has no exit condition. Leases never expire. Once started, a broker runs until something outside it decides otherwise.
+The mechanism that keeps this arrangement honest is the client-side probe. When a client needs a broker, `ensure_running` connects to the configured socket, pings, and compares the reported status against its own expectations. If the running broker doesn't match — wrong protocol version, wrong runtime mode, wrong CDP endpoint — the client terminates it and spawns a replacement. Correction happens at the moment of next contact.
 
-The existing correction mechanism is the client-side probe: `ensure_running` connects to the configured socket, pings, and compares the reported status against its own expectations (`broker_status_mismatch`). On mismatch it terminates the old daemon and spawns a replacement. This design silently assumes that **every socket will eventually be probed again**.
+The trouble is the phrase *next contact*. The probe-and-replace design silently assumes that every socket a broker listens on will eventually be probed again. That assumption is true for exactly one socket — the shared singleton in the user's cache directory, which every installed client connects to — and it is false everywhere else. We have now been bitten by both halves of this observation, in the same week.
 
-That assumption holds for exactly one socket — the user-cache singleton that installed clients share — and we have now hit both of the ways it fails:
+The first incident was version skew. The singleton socket *is* re-probed constantly, but the probe's compatibility predicate was incomplete: it compared the broker protocol version, which has not changed since 0.3.x, and said nothing about the package version. When the 0.4.2 extension was installed, it connected to the still-running 0.4.0 broker, found the protocol agreeable, and proceeded — so a freshly upgraded installation silently ran months-old broker behavior. The stale daemon was only discovered because a live smoke test checked for a behavior change that had just shipped, and it cost a debugging round before anyone thought to suspect the daemon's age. PR #41 fixed this instance by adding `package_version` to `BrokerStatus` and treating any difference as grounds for replacement.
 
-1. **Version skew across upgrades.** The singleton *is* re-probed, but the probe's compatibility predicate was incomplete: it compared `protocol_version` (unchanged since 0.3.x) but not the package version. After the 0.4.2 upgrade, the freshly installed extension silently kept talking to the 0.4.0 daemon; the stale behavior surfaced during live smoke testing and cost a debugging round before the daemon was killed by hand. PR #41 fixed this instance by adding `package_version` to `BrokerStatus` and treating any difference as incompatible.
-2. **Orphaned test brokers.** Each `headless_mcp` property test spawns a broker on a per-tempdir socket. When the test ends, the harness kills the MCP *client*; the tempdir — socket file and all — is deleted. Nobody ever contacts that socket path again, so the extrinsic correction never fires. The broker is immortal. An audit on 2026-07-05 found **195 orphaned broker daemons** accumulated over three days of test runs on a single development machine.
+The second incident was quieter and larger. Each `headless_mcp` property test spawns its own broker on a socket inside a per-test temporary directory. When the test finishes, the harness kills the MCP client it spawned, and the temporary directory — socket file included — is deleted. No client will ever connect to that socket path again, which means the extrinsic correction will never fire, which means the broker is immortal. An audit on 2026-07-05 found **195 orphaned broker daemons** on a single development machine, accumulated over three days of ordinary test runs.
 
-These are not two bugs. They are two instances of one class: **a daemon whose continued existence is justified by nothing it can observe.** Fixing instances (as #41 did, and as a harness `Drop` impl would) leaves the class open — the third instance will be some socket we have not thought of yet, discovered the same way these were: by surprise.
+It would be easy to treat these as two unrelated bugs: patch the probe (done, in #41), add a `Drop` implementation to the test harness that kills the broker (easy enough), and move on. But they are not two bugs. They are two instances of one class: **a daemon whose continued existence is justified by nothing it can observe.** The version-skew daemon had a live socket and a supervisor that was checking the wrong things; the orphaned daemons had sockets nobody would ever check. In both cases the broker itself had everything it needed to notice the problem — its binary had been replaced on disk, its socket had been deleted out from under it — and no code that looked.
 
-## What acceptable looks like
+Fixing instances leaves the class open. The third instance will be some socket we have not thought about yet, and we will find it the way we found these: by surprise, after accumulation. The class-level fix is to make the broker supervise itself.
 
-- A broker whose state directory or socket vanishes exits promptly on its own.
-- A broker that has served no one for a bounded period exits cleanly, because `ensure_running` can recreate it on demand in well under a second and managed Chrome re-adoption (`reused: true`) means the user's visible browser survives the gap.
-- The test suite leaves zero broker processes behind, and asserts so.
-- None of this depends on a future client happening to connect.
+What acceptable looks like, concretely: a broker whose state directory or socket vanishes should notice within seconds and exit; a broker that has served no clients for a bounded period should exit cleanly, because recreating one on demand costs well under a second and the managed Chrome window survives the gap; the test suite should leave zero broker processes behind and should assert as much. None of this may depend on a future client happening to connect.
 
 # Guide-level explanation
 
-## For users
+## What users see
 
-Nothing visible changes in normal operation. The broker still starts on demand and is shared by every client on the machine. What changes is what happens when the broker stops being needed:
+In normal operation, nothing changes. The broker still starts on demand, still shares one managed Chrome across every client on the machine, and still hands out isolated tabs per session. The changes appear at the edges of the lifecycle, which is precisely where today's behavior is surprising.
 
-- If you clear the cache directory (or an upgrade replaces it), the running broker notices within seconds and exits, instead of squatting on the old socket until something kills it.
-- If no client has used the broker for a while (default: 15 minutes with no connections and no active sessions), it exits. The next tool call transparently starts a fresh one. Your managed Chrome window is untouched — the new broker re-adopts it.
-- `pkill visible-browser-lab-mcp` is no longer part of anyone's upgrade ritual. (PR #41 already handles upgrades; this RFC removes the need for extrinsic correction at all in the common case.)
+If you clear the cache directory — or an uninstall, upgrade, or cleanup task does it for you — the running broker notices within a few seconds and exits. Today it would squat on the deleted socket path indefinitely, invisible except in `ps` output.
 
-## For contributors
+If nothing has used the broker for a while — no connections, no live sessions, for fifteen minutes by default — it exits on its own. The next tool call transparently starts a fresh broker, which re-adopts the managed Chrome profile that is already running. Your browser window, tabs, and login state are untouched; the only cost is a sub-second broker startup on the first call after a quiet stretch.
 
-The broker's tenancy claim is the set of filesystem artifacts it owns: its state directory, its socket path (on platforms where the endpoint is a filesystem object), and its pid file. The broker now treats that claim as a lease on its own existence, re-verified on a timer:
+And with #41's probe fix and this RFC together, `pkill visible-browser-lab-mcp` stops being part of anyone's upgrade ritual. The probe handles the case where a new client meets an old broker; self-ownership handles the case where no new client is coming.
 
-- **Claim gone → exit.** State dir deleted, socket file missing, or pid file present but naming a different pid (a replacement broker has taken over) — each means this broker's tenure has ended.
-- **Idle → exit.** Zero open client connections and zero live sessions for the full idle window means nobody needs this broker. It shuts down cleanly: stops accepting, removes the socket and pid file (only if the pid file still names it), and exits 0 with a logged reason.
+## How contributors should think about it
 
-Test harnesses get a short idle window via configuration, and the suite gains an end-of-run assertion that no broker with a test state-dir survives.
+The broker's claim to exist is not abstract — it is a set of filesystem artifacts the broker owns: its state directory, its socket (on platforms where the IPC endpoint is a filesystem object), and its pid file. Those artifacts are how clients find the broker and how replacement brokers displace it. This RFC's central move is to treat that claim as a *lease on the broker's own existence*, re-verified from inside on a timer.
+
+When the claim fails verification — the state directory is gone, the socket file is gone, or the pid file now names a different process because a replacement broker has taken over — the broker's tenure has ended, and it shuts down. When the claim is intact but nobody has needed the broker for the full idle window, the broker concludes that its work is done and shuts down too, releasing its artifacts on the way out.
+
+The key property in both cases is that shutdown is *safe by construction*: the client side was already built to treat "no broker answering" as "take the start lock and spawn one," so a broker that exits at an inconvenient moment costs the next caller one retry, not an error. Cheap recreation is what makes aggressive self-termination reasonable — the same insight that underlies socket-activated system services.
+
+Test harnesses configure a short idle window, so even a harness that dies by SIGKILL — where no cleanup code runs at all — leaves a broker that expires seconds later on its own.
 
 # Reference-level explanation
 
 ## Tenancy verification
 
-A `tenancy` task runs inside the broker on a fixed cadence (5 seconds). Each tick performs three checks, all local `stat`-class operations:
+A tenancy task runs inside the broker on a five-second cadence. Each tick re-verifies the broker's claim with three checks, all of them cheap local filesystem operations.
 
-1. **State directory exists.** `config.state_dir` must still be a directory. Tempdir deletion (the test-orphan case) trips this within one tick.
-2. **Endpoint object exists,** on platforms where `endpoint.stale_path()` is `Some` (Unix domain sockets). Windows named pipes have no filesystem object; the state-directory check carries the weight there, which is sufficient because per-tempdir test brokers place their state dir inside the tempdir.
-3. **Pid file names us.** If `config.pid_path` exists and parses to a pid other than `std::process::id()`, a replacement broker has claimed the socket path (the restart flow in `restart_incompatible_broker` deletes and rewrites these files). The incumbent must stand down.
+The first check is that `config.state_dir` still exists and is a directory. This is the check that catches the orphaned-test-broker case: the harness's temporary directory is deleted when the test ends, and the broker notices on the next tick.
 
-Any failed check logs the specific reason and begins shutdown. The checks are deliberately conservative: transient read errors (EINTR, permission blips) do not trip them; only a definitive negative does.
+The second check is that the IPC endpoint's filesystem object still exists, on platforms where there is one. Unix domain sockets have a socket file (`endpoint.stale_path()` returns `Some`); Windows named pipes do not, so this check is skipped there. That asymmetry is acceptable because the state-directory check carries the weight on Windows: test brokers place their state directory inside the same tempdir as everything else, so deletion of the tempdir still trips verification, just via a different check.
+
+The third check is that the pid file, if present and parseable, names this process. The restart flow in `restart_incompatible_broker` deletes the old broker's files and the replacement writes its own pid file; if an incumbent broker survives its own termination attempt for any reason, it will observe a pid file naming its successor and stand down voluntarily. This makes displacement safe from both directions — the replacer kills by pid, and the displaced broker also self-evicts.
+
+Verification is deliberately conservative about what counts as failure. A transient read error — an interrupted syscall, a permissions hiccup — does not end the broker's tenure; only a definitive negative does (the path affirmatively does not exist, or the pid file affirmatively names someone else). The failure mode this conservatism accepts is that a genuinely dead claim survives a few extra ticks; the failure mode it prevents is a healthy broker exiting because of filesystem noise.
 
 ## Idle tracking
 
-The broker maintains two counters it already has the raw material for:
+The broker already has the raw material for an idleness judgment; this RFC only asks it to keep two counters current. Open connections are counted by incrementing on accept and decrementing when `handle_connection` returns. Live sessions are already counted by the lease table. The broker records a `last_activity` timestamp whenever either count is nonzero or any request is dispatched.
 
-- **Open connections**: incremented on accept, decremented when `handle_connection` returns.
-- **Live sessions**: the lease table's session count.
+The tenancy tick then computes idleness as: both counters zero, *and* the time since `last_activity` meets the idle window. Long-running operations need no special treatment — an in-flight request necessarily holds its connection open, so it defers idleness by existing.
 
-The broker records `last_activity` whenever either counter is nonzero, or when any request is dispatched. The tenancy tick computes idleness as *both counters zero* and *now − last_activity ≥ idle window*. In-flight long operations hold a connection open, so they inherently defer idleness — no separate bookkeeping needed.
-
-The idle window defaults to **15 minutes**, configurable via `VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS` and a `--idle-timeout-secs` broker flag (flag wins). `0` disables idle exit (opt-out for unusual deployments); tenancy verification cannot be disabled.
+The idle window defaults to **fifteen minutes**. It is configurable through the `VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS` environment variable and an `--idle-timeout-secs` flag on the broker subcommand, with the flag taking precedence. A value of zero disables idle exit entirely, as an escape hatch for unusual deployments. Tenancy verification has no such escape hatch: a broker whose claim is gone has no legitimate reason to keep running, in any deployment.
 
 ## Shutdown sequence
 
-1. Log the reason (`tenancy: state dir removed`, `idle: 900s with no connections or sessions`, ...).
-2. Stop accepting: close the listener. New connectors get `ECONNREFUSED`/pipe-not-found, which `ensure_running` already treats as "no broker; take the start lock and spawn" — the existing retry loop absorbs the race.
-3. Drain: wait for open connections to finish, bounded by a short deadline (5 seconds), then proceed regardless.
-4. Release the claim: remove the socket file and pid file, each only if it still belongs to this broker (pid file re-read and compared before unlink).
-5. Exit 0.
+Shutdown proceeds in five steps, and the ordering matters.
 
-Managed Chrome is **always left running**. Re-adoption is the designed path (`ensure_managed_chrome` returns `reused: true` against a live profile), and terminating a visible browser on an idle timer would destroy user state for no benefit.
+The broker first logs the reason it is exiting — `tenancy: state dir removed`, `idle: 900s with no connections or sessions` — so that "why did the broker exit" is always answerable from `broker.stderr.log`. It then closes its listener, so new connectors fail fast with connection-refused rather than queueing behind a shutdown in progress; `ensure_running` already interprets that failure as "no broker here; take the start lock and spawn," so the racing client recovers without new code. Third, it drains: open connections get a short bounded grace period (five seconds) to finish their in-flight work, after which shutdown proceeds regardless. Fourth, it releases its claim, removing the socket file and pid file — each only after re-checking that the artifact still belongs to it, so a displaced broker cannot delete its successor's files. Finally it exits with status zero.
 
-## Race analysis
+One step deserves emphasis for what it does *not* do: shutdown never touches managed Chrome. Re-adoption of a live Chrome profile is the designed path — `ensure_managed_chrome` returns `reused: true` against a running profile — and terminating a user's visible browser because a daemon's idle timer fired would destroy real user state to save nothing. The broker's lifecycle and the browser's lifecycle are deliberately decoupled; this RFC tightens the former and leaves the latter alone.
 
-- **Client connects during shutdown.** Window between "listener closed" and "socket unlinked": connector fails, retries, hits the start lock, spawns a fresh broker after the old one releases its files. The start-lock path already serializes this.
-- **Replacement broker vs. lingering incumbent.** The pid-file check makes the incumbent self-evict; `restart_incompatible_broker` also terminates it by pid, so this is belt-and-suspenders in both directions.
-- **Idle exit races a new session.** The accept between tick N's idle verdict and shutdown's listener close: shutdown re-checks the connection counter after closing the listener; if a connection slipped in, shutdown aborts and the broker resumes. (Listener close before the re-check means the racing client may need one retry — again absorbed by `ensure_running`.)
+## Races
+
+Three races are constructible, and each resolves through machinery that already exists.
+
+A client can connect in the window between the listener closing and the socket file being unlinked. It experiences a refused connection, retries, and lands in the start-lock path, which serializes broker creation; it gets a fresh broker after the old one finishes releasing its files. This is the same path a client takes today when it beats the broker's startup, so no new behavior is required.
+
+A replacement broker can find its predecessor still alive — termination is asynchronous, and a process can linger briefly after being signaled. The pid-file check resolves this from the incumbent's side: it observes the successor's pid file and self-evicts. The successor, meanwhile, has already signaled it by pid. Displacement converges from both directions.
+
+An idle verdict can race a brand-new session: the tenancy tick judges the broker idle at the same moment a client's connection is being accepted. Shutdown re-checks the connection counter after closing the listener; if a connection slipped in before the close, shutdown aborts and the broker resumes normal operation. If the client instead arrived just after the close, it is the first race again — one retry, fresh broker. Either way no session is lost, because the session had not been established yet.
 
 ## Test harness changes
 
-- `McpClient::shutdown` (test-support) additionally terminates the broker recorded in the harness state dir's pid file, as defense in depth for suite runs on machines predating this RFC's broker.
-- Property-test and integration-test configs set a short idle window (2 seconds) so that even SIGKILLed harnesses leave brokers that expire within seconds.
-- A suite-level check (xtask or CI step) asserts no `visible-browser-lab-mcp broker` process with a `--state-dir` under the temp root survives the run.
+The harness changes are defense in depth rather than the primary mechanism — the primary mechanism is the broker expiring on its own.
 
-## Interaction with PR #41 (extrinsic correction)
+`McpClient::shutdown` in test-support additionally terminates the broker named by the harness state directory's pid file, covering suite runs against broker binaries that predate this RFC. Property-test and integration-test configurations set the idle window to two seconds, so even a SIGKILLed harness — the case where no `Drop` implementation anywhere will run — strands a broker for seconds rather than forever. And the suite gains an end-of-run assertion, in xtask or CI, that no broker process with a state directory under the temp root survived. That assertion is the regression test for this RFC's core promise, phrased in the only terms that matter: process count, zero.
 
-The probe-and-restart path remains unchanged and necessary: it is the *replacement* mechanism (upgrade arrives while a healthy same-socket broker is running and must be swapped). This RFC covers the *abandonment* mechanism (no future client will ever connect). The two compose: every broker is guaranteed a supervisor — either the next client, or itself.
+## Relationship to the extrinsic probe
+
+PR #41's probe-and-replace path remains unchanged and remains necessary. The probe is the *replacement* mechanism: it handles the case where an upgrade arrives while a healthy broker is running on the shared socket and must be swapped for a newer one. This RFC adds the *abandonment* mechanism: it handles the case where no future client will ever connect. The two compose into a complete supervision story — every broker is guaranteed a supervisor, either the next client to arrive or, in the limit, itself.
 
 # Drawbacks
 
-- **Restart latency after idle exit.** The first tool call after a quiet quarter-hour pays broker startup (sub-second) plus Chrome re-adoption (fast; the profile and DevToolsActivePort are already on disk). This is a real but small cost, and the alternative — daemons that live forever — has now produced two field incidents.
-- **Self-terminating daemons are harder to reason about in logs.** Mitigated by logging every exit with its reason and by the broker's existing structured logging; "why did the broker exit" is answerable from `broker.stderr.log`.
-- **More lifecycle states means more races.** The race analysis above covers the three we can construct; the start-lock and retry loop in `ensure_running` were built for exactly this shape of problem and absorb each residual window.
+Idle exit trades a small, visible cost for the invisible one we have been paying. The first tool call after a quiet stretch pays broker startup plus Chrome re-adoption — sub-second in practice, since the profile and `DevToolsActivePort` file are already on disk, but not free. Fifteen minutes is chosen to make this cost rare in an active working session while still bounding daemon lifetime to something a human would recognize as reasonable.
+
+Self-terminating daemons are also genuinely harder to reason about than immortal ones: "the broker exited" becomes an expected log line rather than evidence of a crash. The mitigation is that every self-initiated exit logs its reason before doing anything else, so the log always distinguishes a tenancy exit from an idle exit from an actual failure.
+
+Finally, more lifecycle states mean more interleavings. The race analysis above covers the three we can construct, and all three resolve through the pre-existing start-lock and retry machinery — but "the races we can construct" is not a proof, and the property tests should continue to hammer session establishment against broker churn.
 
 # Rationale and alternatives
 
-- **Parent-tied lifetime** (broker dies with the client that spawned it): wrong model — the broker is deliberately a shared multi-client daemon; the first client exiting must not kill the second client's session.
-- **Version-stamped socket paths** (`broker-0.4.2.sock`): solves skew only, leaks one daemon per release, and abandons the handshake-and-replace mechanism that works today. Rejected in #41's design discussion.
-- **Harness-only cleanup** (test `Drop` kills the broker): fixes the known instance, not the class. Harnesses die by SIGKILL and panic-abort; `Drop` does not run. The 195-daemon audit is precisely the residue of "cleanup code that usually runs."
-- **OS service supervision** (launchd/systemd socket activation): heavyweight, per-platform, and wrong for per-tempdir test brokers, which are exactly the population that leaks.
-- **Lease expiry instead of broker exit**: expiring leases would bound *session* lifetime but not *process* lifetime — an empty broker still runs forever. Lease TTLs may be worth pursuing separately; they are out of scope here.
+**Tie the broker's lifetime to its parent.** The simplest lifecycle is "die when the spawning client dies," and it is the wrong one here. The broker is deliberately a shared, multi-client daemon; the first client exiting must not tear down the second client's session. Parent-tied lifetime solves the orphan problem by giving up the design's central feature.
+
+**Version-stamp the socket path** (`broker-0.4.2.sock`). This makes version skew structurally impossible — each release talks to its own socket — but it solves only skew, leaks one orphaned daemon per release by construction, and abandons the handshake-and-replace mechanism that already works. It was considered and rejected during #41's design discussion.
+
+**Fix the harness and call it done.** A `Drop` implementation that kills the broker fixes the known instance and not the class. Harnesses die by SIGKILL, panic-abort, and CI timeout cancellation; destructors are a courtesy, not a guarantee. The 195-daemon audit is precisely the residue of three days of "cleanup code that usually runs." Harness cleanup is worth having — this RFC includes it — but as a supplement to self-supervision, not a substitute.
+
+**Delegate supervision to the OS** (launchd, systemd socket activation). Socket activation embodies the right insight — cheap restart makes aggressive shutdown safe — but adopting it means per-platform service definitions, install-time registration, and a supervision model that does not exist for the per-tempdir test brokers, which are exactly the population that leaks. The RFC borrows the insight and skips the machinery.
+
+**Expire leases instead of the process.** Lease TTLs bound *session* lifetime, not *process* lifetime; an empty broker still runs forever, so the orphan class survives. Lease expiry may be independently worthwhile — a crashed client currently strands its leases until the broker restarts — but it is a different problem, and it is out of scope here.
 
 # Prior art
 
-- `gpg-agent` and `ssh-agent` both self-terminate on socket removal and support idle-based expiry of cached material; `gpg-agent` in particular watches its socket directory and exits when displaced.
-- Language-server processes conventionally exit when their client connection closes or their workspace disappears; the multi-client analogue is "exit when *all* clients are gone for a window."
-- systemd socket activation demonstrates the recreate-on-demand pattern this RFC relies on: cheap restart makes aggressive shutdown safe.
+`gpg-agent` and `ssh-agent` are the closest relatives: user-level daemons, started on demand, shared by many clients, with no natural parent to tie themselves to. Both self-terminate when displaced — `gpg-agent` watches its socket directory and exits when the socket is removed or replaced — and both treat idle expiry of their contents as normal operation. Their longevity as designs suggests that self-supervision is the stable equilibrium for this shape of daemon.
+
+Language servers converge on the same answer from a different direction: the LSP lifecycle convention is that a server exits when its client connection closes. The broker is the multi-client generalization, and "exit when all clients are gone and none has arrived for a window" is the natural generalization of that convention.
+
+systemd's socket activation is prior art for the enabling assumption rather than the mechanism: when restart is cheap and state is recoverable, processes do not need to be precious. The broker's state is recoverable by design — Chrome re-adoption, sessions re-established by clients — so it qualifies.
 
 # Unresolved questions
 
-- **Idle window default.** 15 minutes is a judgment call balancing restart latency against daemon lifetime; usage may argue for longer. The configuration surface makes this tunable without another RFC.
-- **Windows endpoint verification.** Named pipes leave the state-directory check as the only filesystem anchor on Windows. If a Windows deployment ever separates state dir from pipe lifetime, check 2 needs a platform-specific answer (e.g., periodic zero-timeout pipe self-connect).
-- **Telemetry on idle exits.** Whether to surface "broker exited idle N times today" anywhere beyond the log file. Deferred until there is evidence anyone needs it.
+The fifteen-minute idle default is a judgment call, balancing restart latency against daemon lifetime, and real usage may argue for a longer window. The configuration surface exists precisely so this can be tuned from evidence without another design round.
+
+Windows verification currently leans entirely on the state-directory check, because named pipes leave no filesystem object to watch. If a Windows deployment ever separates the state directory's lifetime from the pipe's, the second check needs a platform-specific answer — likely a periodic zero-timeout self-connect to the pipe — and that work is deferred until such a deployment exists.
+
+Whether idle exits deserve telemetry beyond the log line — "broker exited idle N times today" surfacing somewhere a user would see it — is deferred until there is evidence anyone needs it.
 
 # Implementation plan
 
-1. Idle/tenancy config plumbing (`RuntimeConfig`, env var, flag) with tests.
-2. Tenancy tick + shutdown sequence in the broker, behind the existing tokio runtime; unit tests for each check with a scratch state dir.
-3. Idle counters threaded through `serve`/`handle_connection` and the lease table; integration test: broker with 2-second window exits after last session closes, files released.
-4. Harness updates and the suite-level no-survivors assertion.
-5. Release in 0.4.3 alongside #41; release notes mention both halves (probe completeness + self-ownership).
+Implementation proceeds in four steps, each independently testable, followed by release.
 
+1. Configuration plumbing: the idle window through `RuntimeConfig`, the environment variable, and the broker flag, with precedence tests.
+2. The tenancy task and shutdown sequence, with unit tests driving each check against a scratch state directory (delete the dir, delete the socket, swap the pid file) and asserting clean file release.
+3. Idle counters threaded through `serve`, `handle_connection`, and the lease table, with an integration test: a broker configured with a two-second window exits after its last session closes, and its socket and pid file are gone afterward.
+4. Harness updates and the suite-level no-survivors assertion.
+5. Ship in 0.4.3 alongside #41, with release notes presenting both halves as one story: the probe now catches version skew at next contact, and the broker no longer depends on a next contact ever coming.
