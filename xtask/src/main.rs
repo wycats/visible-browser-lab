@@ -2617,6 +2617,22 @@ fn fmt(args: FmtArgs) -> Result<()> {
         // translation: on Windows CI, autocrlf checks files out with CRLF
         // while taplo emits LF, which would flag every file as dirty.
         let source = source.replace("\r\n", "\n");
+
+        // taplo's formatter is lenient: it skips syntax-error ranges instead
+        // of failing, so a broken file could pass the gate. Reject invalid
+        // TOML explicitly.
+        let parse = taplo::parser::parse(&source);
+        if let Some(error) = parse.errors.first() {
+            bail!("`{entry}` contains invalid TOML: {error}");
+        }
+        if let Err(errors) = parse.into_dom().validate() {
+            let first = errors.into_iter().next().map(|e| e.to_string());
+            bail!(
+                "`{entry}` contains invalid TOML: {}",
+                first.unwrap_or_else(|| "unknown validation error".to_string())
+            );
+        }
+
         let formatted = taplo::formatter::format(&source, options.clone());
         if formatted == source {
             continue;
