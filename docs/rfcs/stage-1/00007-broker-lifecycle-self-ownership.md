@@ -62,11 +62,13 @@ Verification is deliberately conservative about what counts as failure. A transi
 
 ## Idle tracking
 
-The broker already has the raw material for an idleness judgment; this RFC only asks it to keep two counters current. Open connections are counted by incrementing on accept and decrementing when `handle_connection` returns. Live sessions are already counted by the lease table. The broker records a `last_activity` timestamp whenever either count is nonzero or any request is dispatched.
+Idleness is tracked with a **bumped deadline**, not a polled timestamp. The broker holds a single shutdown deadline; every dispatched request pushes it forward by the idle window, and the serve loop races the listener's accept future against that deadline. When the deadline lapses with no bump, the broker begins shutdown. This is the mechanism sccache (`ShutdownOrInactive`) and turborepo's daemon (`BumpTimeout`) both converged on, and it is preferable to the counter-and-timestamp bookkeeping an earlier draft of this RFC proposed: there is one piece of state, it is written on exactly one path, and there is no way for a counter decrement to be missed.
 
-The tenancy tick then computes idleness as: both counters zero, *and* the time since `last_activity` meets the idle window. Long-running operations need no special treatment — an in-flight request necessarily holds its connection open, so it defers idleness by existing.
+Two refinements keep the deadline honest. Open connections must defer idleness even when no request is mid-dispatch, so the deadline is also bumped when a connection closes — a client that holds a connection open and then disconnects restarts the full window rather than inheriting a deadline that mostly elapsed while it was connected. And live sessions must prevent idle exit outright: a session represents a client's standing claim on browser state, so the deadline check additionally consults the lease table and declines to fire while any session exists. Long-running operations need no special treatment — an in-flight request necessarily holds its connection open and bumped the deadline when it arrived.
 
-The idle window defaults to **fifteen minutes**. It is configurable through the `VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS` environment variable and an `--idle-timeout-secs` flag on the broker subcommand, with the flag taking precedence. A value of zero disables idle exit entirely, as an escape hatch for unusual deployments. Tenancy verification has no such escape hatch: a broker whose claim is gone has no legitimate reason to keep running, in any deployment.
+The tenancy tick from the previous section is deliberately not involved in idleness. Tenancy is a polled question because nothing signals the broker when its files vanish; idleness is an event-driven question because the broker sees every event that could defer it. Using the right mechanism for each keeps both simple.
+
+The idle window defaults to **fifteen minutes**. For calibration: sccache defaults to ten minutes and turborepo's daemon to four hours, so fifteen minutes sits at the aggressive end of the range production Rust daemons actually ship — appropriate here, because the broker's restart cost is lower than either (no cache to rewarm, no file-watcher state to rebuild; Chrome re-adoption is a directory read). It is configurable through the `VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS` environment variable and an `--idle-timeout-secs` flag on the broker subcommand, with the flag taking precedence. A value of zero disables idle exit entirely — the same convention as `SCCACHE_IDLE_TIMEOUT=0` — as an escape hatch for unusual deployments. Tenancy verification has no such escape hatch: a broker whose claim is gone has no legitimate reason to keep running, in any deployment.
 
 ## Shutdown sequence
 
@@ -84,7 +86,7 @@ A client can connect in the window between the listener closing and the socket f
 
 A replacement broker can find its predecessor still alive — termination is asynchronous, and a process can linger briefly after being signaled. The pid-file check resolves this from the incumbent's side: it observes the successor's pid file and self-evicts. The successor, meanwhile, has already signaled it by pid. Displacement converges from both directions.
 
-An idle verdict can race a brand-new session: the tenancy tick judges the broker idle at the same moment a client's connection is being accepted. Shutdown re-checks the connection counter after closing the listener; if a connection slipped in before the close, shutdown aborts and the broker resumes normal operation. If the client instead arrived just after the close, it is the first race again — one retry, fresh broker. Either way no session is lost, because the session had not been established yet.
+An idle verdict can race a brand-new connection: the deadline lapses at the same moment a client's connection is being accepted. Shutdown re-checks for connections accepted since the deadline fired after closing the listener; if one slipped in, shutdown aborts and the broker resumes normal operation with a fresh deadline. If the client instead arrived just after the close, it is the first race again — one retry, fresh broker. Either way no session is lost, because the session had not been established yet.
 
 ## Test harness changes
 
@@ -118,7 +120,15 @@ Finally, more lifecycle states mean more interleavings. The race analysis above 
 
 # Prior art
 
-`gpg-agent` and `ssh-agent` are the closest relatives: user-level daemons, started on demand, shared by many clients, with no natural parent to tie themselves to. Both self-terminate when displaced — `gpg-agent` watches its socket directory and exits when the socket is removed or replaced — and both treat idle expiry of their contents as normal operation. Their longevity as designs suggests that self-supervision is the stable equilibrium for this shape of daemon.
+The two closest relatives in the Rust ecosystem were reviewed at the source level for this RFC, and both validate the idle half of the design while leaving the tenancy half open.
+
+**sccache** is the nearest engineering match: a detached, on-demand, shared compilation-cache daemon that clients spawn by re-executing their own binary. Its idle shutdown is event-driven — a `ShutdownOrInactive` future holds a timer that every serviced request resets through a message channel — and its `WaitUntilZero` future tracks live client connections so that shutdown drains them, capped at a ten-second timeout. `SCCACHE_IDLE_TIMEOUT` defaults to 600 seconds with `0` meaning never, the exact configuration convention this RFC adopts. Notably, sccache's test suite has dedicated tests for the interaction between explicit shutdown and idle shutdown (`test_server_shutdown_no_idle`, `test_server_idle_timeout`) — evidence that this interaction is subtle enough to deserve the same treatment here.
+
+**turborepo's daemon** has lived through this RFC's exact evolution. Its `BumpTimeout` is the bumped-deadline idle mechanism in its simplest form: a shared deadline that requests push forward, raced in the serve loop, producing `CloseReason::Timeout` (default four hours). Its connector performs version negotiation during the connect handshake and kills mismatched daemons — their equivalent of PR #41 — and its `kill_dead_server` re-checks that the pid file still names the process it intends to kill before killing it, the same belongs-to-me discipline this RFC applies to file release. Turborepo also vendored the `pidlock` crate (adding Windows support and owner queries) because nothing on crates.io handled pid-file lifecycle correctly — a signal that this problem space is underserved. Their daemon lifecycle test asserts the pid file is deleted after close, which is this RFC's file-release assertion in the wild.
+
+What neither does is tenancy verification. Both sccache and turborepo daemons in per-tempdir test configurations have precisely the orphan bug this RFC fixes: a daemon whose socket directory is deleted keeps running, because nothing inside it looks. The tenancy task is this RFC's genuinely novel contribution relative to the Rust ecosystem, and if it proves out in production it is a candidate for extraction into a small shared crate — tenancy tick, bumped deadline, and claim-releasing shutdown behind one API — which turborepo's pidlock fork suggests would find an audience.
+
+Outside Rust, `gpg-agent` and `ssh-agent` are the closest relatives: user-level daemons, started on demand, shared by many clients, with no natural parent to tie themselves to. Both self-terminate when displaced — `gpg-agent` watches its socket directory and exits when the socket is removed or replaced — and both treat idle expiry of their contents as normal operation. Their longevity as designs suggests that self-supervision is the stable equilibrium for this shape of daemon.
 
 Language servers converge on the same answer from a different direction: the LSP lifecycle convention is that a server exits when its client connection closes. The broker is the multi-client generalization, and "exit when all clients are gone and none has arrived for a window" is the natural generalization of that convention.
 
@@ -126,11 +136,21 @@ systemd's socket activation is prior art for the enabling assumption rather than
 
 # Unresolved questions
 
-The fifteen-minute idle default is a judgment call, balancing restart latency against daemon lifetime, and real usage may argue for a longer window. The configuration surface exists precisely so this can be tuned from evidence without another design round.
-
 Windows verification currently leans entirely on the state-directory check, because named pipes leave no filesystem object to watch. If a Windows deployment ever separates the state directory's lifetime from the pipe's, the second check needs a platform-specific answer — likely a periodic zero-timeout self-connect to the pipe — and that work is deferred until such a deployment exists.
 
 Whether idle exits deserve telemetry beyond the log line — "broker exited idle N times today" surfacing somewhere a user would see it — is deferred until there is evidence anyone needs it.
+
+An earlier draft listed the idle default itself as unresolved. The ecosystem review settled it: fifteen minutes sits inside the range production Rust daemons ship (sccache's ten minutes to turborepo's four hours), positioned toward the aggressive end because the broker's restart cost is lower than either. The configuration surface remains the escape valve if usage argues otherwise.
+
+# Stage 3 criteria
+
+This RFC should be considered implemented — and promotable to Stage 3 — when the following hold, each verifiable from the repository:
+
+1. **Tenancy exits work.** Unit tests drive each tenancy check against a scratch state directory — delete the directory, delete the socket file, swap the pid file — and assert the broker exits with the corresponding logged reason and releases only the files that still belong to it.
+2. **Idle exits work end to end.** An integration test configures a broker with a two-second window, establishes and closes a session, and observes the broker exit with its socket and pid file removed. A companion test holds a session open past the window and asserts the broker stays.
+3. **The suite leaves no survivors.** The property-test and integration suites run with a short idle window, and an end-of-run assertion (xtask or CI) finds zero broker processes with state directories under the temp root. This is the regression test for the 195-daemon incident.
+4. **The upgrade path is exercised.** A test or scripted validation simulates the version-skew scenario — an old-status broker on the shared socket path — and confirms the #41 probe replaces it, demonstrating that the extrinsic and intrinsic mechanisms compose.
+5. **A release has shipped and survived dogfooding.** At least one release (targeting 0.4.3) has been installed and driven live, upgrade ritual included, without a manual `pkill` and without stale-broker behavior.
 
 # Implementation plan
 
@@ -138,6 +158,6 @@ Implementation proceeds in four steps, each independently testable, followed by 
 
 1. Configuration plumbing: the idle window through `RuntimeConfig`, the environment variable, and the broker flag, with precedence tests.
 2. The tenancy task and shutdown sequence, with unit tests driving each check against a scratch state directory (delete the dir, delete the socket, swap the pid file) and asserting clean file release.
-3. Idle counters threaded through `serve`, `handle_connection`, and the lease table, with an integration test: a broker configured with a two-second window exits after its last session closes, and its socket and pid file are gone afterward.
+3. The bumped idle deadline threaded through `serve` and `handle_connection`, consulting the lease table before firing, with an integration test: a broker configured with a two-second window exits after its last session closes, and its socket and pid file are gone afterward.
 4. Harness updates and the suite-level no-survivors assertion.
 5. Ship in 0.4.3 alongside #41, with release notes presenting both halves as one story: the probe now catches version skew at next contact, and the broker no longer depends on a next contact ever coming.
