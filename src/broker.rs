@@ -3740,7 +3740,7 @@ async fn broker_interact(
                 .unwrap_or_else(|| json!({}));
             let Some(data_entries) = data.as_object() else {
                 return Err(BrowserToolError::invalid_input(
-                    "`drop` requires `data` to be an object of MIME type to string value",
+                    "`drop` requires `data` to be an object mapping MIME types to string values",
                 ));
             };
             if data_entries.values().any(|value| !value.is_string()) {
