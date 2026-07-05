@@ -10,12 +10,17 @@ agent-surface-contract = { path = "../agent-surface-contract" }
 agent-surface-eval = { path = "../agent-surface-eval" }
 anyhow = "1.0"
 reqwest = { version = "0.12", default-features = false, features = [
-  "blocking",
+    "blocking",
 ] }
 semver = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
+taplo = { version = "0.14.0", default-features = false, features = ["serde"] }
 tempfile = "3.23"
+toml = { version = "1.1.2", default-features = false, features = [
+    "parse",
+    "serde",
+] }
 visible-browser-lab-test-support = { path = "../test-support" }
 wait-timeout = "0.2"
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }

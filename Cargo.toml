@@ -29,12 +29,18 @@ directories = "6.0"
 fs2 = "0.4"
 futures-util = "0.3"
 interprocess = { version = "2.4.2", features = ["tokio"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+] }
 libc = "0.2"
 petgraph = "0.8"
 oxideav-core = "0.1"
 oxideav-mkv = "0.0.9"
-rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+rav1e = { version = "0.8.1", default-features = false, features = [
+    "threading",
+] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 regex = "1.11"
 rmcp = { version = "1.7.0", features = ["transport-io"] }
@@ -42,17 +48,34 @@ schemars = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "libc"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSRunningApplication",
+    "libc",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"

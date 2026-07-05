@@ -76,6 +76,7 @@ fn main() -> Result<()> {
 
     match command.as_str() {
         "validate" => validate(),
+        "fmt" => fmt(FmtArgs::parse(args.collect())?),
         "package" => package(PackageArgs::parse(args.collect())?),
         "checksums" => checksums(ChecksumsArgs::parse(args.collect())?),
         "vscode-manifest" => vscode_manifest(VscodeManifestArgs::parse(args.collect())?),
@@ -101,6 +102,10 @@ fn print_usage() {
         "\
 usage:
   cargo xtask validate
+  cargo xtask fmt [--check]
+      Formats tracked TOML files with taplo using the settings in .taplo.toml,
+      matching what Even Better TOML does in the editor. --check fails without
+      writing, for CI.
   cargo xtask package [--target <target>] [--binary <path>] [--out-dir <dir>] [--version <semver>] [--extension-dist <dir>]
   cargo xtask checksums [--dir <dir>]
   cargo xtask vscode-manifest [--out <path>] [--version <semver>] [--sync]
@@ -195,6 +200,24 @@ impl PackageArgs {
 struct VsixSmokeArgs {
     archive: Option<PathBuf>,
     extension_host: bool,
+}
+
+#[derive(Debug)]
+struct FmtArgs {
+    check: bool,
+}
+
+impl FmtArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut check = false;
+        for arg in &args {
+            match arg.as_str() {
+                "--check" => check = true,
+                arg => bail!("unknown fmt argument `{arg}`"),
+            }
+        }
+        Ok(Self { check })
+    }
 }
 
 #[derive(Debug)]
@@ -2561,6 +2584,76 @@ fn repo_root() -> Result<PathBuf> {
             bail!("could not find visible-browser-lab repository root");
         }
     }
+}
+
+/// Formats tracked TOML files with the same taplo engine and settings the
+/// editor uses (Even Better TOML reads `.taplo.toml`), so editor saves and
+/// `cargo xtask fmt` always agree.
+fn fmt(args: FmtArgs) -> Result<()> {
+    let root = repo_root()?;
+    let options = taplo_options(&root)?;
+
+    let output = Command::new("git")
+        .args(["ls-files", "*.toml"])
+        .current_dir(&root)
+        .output()
+        .context("failed to run git ls-files")?;
+    if !output.status.success() {
+        bail!("git ls-files failed");
+    }
+    let listing = String::from_utf8(output.stdout).context("git ls-files output was not UTF-8")?;
+
+    let mut dirty = Vec::new();
+    for entry in listing.lines() {
+        // Mirrors the `exclude` in .taplo.toml: spikes are frozen experiments.
+        if entry.starts_with("spikes/") {
+            continue;
+        }
+
+        let path = root.join(entry);
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read `{}`", path.display()))?;
+        let formatted = taplo::formatter::format(&source, options.clone());
+        if formatted == source {
+            continue;
+        }
+
+        if args.check {
+            dirty.push(entry.to_string());
+        } else {
+            fs::write(&path, formatted)
+                .with_context(|| format!("failed to write `{}`", path.display()))?;
+            println!("formatted {entry}");
+        }
+    }
+
+    if !dirty.is_empty() {
+        bail!(
+            "TOML formatting differs from .taplo.toml settings (run `cargo xtask fmt`):\n  {}",
+            dirty.join("\n  ")
+        );
+    }
+
+    Ok(())
+}
+
+fn taplo_options(root: &Path) -> Result<taplo::formatter::Options> {
+    let config_path = root.join(".taplo.toml");
+    let source = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read `{}`", config_path.display()))?;
+    let config: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("failed to parse `{}`", config_path.display()))?;
+
+    let mut options = taplo::formatter::Options::default();
+    if let Some(formatting) = config.get("formatting") {
+        let overrides: taplo::formatter::OptionsIncomplete = formatting
+            .clone()
+            .try_into()
+            .context("invalid [formatting] table in .taplo.toml")?;
+        options.update(overrides);
+    }
+
+    Ok(options)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
