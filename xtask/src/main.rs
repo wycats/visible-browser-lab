@@ -2613,6 +2613,10 @@ fn fmt(args: FmtArgs) -> Result<()> {
         let path = root.join(entry);
         let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read `{}`", path.display()))?;
+        // Compare repository content, not the checkout's line-ending
+        // translation: on Windows CI, autocrlf checks files out with CRLF
+        // while taplo emits LF, which would flag every file as dirty.
+        let source = source.replace("\r\n", "\n");
         let formatted = taplo::formatter::format(&source, options.clone());
         if formatted == source {
             continue;
