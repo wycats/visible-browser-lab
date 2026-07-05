@@ -32,6 +32,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check TOML formatting
+        run: cargo xtask fmt --check
+
       - name: Lint with Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

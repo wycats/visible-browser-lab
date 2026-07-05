@@ -1,0 +1,9 @@
+# Shared TOML formatting canon. Even Better TOML picks this file up in the
+# editor, and `cargo xtask fmt --check` enforces it in CI, so editor reflows
+# never show up as formatting-only diffs.
+include = ["**/*.toml"]
+# Spikes are frozen experiments excluded from the workspace.
+exclude = ["spikes/**", "target/**"]
+
+[formatting]
+indent_string = "    "
