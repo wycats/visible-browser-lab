@@ -5,8 +5,11 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex as AsyncMutex,
-    time::{Instant, sleep},
+    time::{Instant, MissedTickBehavior, interval, sleep, sleep_until},
 };
 use url::Url;
 
@@ -58,6 +61,11 @@ use crate::semantic::{RawAxFrame, RawAxNode};
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
+const TENANCY_TICK_INTERVAL: Duration = Duration::from_secs(5);
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Sessions defer idle exit only while they were touched within this many
+/// idle windows; older sessions are treated as abandoned.
+const IDLE_SESSION_GRACE_FACTOR: u32 = 4;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
@@ -1676,10 +1684,12 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
         cdp_endpoint = ?config.cdp_endpoint,
         ipc_endpoint = %endpoint.display(),
         state_dir = %config.state_dir.display(),
+        idle_timeout = ?config.idle_timeout,
         "visible browser broker listening"
     );
 
-    serve(config, listener).await
+    let stale_path = endpoint.stale_path().map(Path::to_path_buf);
+    serve(config, listener, stale_path, TENANCY_TICK_INTERVAL).await
 }
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
@@ -1889,6 +1899,16 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
         .arg(&config.ipc_endpoint)
         .arg("--state-dir")
         .arg(&config.state_dir)
+        // Forward the parent's resolved idle window so a flag- or
+        // env-configured value survives the respawn.
+        .arg("--idle-timeout-secs")
+        .arg(
+            config
+                .idle_timeout
+                .map(|window| window.as_secs())
+                .unwrap_or(0)
+                .to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1920,27 +1940,231 @@ async fn write_pid_file(config: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-async fn serve(config: RuntimeConfig, listener: BrokerListener) -> Result<()> {
+async fn serve(
+    config: RuntimeConfig,
+    listener: BrokerListener,
+    stale_path: Option<PathBuf>,
+    tenancy_interval: Duration,
+) -> Result<()> {
     let state = BrokerState::new(&config)?;
+    serve_state(config, state, listener, stale_path, tenancy_interval).await
+}
 
-    loop {
-        let stream = ipc::accept(&listener).await?;
-        let connection_config = config.clone();
-        let connection_state = state.clone();
+/// Why the broker's serve loop ended its own tenure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServeExit {
+    /// The broker's claim to exist (state dir, socket, pid file) failed
+    /// verification.
+    TenancyLost(String),
+    /// The idle window lapsed with no connections and no active sessions.
+    Idle(Duration),
+}
 
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(connection_config, connection_state, stream).await
-            {
-                tracing::warn!(error = %error, "broker connection failed");
-            }
-        });
+impl ServeExit {
+    fn reason(&self) -> String {
+        match self {
+            Self::TenancyLost(reason) => format!("tenancy: {reason}"),
+            Self::Idle(window) => format!(
+                "idle: {}s with no connections or sessions",
+                window.as_secs()
+            ),
+        }
     }
+}
+
+async fn serve_state(
+    config: RuntimeConfig,
+    state: BrokerState,
+    listener: BrokerListener,
+    stale_path: Option<PathBuf>,
+    tenancy_interval: Duration,
+) -> Result<()> {
+    let idle = Arc::new(IdleTracker::new(config.idle_timeout));
+    let open_connections = Arc::new(AtomicUsize::new(0));
+
+    let mut tenancy = interval(tenancy_interval);
+    tenancy.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick of a tokio interval fires immediately; consume it so
+    // verification starts one full cadence after startup.
+    tenancy.tick().await;
+
+    let exit = loop {
+        tokio::select! {
+            accepted = ipc::accept(&listener) => {
+                let stream = accepted?;
+                idle.bump();
+                open_connections.fetch_add(1, Ordering::SeqCst);
+
+                let connection_config = config.clone();
+                let connection_state = state.clone();
+                let connection_idle = idle.clone();
+                let connection_count = open_connections.clone();
+
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(
+                        connection_config,
+                        connection_state,
+                        stream,
+                        connection_idle.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "broker connection failed");
+                    }
+                    connection_count.fetch_sub(1, Ordering::SeqCst);
+                    // A closing connection restarts the full idle window
+                    // rather than inheriting a deadline that mostly elapsed
+                    // while it was open.
+                    connection_idle.bump();
+                });
+            }
+            _ = tenancy.tick() => {
+                if let Some(reason) = tenancy_violation(&config, stale_path.as_deref()) {
+                    break ServeExit::TenancyLost(reason);
+                }
+            }
+            window = idle.lapsed() => {
+                if idle_exit_permitted(&state, &open_connections, window) {
+                    break ServeExit::Idle(window);
+                }
+                // A connection or live session vetoed the verdict; restart
+                // the window instead of re-firing immediately.
+                idle.bump();
+            }
+        }
+    };
+
+    // Shutdown ordering per RFC 00007: log the reason first so `broker.stderr.log`
+    // always answers "why did the broker exit", then close the listener so new
+    // connectors fail fast into the start-lock path, then drain briefly.
+    tracing::warn!(reason = %exit.reason(), "visible browser broker shutting down");
+    drop(listener);
+
+    let drain_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while open_connections.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // The claim itself (pid file, socket file) is released by the
+    // RuntimeFileGuard in `run`, which re-checks ownership before removing.
+    Ok(())
+}
+
+/// The broker's idle deadline. Every accepted connection, dispatched request,
+/// and connection close pushes the deadline forward by the idle window; when
+/// it lapses with nothing to defer it, the broker shuts down. A window of
+/// `None` disables idle exit.
+struct IdleTracker {
+    window: Option<Duration>,
+    deadline: Mutex<Instant>,
+}
+
+impl IdleTracker {
+    fn new(window: Option<Duration>) -> Self {
+        Self {
+            window,
+            deadline: Mutex::new(Instant::now() + window.unwrap_or(Duration::ZERO)),
+        }
+    }
+
+    fn bump(&self) {
+        if let Some(window) = self.window {
+            *self.deadline.lock().unwrap() = Instant::now() + window;
+        }
+    }
+
+    /// Resolves with the idle window once the deadline lapses without being
+    /// bumped. Pends forever when idle exit is disabled.
+    async fn lapsed(&self) -> Duration {
+        let Some(window) = self.window else {
+            return std::future::pending().await;
+        };
+        loop {
+            let deadline = *self.deadline.lock().unwrap();
+            sleep_until(deadline).await;
+            if *self.deadline.lock().unwrap() <= Instant::now() {
+                return window;
+            }
+        }
+    }
+}
+
+/// Whether a lapsed idle deadline may actually end the broker's tenure. Open
+/// connections defer idleness outright. Sessions defer it only while recently
+/// touched: a session nobody has used in several idle windows is treated as
+/// abandoned rather than as a standing claim.
+fn idle_exit_permitted(
+    state: &BrokerState,
+    open_connections: &AtomicUsize,
+    window: Duration,
+) -> bool {
+    if open_connections.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+
+    let grace = window.saturating_mul(IDLE_SESSION_GRACE_FACTOR);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    !state
+        .registry()
+        .lock()
+        .unwrap()
+        .any_session_active_within(grace, now_ms)
+}
+
+/// Re-verify the broker's claim to exist. Returns the violation when the
+/// claim has definitively ended; transient errors (interrupted syscalls,
+/// permission hiccups) never end a tenure, only affirmative negatives do.
+fn tenancy_violation(config: &RuntimeConfig, stale_path: Option<&Path>) -> Option<String> {
+    match fs::metadata(&config.state_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Some(format!(
+                "state dir `{}` is no longer a directory",
+                config.state_dir.display()
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Some(format!(
+                "state dir `{}` removed",
+                config.state_dir.display()
+            ));
+        }
+        Err(_) => {}
+    }
+
+    if let Some(path) = stale_path {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Some(format!("socket file `{}` removed", path.display()));
+            }
+            Err(_) => {}
+        }
+    }
+
+    // A missing pid file is not a violation: the file is how successors
+    // displace us, and its absence alone proves nothing.
+    if let Ok(contents) = fs::read_to_string(&config.pid_path)
+        && let Ok(pid) = contents.trim().parse::<u32>()
+        && pid != std::process::id()
+    {
+        return Some(format!(
+            "pid file `{}` names pid {pid}; this broker was displaced",
+            config.pid_path.display()
+        ));
+    }
+
+    None
 }
 
 async fn handle_connection(
     config: RuntimeConfig,
     state: BrokerState,
     stream: BrokerStream,
+    idle: Arc<IdleTracker>,
 ) -> Result<()> {
     let mut stream = BufReader::new(stream);
 
@@ -1951,6 +2175,7 @@ async fn handle_connection(
         if bytes == 0 {
             break;
         }
+        idle.bump();
 
         let response = match serde_json::from_str::<BrokerRequest>(&line) {
             Ok(request) => dispatch_request(&config, &state, request).await,
@@ -5744,10 +5969,23 @@ impl RuntimeFileGuard {
             stale_path,
         }
     }
+
+    /// Whether the pid file still names this process. A displaced broker's
+    /// pid file belongs to its successor; deleting it would tear down the
+    /// successor's claim.
+    fn owns_pid_file(&self) -> bool {
+        match fs::read_to_string(&self.pid_path) {
+            Ok(contents) => contents.trim().parse::<u32>() == Ok(std::process::id()),
+            Err(_) => false,
+        }
+    }
 }
 
 impl Drop for RuntimeFileGuard {
     fn drop(&mut self) {
+        if !self.owns_pid_file() {
+            return;
+        }
         let _ = fs::remove_file(&self.pid_path);
         if let Some(stale_path) = &self.stale_path {
             let _ = fs::remove_file(stale_path);
@@ -5807,7 +6045,7 @@ mod tests {
         prepare_state(&config).await.unwrap();
         let endpoint = broker_endpoint(&config).unwrap();
         let listener = endpoint.listen().unwrap();
-        let server = tokio::spawn(serve(config.clone(), listener));
+        let server = tokio::spawn(serve(config.clone(), listener, None, TENANCY_TICK_INTERVAL));
 
         let mut client = BrokerClient::connect(&endpoint).await.unwrap();
         let status = client.ping().await.unwrap();
@@ -5818,6 +6056,187 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[test]
+    fn tenancy_holds_while_claim_is_intact() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().to_path_buf());
+        fs::write(&config.pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(tenancy_violation(&config, None), None);
+    }
+
+    #[test]
+    fn tenancy_ends_when_state_dir_is_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state_dir = tempdir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let config = test_config(state_dir.clone());
+        fs::remove_dir_all(&state_dir).unwrap();
+
+        let violation = tenancy_violation(&config, None).unwrap();
+        assert!(violation.contains("state dir"), "got: {violation}");
+    }
+
+    #[test]
+    fn tenancy_ends_when_socket_file_is_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().to_path_buf());
+        let socket = tempdir.path().join("broker.sock");
+
+        let violation = tenancy_violation(&config, Some(&socket)).unwrap();
+        assert!(violation.contains("socket file"), "got: {violation}");
+    }
+
+    #[test]
+    fn tenancy_ends_when_pid_file_names_a_successor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().to_path_buf());
+        fs::write(&config.pid_path, "999999").unwrap();
+
+        let violation = tenancy_violation(&config, None).unwrap();
+        assert!(violation.contains("displaced"), "got: {violation}");
+    }
+
+    #[test]
+    fn missing_pid_file_is_not_a_violation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().to_path_buf());
+
+        assert_eq!(tenancy_violation(&config, None), None);
+    }
+
+    #[test]
+    fn idle_exit_is_denied_while_connections_are_open() {
+        let state = fake_state(Vec::new());
+        let connections = AtomicUsize::new(1);
+
+        assert!(!idle_exit_permitted(
+            &state,
+            &connections,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn idle_exit_is_denied_while_a_session_is_fresh() {
+        let state = fake_state(Vec::new());
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+        let connections = AtomicUsize::new(0);
+
+        assert!(!idle_exit_permitted(
+            &state,
+            &connections,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn idle_exit_is_permitted_with_no_connections_or_sessions() {
+        let state = fake_state(Vec::new());
+        let connections = AtomicUsize::new(0);
+
+        assert!(idle_exit_permitted(
+            &state,
+            &connections,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_tracker_fires_after_an_unbumped_window() {
+        let tracker = IdleTracker::new(Some(Duration::from_secs(5)));
+
+        let window = tracker.lapsed().await;
+
+        assert_eq!(window, Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_tracker_bump_defers_the_deadline() {
+        let tracker = Arc::new(IdleTracker::new(Some(Duration::from_secs(5))));
+
+        let waiter = tracker.clone();
+        let lapsed = tokio::spawn(async move { waiter.lapsed().await });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        tracker.bump();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!lapsed.is_finished(), "bump should have deferred the lapse");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(lapsed.await.unwrap(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_idle_tracker_never_fires() {
+        let tracker = Arc::new(IdleTracker::new(None));
+
+        let waiter = tracker.clone();
+        let lapsed = tokio::spawn(async move { waiter.lapsed().await });
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+
+        assert!(!lapsed.is_finished(), "disabled tracker must pend forever");
+        lapsed.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_exits_on_its_own_when_idle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config = test_config(tempdir.path().join("state"));
+        config.idle_timeout = Some(Duration::from_millis(200));
+        prepare_state(&config).await.unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        let server = tokio::spawn(serve_state(
+            config.clone(),
+            fake_state(Vec::new()),
+            listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+
+        // Prove the loop stays alive while traffic flows, then exits once
+        // the window lapses with nothing to defer it.
+        let mut client = BrokerClient::connect(&endpoint).await.unwrap();
+        client.ping().await.unwrap();
+        drop(client);
+
+        let exited = tokio::time::timeout(Duration::from_secs(5), server).await;
+        exited
+            .expect("serve loop should exit within the idle window")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_exits_when_its_pid_file_names_a_successor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        let server = tokio::spawn(serve_state(
+            config.clone(),
+            fake_state(Vec::new()),
+            listener,
+            None,
+            Duration::from_millis(50),
+        ));
+
+        fs::write(&config.pid_path, "999999").unwrap();
+
+        let exited = tokio::time::timeout(Duration::from_secs(5), server).await;
+        exited
+            .expect("serve loop should exit after losing tenancy")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -6598,7 +7017,7 @@ mod tests {
         prepare_state(&config).await.unwrap();
         let endpoint = broker_endpoint(&config).unwrap();
         let listener = endpoint.listen().unwrap();
-        let server = tokio::spawn(serve(config.clone(), listener));
+        let server = tokio::spawn(serve(config.clone(), listener, None, TENANCY_TICK_INTERVAL));
 
         let mut client = ensure_running(&config).await.unwrap();
         let status = client.ping().await.unwrap();

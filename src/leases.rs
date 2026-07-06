@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::schemars::JsonSchema;
@@ -371,6 +371,16 @@ impl LeaseRegistry {
 
     pub fn session(&self, session_id: &AgentSessionId) -> Option<&BrowserSession> {
         self.sessions.get(session_id)
+    }
+
+    /// Whether any session was touched within `grace`. Sessions defer the
+    /// broker's idle exit only while they show recent activity; a session
+    /// nobody has touched in a long time is treated as abandoned.
+    pub fn any_session_active_within(&self, grace: Duration, now_ms: u64) -> bool {
+        let grace_ms = grace.as_millis() as u64;
+        self.sessions
+            .values()
+            .any(|session| now_ms.saturating_sub(session.updated_at_ms) <= grace_ms)
     }
 
     pub fn ensure_session(&self, session_id: &AgentSessionId) -> Result<(), BrowserToolError> {
@@ -818,6 +828,30 @@ mod tests {
             format!("https://example.com/{target_id}"),
             true,
         )
+    }
+
+    #[test]
+    fn empty_registry_has_no_active_sessions() {
+        let registry = LeaseRegistry::new();
+        assert!(!registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+    }
+
+    #[test]
+    fn recently_touched_session_counts_as_active() {
+        let mut registry = LeaseRegistry::new();
+        registry.start_session(Some("agent".to_string()));
+
+        assert!(registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+    }
+
+    #[test]
+    fn stale_session_no_longer_defers_idle_exit() {
+        let mut registry = LeaseRegistry::new();
+        registry.start_session(Some("agent".to_string()));
+
+        // Pretend an hour has passed with a one-minute grace window.
+        let future = now_ms() + 3_600_000;
+        assert!(!registry.any_session_active_within(Duration::from_secs(60), future));
     }
 
     #[test]
