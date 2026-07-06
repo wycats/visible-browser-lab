@@ -541,26 +541,37 @@ fn broker_survivors() -> Result<()> {
     );
 }
 
+/// True when a process listing line is a broker invocation running against a
+/// temp state directory. Tokenizes so `broker` matches as a word regardless of
+/// its position in the command line.
+fn is_temp_broker_line(line: &str, temp_markers: &[&str]) -> bool {
+    line.contains("visible-browser-lab-mcp")
+        && line.split_whitespace().any(|token| token == "broker")
+        && temp_markers.iter().any(|marker| line.contains(marker))
+}
+
 #[cfg(unix)]
 fn find_broker_survivors() -> Result<Vec<String>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
         .context("failed to run ps")?;
+    if !output.status.success() {
+        bail!(
+            "ps exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     let temp_root = env::temp_dir();
     let temp_prefix = temp_root.to_string_lossy();
+    // macOS temp dirs live under /var/folders even when env::temp_dir reports
+    // the /private alias (or vice versa).
+    let temp_markers = [temp_prefix.as_ref(), "/var/folders/", "/tmp/"];
     let listing = String::from_utf8_lossy(&output.stdout);
     Ok(listing
         .lines()
-        .filter(|line| {
-            line.contains("visible-browser-lab-mcp")
-                && line.contains(" broker ")
-                && (line.contains(temp_prefix.as_ref())
-                    // macOS temp dirs live under /var/folders even when
-                    // env::temp_dir reports the /private alias (or vice versa).
-                    || line.contains("/var/folders/")
-                    || line.contains("/tmp/"))
-        })
+        .filter(|line| is_temp_broker_line(line, &temp_markers))
         .map(str::trim)
         .map(String::from)
         .collect())
@@ -576,17 +587,20 @@ fn find_broker_survivors() -> Result<Vec<String>> {
         ])
         .output()
         .context("failed to run powershell")?;
+    if !output.status.success() {
+        bail!(
+            "powershell exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     let temp_root = env::temp_dir();
     let temp_prefix = temp_root.to_string_lossy().to_lowercase();
+    let temp_markers = [temp_prefix.as_str()];
     let listing = String::from_utf8_lossy(&output.stdout);
     Ok(listing
         .lines()
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("visible-browser-lab-mcp")
-                && lower.contains(" broker ")
-                && lower.contains(temp_prefix.as_str())
-        })
+        .filter(|line| is_temp_broker_line(&line.to_lowercase(), &temp_markers))
         .map(str::trim)
         .map(String::from)
         .collect())
@@ -2787,6 +2801,30 @@ fn git_head() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_broker_filter_matches_broker_as_a_word_in_any_position() {
+        let markers = ["/tmp/"];
+        // `broker` as the final token still matches.
+        assert!(is_temp_broker_line(
+            "123 target/debug/visible-browser-lab-mcp broker",
+            &["target/"]
+        ));
+        assert!(is_temp_broker_line(
+            "123 visible-browser-lab-mcp broker --socket /tmp/x/broker-v3.sock --state-dir /tmp/x",
+            &markers
+        ));
+        // A path component containing "broker" is not the broker subcommand.
+        assert!(!is_temp_broker_line(
+            "123 visible-browser-lab-mcp serve --state-dir /tmp/brokerish",
+            &markers
+        ));
+        // Non-temp state dirs (the real shared broker) are not survivors.
+        assert!(!is_temp_broker_line(
+            "123 visible-browser-lab-mcp broker --state-dir /Users/me/Library/Caches/visible-browser-lab",
+            &markers
+        ));
+    }
 
     #[test]
     fn prompt_referenced_tools_are_production_tools_with_unique_references() {
