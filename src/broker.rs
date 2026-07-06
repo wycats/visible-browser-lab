@@ -2200,8 +2200,9 @@ async fn dispatch_request(
     request: BrokerRequest,
 ) -> BrokerResponse {
     touch_request_session(state, &request);
+    let session_id = request_session_id(&request);
 
-    match request.method.as_str() {
+    let response = match request.method.as_str() {
         "ping" => broker_response(request.id, broker_status(config, state).await),
         "start_session" => broker_response(
             request.id,
@@ -2310,7 +2311,16 @@ async fn dispatch_request(
         method => {
             BrokerResponse::invalid_input(request.id, format!("unknown broker method `{method}`"))
         }
+    };
+
+    // Touch again once the request finishes. A single navigate or wait_for can
+    // outlast the staleness window, and the entry-time touch alone would leave
+    // the session looking abandoned the moment such a request completes.
+    if let Some(session_id) = session_id {
+        state.registry().lock().unwrap().touch(&session_id);
     }
+
+    response
 }
 
 /// Refresh the requesting session's last-touch time before dispatch. Any
@@ -2318,19 +2328,19 @@ async fn dispatch_request(
 /// idle-exit veto (and, once it ships, session expiry) honest for sessions
 /// that interact without changing tab ownership.
 fn touch_request_session(state: &BrokerState, request: &BrokerRequest) {
-    let Some(session_id) = request
-        .params
-        .get("agent_session_id")
-        .and_then(Value::as_str)
-    else {
+    let Some(session_id) = request_session_id(request) else {
         return;
     };
 
-    state
-        .registry()
-        .lock()
-        .unwrap()
-        .touch(&AgentSessionId(session_id.to_string()));
+    state.registry().lock().unwrap().touch(&session_id);
+}
+
+fn request_session_id(request: &BrokerRequest) -> Option<AgentSessionId> {
+    request
+        .params
+        .get("agent_session_id")
+        .and_then(Value::as_str)
+        .map(|id| AgentSessionId(id.to_string()))
 }
 
 fn parse_params<T>(params: serde_json::Value) -> Result<T, BrowserToolError>
