@@ -18,7 +18,7 @@ The cost has been invisible for the same reason the orphaned-broker cost was inv
 
 There is also housekeeping that never happens. Sessions accumulate artifacts, screenshots, exported files, page captures, stored under a per-session directory on disk and indexed in a per-session registry. The artifact store has a `remove_session` method that removes a session's records and files. It has zero callers. Someone built the cleanup half of the lifecycle and nothing ever drives it, because nothing ever decides a session is over.
 
-What acceptable looks like, concretely: a session that an agent is actively using, in any way, should never expire out from under it. A session whose client vanished should return its tabs to the claimable pool within a bounded window, without destroying anything a human can see. An agent that comes back to an expired session should get one crisp error that tells it exactly how to recover, and recovery should be cheap because expiry destroyed nothing it needs. And the broker's idle exit should stop being veto-able by ghosts.
+What acceptable looks like, concretely: a session that an agent is actively using, in any way, should never expire out from under it. A session whose client vanished should return its tabs to the claimable pool within a bounded window, without destroying anything a human can see. An agent that comes back to an expired session should get one crisp error that tells it exactly how to recover, and recovery should be cheap because expiry destroyed nothing it needs. And the broker's idle exit should stop being vetoable by ghosts.
 
 # Guide-level explanation
 
