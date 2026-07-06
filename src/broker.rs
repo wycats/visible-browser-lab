@@ -2199,6 +2199,8 @@ async fn dispatch_request(
     state: &BrokerState,
     request: BrokerRequest,
 ) -> BrokerResponse {
+    touch_request_session(state, &request);
+
     match request.method.as_str() {
         "ping" => broker_response(request.id, broker_status(config, state).await),
         "start_session" => broker_response(
@@ -2309,6 +2311,26 @@ async fn dispatch_request(
             BrokerResponse::invalid_input(request.id, format!("unknown broker method `{method}`"))
         }
     }
+}
+
+/// Refresh the requesting session's last-touch time before dispatch. Any
+/// request that names a session counts as using it, which is what keeps the
+/// idle-exit veto (and, once it ships, session expiry) honest for sessions
+/// that interact without changing tab ownership.
+fn touch_request_session(state: &BrokerState, request: &BrokerRequest) {
+    let Some(session_id) = request
+        .params
+        .get("agent_session_id")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .touch(&AgentSessionId(session_id.to_string()));
 }
 
 fn parse_params<T>(params: serde_json::Value) -> Result<T, BrowserToolError>
@@ -6134,6 +6156,46 @@ mod tests {
             &connections,
             Duration::from_secs(60)
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_touches_the_requesting_session() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(vec![fake_target("target-a")]);
+        let session = state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+
+        // Backdate the session an hour, then dispatch an interaction-shaped
+        // request. Interaction verbs never touched the session before the
+        // dispatch-time touch; this is the regression test for that gap.
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000);
+
+        let request = BrokerRequest {
+            id: "1".to_string(),
+            method: "snapshot".to_string(),
+            params: json!({
+                "agent_session_id": session.agent_session_id.0,
+                "tab_id": "tab-nonexistent",
+            }),
+        };
+        dispatch_request(&config, &state, request).await;
+
+        let refreshed = state
+            .registry
+            .lock()
+            .unwrap()
+            .any_session_active_within(Duration::from_secs(60), crate::leases::now_ms());
+        assert!(
+            refreshed,
+            "an interaction-shaped request should refresh its session even when it fails"
+        );
     }
 
     #[test]

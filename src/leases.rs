@@ -373,6 +373,15 @@ impl LeaseRegistry {
         self.sessions.get(session_id)
     }
 
+    /// Test support: rewind a session's last-activity timestamp so tests can
+    /// exercise staleness without waiting out real clock time.
+    #[cfg(test)]
+    pub(crate) fn backdate_session(&mut self, session_id: &AgentSessionId, by_ms: u64) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.updated_at_ms = session.updated_at_ms.saturating_sub(by_ms);
+        }
+    }
+
     /// Whether any session was touched within `grace`. Sessions defer the
     /// broker's idle exit only while they show recent activity; a session
     /// nobody has touched in a long time is treated as abandoned.
@@ -386,6 +395,14 @@ impl LeaseRegistry {
     pub fn ensure_session(&self, session_id: &AgentSessionId) -> Result<(), BrowserToolError> {
         self.require_session(session_id)?;
         Ok(())
+    }
+
+    /// Refresh a session's last-touch time. Called at the broker's dispatch
+    /// choke point, so any request that names a session counts as using it.
+    /// Unknown session ids are ignored; the per-operation handler is the one
+    /// that reports them.
+    pub fn touch(&mut self, session_id: &AgentSessionId) {
+        self.touch_session(session_id, now_ms());
     }
 
     pub fn lease_tab(
@@ -428,7 +445,6 @@ impl LeaseRegistry {
 
             self.leases.remove(&existing.tab_id);
             self.remove_active_target_if_matches(&existing.target_id, &existing.tab_id);
-            self.touch_session(&existing.owner_session_id, now_ms());
         }
 
         let lease = self.insert_active_lease(session_id, target);
@@ -513,21 +529,17 @@ impl LeaseRegistry {
         target: TabSnapshot,
     ) -> Result<TabLease, BrowserToolError> {
         let now = now_ms();
-        let owner_session_id;
 
         {
             let lease = self
                 .leases
                 .get_mut(tab_id)
                 .ok_or_else(|| BrowserToolError::unknown_tab(tab_id))?;
-            owner_session_id = lease.owner_session_id.clone();
             lease.target_id = target.target_id;
             lease.title = Some(target.title);
             lease.url = Some(target.url);
             lease.updated_at_ms = now;
         }
-
-        self.touch_session(&owner_session_id, now);
 
         Ok(self
             .leases
@@ -554,29 +566,22 @@ impl LeaseRegistry {
 
     pub fn mark_missing(&mut self, tab_id: &TabId) -> Result<TabLease, BrowserToolError> {
         let now = now_ms();
-        let owner_session_id;
         let target_id;
-        let changed;
 
         {
             let lease = self
                 .leases
                 .get_mut(tab_id)
                 .ok_or_else(|| BrowserToolError::unknown_tab(tab_id))?;
-            owner_session_id = lease.owner_session_id.clone();
             target_id = lease.target_id.clone();
-            changed = lease.state == LeaseState::Active;
 
-            if changed {
+            if lease.state == LeaseState::Active {
                 lease.state = LeaseState::Missing;
                 lease.updated_at_ms = now;
             }
         }
 
         self.remove_active_target_if_matches(&target_id, tab_id);
-        if changed {
-            self.touch_session(&owner_session_id, now);
-        }
 
         Ok(self
             .leases
@@ -673,7 +678,6 @@ impl LeaseRegistry {
         self.active_target_owners
             .insert(lease.target_id.clone(), lease.tab_id.clone());
         self.leases.insert(lease.tab_id.clone(), lease.clone());
-        self.touch_session(session_id, now);
 
         lease
     }
@@ -707,7 +711,6 @@ impl LeaseRegistry {
         }
 
         self.remove_active_target_if_matches(&target_id, tab_id);
-        self.touch_session(session_id, now);
 
         Ok(self
             .leases
@@ -797,7 +800,7 @@ fn push_global_summary(
     });
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -852,6 +855,26 @@ mod tests {
         // Pretend an hour has passed with a one-minute grace window.
         let future = now_ms() + 3_600_000;
         assert!(!registry.any_session_active_within(Duration::from_secs(60), future));
+    }
+
+    #[test]
+    fn touch_refreshes_a_sessions_last_activity() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+
+        // Backdate the session an hour, then touch it.
+        registry.backdate_session(&session.agent_session_id, 3_600_000);
+        registry.touch(&session.agent_session_id);
+
+        assert!(registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+    }
+
+    #[test]
+    fn touch_ignores_unknown_sessions() {
+        let mut registry = LeaseRegistry::new();
+        registry.touch(&AgentSessionId("session-nonexistent".to_string()));
+
+        assert!(!registry.any_session_active_within(Duration::from_secs(60), now_ms()));
     }
 
     #[test]
