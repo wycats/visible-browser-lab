@@ -23,6 +23,10 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerStatus {
     pub protocol_version: u32,
+    // Brokers older than 0.4.3 omit this field; the empty default deliberately
+    // fails the version comparison so stale daemons are replaced on first probe.
+    #[serde(default)]
+    pub package_version: String,
     pub pid: u32,
     pub runtime_mode: RuntimeMode,
     pub cdp_endpoint: String,
@@ -689,6 +693,22 @@ impl BrokerClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn broker_status_without_package_version_defaults_to_empty() {
+        // Wire shape emitted by brokers older than 0.4.3.
+        let status: BrokerStatus = serde_json::from_value(json!({
+            "protocol_version": BROKER_PROTOCOL_VERSION,
+            "pid": 123,
+            "runtime_mode": "managed",
+            "cdp_endpoint": "http://127.0.0.1:9222",
+            "ipc_endpoint": "endpoint",
+            "socket_path": "/tmp/broker.sock",
+        }))
+        .unwrap();
+
+        assert_eq!(status.package_version, "");
+    }
 
     #[test]
     fn success_response_omits_error_payload() {

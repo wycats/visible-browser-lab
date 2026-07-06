@@ -1796,6 +1796,17 @@ fn broker_status_mismatch(config: &RuntimeConfig, status: &BrokerStatus) -> Resu
             BROKER_PROTOCOL_VERSION, status.protocol_version
         )));
     }
+    if status.package_version != env!("CARGO_PKG_VERSION") {
+        return Ok(Some(format!(
+            "broker package version mismatch: expected {}, got {}",
+            env!("CARGO_PKG_VERSION"),
+            if status.package_version.is_empty() {
+                "pre-0.4.3 (unversioned)"
+            } else {
+                &status.package_version
+            }
+        )));
+    }
     if status.runtime_mode != config.runtime_mode {
         return Ok(Some(format!(
             "broker runtime mismatch: requested {:?}, existing broker is {:?} at {}",
@@ -5570,6 +5581,7 @@ async fn broker_status(
 ) -> Result<BrokerStatus, BrowserToolError> {
     Ok(BrokerStatus {
         protocol_version: BROKER_PROTOCOL_VERSION,
+        package_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         runtime_mode: config.runtime_mode,
         cdp_endpoint: state.browser.resolved_endpoint().await?,
@@ -6597,6 +6609,43 @@ mod tests {
     }
 
     #[test]
+    fn broker_status_must_match_package_version() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let current = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::Managed,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        assert!(broker_status_mismatch(&config, &current).unwrap().is_none());
+
+        let stale = BrokerStatus {
+            package_version: "0.4.0".to_string(),
+            ..current.clone()
+        };
+        let message = broker_status_mismatch(&config, &stale)
+            .unwrap()
+            .expect("older package version must be rejected");
+        assert!(message.contains("broker package version mismatch"));
+        assert!(message.contains("0.4.0"));
+
+        // Pre-0.4.3 brokers omit the field entirely; serde defaults it to "".
+        let unversioned = BrokerStatus {
+            package_version: String::new(),
+            ..current
+        };
+        let message = broker_status_mismatch(&config, &unversioned)
+            .unwrap()
+            .expect("unversioned broker must be rejected");
+        assert!(message.contains("pre-0.4.3 (unversioned)"));
+    }
+
+    #[test]
     fn broker_status_must_match_requested_runtime() {
         let tempdir = tempfile::tempdir().unwrap();
         let managed_config = RuntimeConfig::managed(tempdir.path().join("state"), None);
@@ -6607,6 +6656,7 @@ mod tests {
         .unwrap();
         let status = BrokerStatus {
             protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
             pid: 123,
             runtime_mode: RuntimeMode::External,
             cdp_endpoint: "http://127.0.0.1:9222".to_string(),
@@ -6636,6 +6686,7 @@ mod tests {
         .unwrap();
         let status = BrokerStatus {
             protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
             pid: 123,
             runtime_mode: RuntimeMode::External,
             cdp_endpoint: "http://127.0.0.1:9223".to_string(),
