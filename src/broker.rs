@@ -6239,6 +6239,150 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn serve_exits_when_its_state_dir_is_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state_dir = tempdir.path().join("state");
+        let config = test_config(state_dir.clone());
+        prepare_state(&config).await.unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        let server = tokio::spawn(serve_state(
+            config.clone(),
+            fake_state(Vec::new()),
+            listener,
+            None,
+            Duration::from_millis(50),
+        ));
+
+        fs::remove_dir_all(&state_dir).unwrap();
+
+        let exited = tokio::time::timeout(Duration::from_secs(5), server).await;
+        exited
+            .expect("serve loop should exit after its state dir vanishes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_exits_when_its_socket_file_is_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let endpoint = broker_endpoint(&config).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        // Stand in for the socket file with a plain file so the test
+        // exercises the same "watched path disappears" verdict on every
+        // platform, including ones whose endpoints have no filesystem object.
+        let watched = tempdir.path().join("broker.sock");
+        fs::write(&watched, "").unwrap();
+
+        let server = tokio::spawn(serve_state(
+            config.clone(),
+            fake_state(Vec::new()),
+            listener,
+            Some(watched.clone()),
+            Duration::from_millis(50),
+        ));
+
+        fs::remove_file(&watched).unwrap();
+
+        let exited = tokio::time::timeout(Duration::from_secs(5), server).await;
+        exited
+            .expect("serve loop should exit after its socket file vanishes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_file_guard_releases_the_claim_it_owns() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let pid_path = tempdir.path().join("broker.pid");
+        let socket_path = tempdir.path().join("broker.sock");
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        fs::write(&socket_path, "").unwrap();
+
+        drop(RuntimeFileGuard::new(
+            pid_path.clone(),
+            Some(socket_path.clone()),
+        ));
+
+        assert!(!pid_path.exists(), "owned pid file should be released");
+        assert!(
+            !socket_path.exists(),
+            "owned socket file should be released"
+        );
+    }
+
+    #[test]
+    fn runtime_file_guard_leaves_a_successors_claim_alone() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let pid_path = tempdir.path().join("broker.pid");
+        let socket_path = tempdir.path().join("broker.sock");
+        fs::write(&pid_path, "999999").unwrap();
+        fs::write(&socket_path, "").unwrap();
+
+        drop(RuntimeFileGuard::new(
+            pid_path.clone(),
+            Some(socket_path.clone()),
+        ));
+
+        assert!(pid_path.exists(), "successor's pid file must survive");
+        assert!(socket_path.exists(), "successor's socket file must survive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_incompatible_broker_displaces_a_stale_process() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+
+        // A long-lived child stands in for the stale broker. Reap it in the
+        // background so termination is observable as process exit rather
+        // than a lingering zombie.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let endpoint = broker_endpoint(&config).unwrap();
+        let stale_path = endpoint.stale_path().map(Path::to_path_buf);
+        if let Some(path) = &stale_path {
+            fs::write(path, "").unwrap();
+        }
+        fs::write(&config.pid_path, pid.to_string()).unwrap();
+
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.0.1".to_string(),
+            pid,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.state_dir.clone(),
+        };
+
+        restart_incompatible_broker(&config, &status, "broker package version mismatch")
+            .await
+            .unwrap();
+
+        assert!(
+            !process_is_alive(pid),
+            "stale broker process should be terminated"
+        );
+        assert!(
+            !config.pid_path.exists(),
+            "stale broker's pid file should be removed"
+        );
+        if let Some(path) = &stale_path {
+            assert!(!path.exists(), "stale socket file should be removed");
+        }
+    }
+
     #[test]
     fn serialization_fallback_preserves_request_id() {
         struct FailsSerialize;
