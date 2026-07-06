@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -15,6 +15,8 @@ const CDP_ENDPOINT_ENV: &str = "VISIBLE_BROWSER_CDP_ENDPOINT";
 const CDP_PORT_ENV: &str = "VISIBLE_BROWSER_CDP_PORT";
 const STATE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_STATE_DIR";
 pub const CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_PATH";
+pub const BROKER_IDLE_TIMEOUT_ENV: &str = "VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS";
+pub const DEFAULT_BROKER_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,12 +48,18 @@ pub enum Command {
 pub struct BrokerArgs {
     #[arg(long, value_name = "ENDPOINT")]
     pub socket: Option<String>,
+
+    #[arg(long, value_name = "SECS")]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl BrokerArgs {
     pub fn apply(self, mut config: RuntimeConfig) -> RuntimeConfig {
         if let Some(ipc_endpoint) = self.socket {
             config.ipc_endpoint = ipc_endpoint;
+        }
+        if let Some(secs) = self.idle_timeout_secs {
+            config.idle_timeout = idle_timeout_from_secs(secs);
         }
 
         config
@@ -100,13 +108,16 @@ impl RuntimeOptions {
         let env_state_dir = env::var_os(STATE_DIR_ENV).map(PathBuf::from);
         let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
         let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
+        let idle_timeout = resolve_idle_timeout(env::var(BROKER_IDLE_TIMEOUT_ENV).ok().as_deref())?;
 
-        match cdp_endpoint {
+        let mut config = match cdp_endpoint {
             Some(cdp_endpoint) => {
-                RuntimeConfig::external_with_chrome(cdp_endpoint, state_dir, chrome_path)
+                RuntimeConfig::external_with_chrome(cdp_endpoint, state_dir, chrome_path)?
             }
-            None => Ok(RuntimeConfig::managed(state_dir, chrome_path)),
-        }
+            None => RuntimeConfig::managed(state_dir, chrome_path),
+        };
+        config.idle_timeout = idle_timeout;
+        Ok(config)
     }
 }
 
@@ -131,6 +142,9 @@ pub struct RuntimeConfig {
     pub devtools_active_port_path: PathBuf,
     pub chrome_lock_path: PathBuf,
     pub chrome_path: Option<PathBuf>,
+    /// How long the broker may sit with no connections and no sessions before
+    /// exiting on its own. `None` disables idle exit.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl RuntimeConfig {
@@ -159,6 +173,7 @@ impl RuntimeConfig {
             chrome_profile_dir,
             chrome_path,
             state_dir,
+            idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
         })
     }
 
@@ -177,7 +192,29 @@ impl RuntimeConfig {
             chrome_profile_dir,
             chrome_path,
             state_dir,
+            idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
         }
+    }
+}
+
+/// Resolve the idle window from the environment. Zero disables idle exit,
+/// matching the `SCCACHE_IDLE_TIMEOUT=0` convention.
+pub fn resolve_idle_timeout(env_secs: Option<&str>) -> Result<Option<Duration>> {
+    let Some(raw) = non_empty(env_secs) else {
+        return Ok(Some(DEFAULT_BROKER_IDLE_TIMEOUT));
+    };
+
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("invalid {BROKER_IDLE_TIMEOUT_ENV} value `{raw}`"))?;
+    Ok(idle_timeout_from_secs(secs))
+}
+
+fn idle_timeout_from_secs(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
     }
 }
 
@@ -368,5 +405,83 @@ mod tests {
         };
 
         assert_eq!(args.socket.as_deref(), Some("/tmp/lab.sock"));
+    }
+
+    #[test]
+    fn idle_timeout_defaults_to_fifteen_minutes() {
+        assert_eq!(
+            resolve_idle_timeout(None).unwrap(),
+            Some(DEFAULT_BROKER_IDLE_TIMEOUT)
+        );
+        assert_eq!(
+            resolve_idle_timeout(Some("  ")).unwrap(),
+            Some(DEFAULT_BROKER_IDLE_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn idle_timeout_env_parses_seconds_and_zero_disables() {
+        assert_eq!(
+            resolve_idle_timeout(Some("120")).unwrap(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(resolve_idle_timeout(Some("0")).unwrap(), None);
+    }
+
+    #[test]
+    fn idle_timeout_env_rejects_garbage() {
+        let err = resolve_idle_timeout(Some("soon")).unwrap_err();
+
+        assert!(err.to_string().contains("soon"));
+    }
+
+    #[test]
+    fn broker_flag_overrides_the_configured_idle_timeout() {
+        let cli = Cli::try_parse_from([
+            "visible-browser-lab-mcp",
+            "broker",
+            "--idle-timeout-secs",
+            "2",
+        ])
+        .unwrap();
+
+        let Some(Command::Broker(args)) = cli.command else {
+            panic!("expected broker subcommand");
+        };
+
+        let config = args.apply(RuntimeConfig::managed(PathBuf::from("/tmp/lab"), None));
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn broker_flag_zero_disables_idle_exit() {
+        let cli = Cli::try_parse_from([
+            "visible-browser-lab-mcp",
+            "broker",
+            "--idle-timeout-secs",
+            "0",
+        ])
+        .unwrap();
+
+        let Some(Command::Broker(args)) = cli.command else {
+            panic!("expected broker subcommand");
+        };
+
+        let config = args.apply(RuntimeConfig::managed(PathBuf::from("/tmp/lab"), None));
+        assert_eq!(config.idle_timeout, None);
+    }
+
+    #[test]
+    fn broker_without_flag_keeps_the_configured_idle_timeout() {
+        let cli = Cli::try_parse_from(["visible-browser-lab-mcp", "broker"]).unwrap();
+
+        let Some(Command::Broker(args)) = cli.command else {
+            panic!("expected broker subcommand");
+        };
+
+        let mut base = RuntimeConfig::managed(PathBuf::from("/tmp/lab"), None);
+        base.idle_timeout = Some(Duration::from_secs(7));
+        let config = args.apply(base);
+        assert_eq!(config.idle_timeout, Some(Duration::from_secs(7)));
     }
 }

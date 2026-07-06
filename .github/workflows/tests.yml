@@ -41,6 +41,9 @@ jobs:
       - name: Test workspace unit layers
         run: cargo test --workspace --lib --bins
 
+      - name: Assert no leaked brokers
+        run: cargo xtask broker-survivors
+
       - name: Validate release inputs
         run: cargo xtask validate
 
@@ -76,3 +79,6 @@ jobs:
         env:
           VISIBLE_BROWSER_LAB_CFT_CACHE_DIR: target/chrome-for-testing
         run: cargo test --test headless_mcp
+
+      - name: Assert no leaked brokers
+        run: cargo xtask broker-survivors

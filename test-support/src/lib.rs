@@ -1470,7 +1470,12 @@ pub struct McpClient {
     stdout: Receiver<String>,
     stderr: Receiver<String>,
     next_id: u64,
+    state_dir: Option<PathBuf>,
 }
+
+/// Idle window for brokers spawned by test harnesses. Short enough that even
+/// a SIGKILLed harness strands a broker for seconds rather than forever.
+pub const TEST_BROKER_IDLE_TIMEOUT_SECS: &str = "2";
 
 impl McpClient {
     pub fn spawn(binary: &Path, cdp_endpoint: &str, state_dir: &Path, root: &Path) -> Result<Self> {
@@ -1481,13 +1486,13 @@ impl McpClient {
             .arg("--state-dir")
             .arg(state_dir)
             .current_dir(root);
-        Self::spawn_command(command, binary)
+        Self::spawn_command(command, binary, Some(state_dir))
     }
 
     pub fn spawn_with_state(binary: &Path, state_dir: &Path, root: &Path) -> Result<Self> {
         let mut command = Command::new(binary);
         command.arg("--state-dir").arg(state_dir).current_dir(root);
-        Self::spawn_command(command, binary)
+        Self::spawn_command(command, binary, Some(state_dir))
     }
 
     pub fn spawn_managed(
@@ -1502,7 +1507,7 @@ impl McpClient {
             .arg(state_dir)
             .current_dir(root)
             .env("VISIBLE_BROWSER_LAB_CHROME_PATH", chrome_path);
-        Self::spawn_command(command, binary)
+        Self::spawn_command(command, binary, Some(state_dir))
     }
 
     pub fn spawn_managed_from_environment(
@@ -1516,10 +1521,20 @@ impl McpClient {
             .current_dir(root)
             .env("VISIBLE_BROWSER_LAB_STATE_DIR", state_dir)
             .env("VISIBLE_BROWSER_LAB_CHROME_PATH", chrome_path);
-        Self::spawn_command(command, binary)
+        Self::spawn_command(command, binary, Some(state_dir))
     }
 
-    fn spawn_command(mut command: Command, binary: &Path) -> Result<Self> {
+    fn spawn_command(
+        mut command: Command,
+        binary: &Path,
+        state_dir: Option<&Path>,
+    ) -> Result<Self> {
+        // Test brokers expire on their own shortly after the harness stops
+        // using them, even when no cleanup code runs at all.
+        command.env(
+            "VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS",
+            TEST_BROKER_IDLE_TIMEOUT_SECS,
+        );
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1542,6 +1557,7 @@ impl McpClient {
             stdout: read_lines(stdout),
             stderr: read_lines(stderr),
             next_id: 1,
+            state_dir: state_dir.map(Path::to_path_buf),
         })
     }
 
@@ -1680,14 +1696,24 @@ impl McpClient {
     pub fn shutdown(&mut self) {
         let _ = self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut exited = false;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+                exited = true;
+                break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        // Also stop the broker this client spawned. The broker's own idle
+        // exit covers the SIGKILL case; this covers the ordinary case
+        // without waiting out the idle window.
+        if let Some(state_dir) = self.state_dir.take() {
+            stop_broker(&state_dir);
+        }
     }
 }
 
@@ -1717,7 +1743,7 @@ where
 }
 
 pub fn stop_broker(state_dir: &Path) {
-    let pid = ["broker-v2.pid", "broker.pid"]
+    let pid = ["broker-v3.pid", "broker-v2.pid", "broker.pid"]
         .into_iter()
         .find_map(|name| {
             fs::read_to_string(state_dir.join(name))

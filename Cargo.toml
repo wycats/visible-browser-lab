@@ -82,6 +82,7 @@ x11rb = "0.13"
 
 [dev-dependencies]
 tempfile = "3.23"
+tokio = { version = "1.48", features = ["test-util"] }
 visible-browser-lab-test-support = { path = "test-support" }
 proptest = "1"
 proptest-state-machine = "0.8"

@@ -84,6 +84,7 @@ fn main() -> Result<()> {
         "dogfood" => dogfood(DogfoodArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
+        "broker-survivors" => broker_survivors(),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
         "agent-eval" => agent_eval::agent_eval_command(
             &repo_root()?,
@@ -117,6 +118,9 @@ usage:
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
   cargo xtask install-smoke [--archive <path>] [--codex <path>] [--chrome-path <path>] [--invoke-codex] [--auth-source <path>] [--keep-temp]
+  cargo xtask broker-survivors
+      Fails if any broker process is still running against a state directory
+      under the OS temp root. Run after the test suite to catch leaked brokers.
   cargo xtask catalog-measurement
   cargo xtask agent-eval --auth-source <path> [--codex <path>] [--model <model>] [--reasoning-effort <effort>] [--fixture <id>] [--resume <run-dir>]
 "
@@ -517,6 +521,75 @@ fn validate() -> Result<()> {
 
     println!("validated visible-browser-lab release inputs");
     Ok(())
+}
+
+/// Suite-level no-survivors assertion (RFC 00007): after a test run, no broker
+/// process may still be running against a state directory under the temp root.
+fn broker_survivors() -> Result<()> {
+    let survivors = find_broker_survivors()?;
+    if survivors.is_empty() {
+        println!("no leaked broker processes");
+        return Ok(());
+    }
+    for line in &survivors {
+        eprintln!("leaked broker: {line}");
+    }
+    bail!(
+        "{} broker process(es) survived with temp state directories; \
+         the broker idle exit or harness cleanup regressed",
+        survivors.len()
+    );
+}
+
+#[cfg(unix)]
+fn find_broker_survivors() -> Result<Vec<String>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("failed to run ps")?;
+    let temp_root = env::temp_dir();
+    let temp_prefix = temp_root.to_string_lossy();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .lines()
+        .filter(|line| {
+            line.contains("visible-browser-lab-mcp")
+                && line.contains(" broker ")
+                && (line.contains(temp_prefix.as_ref())
+                    // macOS temp dirs live under /var/folders even when
+                    // env::temp_dir reports the /private alias (or vice versa).
+                    || line.contains("/var/folders/")
+                    || line.contains("/tmp/"))
+        })
+        .map(str::trim)
+        .map(String::from)
+        .collect())
+}
+
+#[cfg(windows)]
+fn find_broker_survivors() -> Result<Vec<String>> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='visible-browser-lab-mcp.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+        ])
+        .output()
+        .context("failed to run powershell")?;
+    let temp_root = env::temp_dir();
+    let temp_prefix = temp_root.to_string_lossy().to_lowercase();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("visible-browser-lab-mcp")
+                && lower.contains(" broker ")
+                && lower.contains(temp_prefix.as_str())
+        })
+        .map(str::trim)
+        .map(String::from)
+        .collect())
 }
 
 fn package(args: PackageArgs) -> Result<()> {
