@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -165,6 +165,7 @@ impl BrowserToolError {
 pub enum BrowserToolErrorCode {
     ChromeUnavailable,
     UnknownSession,
+    SessionExpired,
     UnknownTab,
     TabNotOwned,
     TabNotActive,
@@ -188,6 +189,18 @@ impl BrowserToolError {
         Self {
             code: BrowserToolErrorCode::UnknownSession,
             message: format!("unknown agent session `{}`", session_id.0),
+            recovery: Some(RecoveryAction::StartSession),
+        }
+    }
+
+    pub fn session_expired(session_id: &AgentSessionId, idle: Duration) -> Self {
+        Self {
+            code: BrowserToolErrorCode::SessionExpired,
+            message: format!(
+                "agent session `{}` expired after {}s of inactivity; its tabs were released and are claimable",
+                session_id.0,
+                idle.as_secs()
+            ),
             recovery: Some(RecoveryAction::StartSession),
         }
     }
@@ -332,11 +345,40 @@ impl BrowserToolError {
     }
 }
 
+/// Tombstones kept for `session_expired` reporting. Old enough tombstones
+/// degrade to `unknown_session`, which costs the caller nothing: the
+/// recovery for both errors is `start_session`.
+const EXPIRED_SESSION_TOMBSTONE_CAP: usize = 1024;
+
 #[derive(Debug, Default)]
 pub struct LeaseRegistry {
     sessions: HashMap<AgentSessionId, BrowserSession>,
     leases: HashMap<TabId, TabLease>,
     active_target_owners: HashMap<String, TabId>,
+    /// Sessions removed by the expiry sweep, with how long each sat idle.
+    /// Lets a call on an expired session fail with `session_expired` ("you
+    /// had this and waited too long") instead of `unknown_session` ("you
+    /// never had this"). Capped at `EXPIRED_SESSION_TOMBSTONE_CAP`; the
+    /// oldest tombstones are evicted first.
+    expired_sessions: HashMap<AgentSessionId, u64>,
+    /// Tombstone insertion order, oldest first, for cap eviction.
+    expired_session_order: VecDeque<AgentSessionId>,
+}
+
+/// What the expiry sweep did to one session, so the broker can reclaim the
+/// session-private state that lives outside the registry.
+pub struct ExpiredSession {
+    pub session_id: AgentSessionId,
+    pub idle: Duration,
+    pub released: Vec<ReleasedLease>,
+}
+
+/// A lease the expiry sweep released, with the target it was bound to so
+/// the broker can clear target-side state (emulation overrides) the way an
+/// explicit release does.
+pub struct ReleasedLease {
+    pub tab_id: TabId,
+    pub target_id: String,
 }
 
 impl LeaseRegistry {
@@ -382,14 +424,82 @@ impl LeaseRegistry {
         }
     }
 
-    /// Whether any session was touched within `grace`. Sessions defer the
-    /// broker's idle exit only while they show recent activity; a session
-    /// nobody has touched in a long time is treated as abandoned.
-    pub fn any_session_active_within(&self, grace: Duration, now_ms: u64) -> bool {
-        let grace_ms = grace.as_millis() as u64;
-        self.sessions
+    /// Whether any live session exists. Every live session defers the
+    /// broker's idle exit; the expiry sweep is what turns an abandoned
+    /// session from live to gone.
+    pub fn has_sessions(&self) -> bool {
+        !self.sessions.is_empty()
+    }
+
+    /// Expire every session whose last touch is older than `ttl`. Tab leases
+    /// are released, never closed: the Chrome tab is the user's visible
+    /// state, and a bookkeeping deadline is not grounds for destroying it.
+    /// The session record itself is removed and tombstoned so later calls
+    /// naming it get `session_expired` rather than `unknown_session`.
+    ///
+    /// Sessions in `in_flight` are never expired: a request that is still
+    /// running is proof the session is in use, however stale its last
+    /// completed touch looks.
+    pub fn expire_sessions(
+        &mut self,
+        ttl: Duration,
+        now_ms: u64,
+        in_flight: &HashSet<AgentSessionId>,
+    ) -> Vec<ExpiredSession> {
+        // Saturate rather than truncate: an absurdly large TTL means
+        // "effectively never", not a wrapped small number.
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let expired_ids: Vec<AgentSessionId> = self
+            .sessions
             .values()
-            .any(|session| now_ms.saturating_sub(session.updated_at_ms) <= grace_ms)
+            .filter(|session| {
+                !in_flight.contains(&session.agent_session_id)
+                    && now_ms.saturating_sub(session.updated_at_ms) > ttl_ms
+            })
+            .map(|session| session.agent_session_id.clone())
+            .collect();
+
+        expired_ids
+            .into_iter()
+            .map(|session_id| {
+                let session = self
+                    .sessions
+                    .remove(&session_id)
+                    .expect("expired session id was just collected from the table");
+                let idle_ms = now_ms.saturating_sub(session.updated_at_ms);
+
+                let mut released = Vec::new();
+                for lease in self.leases.values_mut() {
+                    if lease.owner_session_id == session_id
+                        && matches!(lease.state, LeaseState::Active | LeaseState::Missing)
+                    {
+                        lease.state = LeaseState::Released;
+                        lease.updated_at_ms = now_ms;
+                        released.push(ReleasedLease {
+                            tab_id: lease.tab_id.clone(),
+                            target_id: lease.target_id.clone(),
+                        });
+                    }
+                }
+                for lease in &released {
+                    self.remove_active_target_if_matches(&lease.target_id, &lease.tab_id);
+                }
+
+                self.expired_sessions.insert(session_id.clone(), idle_ms);
+                self.expired_session_order.push_back(session_id.clone());
+                while self.expired_session_order.len() > EXPIRED_SESSION_TOMBSTONE_CAP {
+                    if let Some(evicted) = self.expired_session_order.pop_front() {
+                        self.expired_sessions.remove(&evicted);
+                    }
+                }
+
+                ExpiredSession {
+                    session_id,
+                    idle: Duration::from_millis(idle_ms),
+                    released,
+                }
+            })
+            .collect()
     }
 
     pub fn ensure_session(&self, session_id: &AgentSessionId) -> Result<(), BrowserToolError> {
@@ -742,9 +852,16 @@ impl LeaseRegistry {
         &self,
         session_id: &AgentSessionId,
     ) -> Result<&BrowserSession, BrowserToolError> {
-        self.sessions
-            .get(session_id)
-            .ok_or_else(|| BrowserToolError::unknown_session(session_id))
+        if let Some(session) = self.sessions.get(session_id) {
+            return Ok(session);
+        }
+        if let Some(idle_ms) = self.expired_sessions.get(session_id) {
+            return Err(BrowserToolError::session_expired(
+                session_id,
+                Duration::from_millis(*idle_ms),
+            ));
+        }
+        Err(BrowserToolError::unknown_session(session_id))
     }
 
     fn active_lease_for_target(&self, target_id: &str) -> Option<&TabLease> {
@@ -834,27 +951,123 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_has_no_active_sessions() {
+    fn empty_registry_has_no_sessions() {
         let registry = LeaseRegistry::new();
-        assert!(!registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+        assert!(!registry.has_sessions());
     }
 
     #[test]
-    fn recently_touched_session_counts_as_active() {
+    fn fresh_session_survives_the_expiry_sweep() {
         let mut registry = LeaseRegistry::new();
         registry.start_session(Some("agent".to_string()));
 
-        assert!(registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        assert!(expired.is_empty());
+        assert!(registry.has_sessions());
     }
 
     #[test]
-    fn stale_session_no_longer_defers_idle_exit() {
+    fn stale_session_expires_and_its_leases_are_released_not_closed() {
         let mut registry = LeaseRegistry::new();
-        registry.start_session(Some("agent".to_string()));
+        let session = registry.start_session(Some("agent".to_string()));
+        let summary = registry
+            .lease_tab(&session.agent_session_id, focused_snapshot("target-a"))
+            .unwrap();
 
-        // Pretend an hour has passed with a one-minute grace window.
-        let future = now_ms() + 3_600_000;
-        assert!(!registry.any_session_active_within(Duration::from_secs(60), future));
+        registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].session_id, session.agent_session_id);
+        assert_eq!(expired[0].released.len(), 1);
+        assert_eq!(expired[0].released[0].tab_id, summary.tab_id);
+        assert!(!registry.has_sessions());
+        // Released, not gone: the lease record survives as a claimable tab.
+        let lease = registry.leases.get(&summary.tab_id).unwrap();
+        assert!(matches!(lease.state, LeaseState::Released));
+    }
+
+    #[test]
+    fn expired_session_reports_session_expired_not_unknown() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+        registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+        registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        let error = registry
+            .ensure_session(&session.agent_session_id)
+            .unwrap_err();
+        assert!(matches!(error.code, BrowserToolErrorCode::SessionExpired));
+        assert_eq!(error.recovery, Some(RecoveryAction::StartSession));
+
+        let never_seen = registry
+            .ensure_session(&AgentSessionId("session-nonexistent".to_string()))
+            .unwrap_err();
+        assert!(matches!(
+            never_seen.code,
+            BrowserToolErrorCode::UnknownSession
+        ));
+    }
+
+    #[test]
+    fn restart_after_expiry_mints_a_fresh_session_and_keeps_the_tombstone() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+        registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+        registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        let restarted = registry.start_session(Some("agent".to_string()));
+
+        assert_ne!(restarted.agent_session_id, session.agent_session_id);
+        assert!(registry.ensure_session(&restarted.agent_session_id).is_ok());
+        // The old id still answers session_expired, not unknown_session.
+        let error = registry
+            .ensure_session(&session.agent_session_id)
+            .unwrap_err();
+        assert!(matches!(error.code, BrowserToolErrorCode::SessionExpired));
+    }
+
+    #[test]
+    fn tombstones_are_capped_and_evict_oldest_first() {
+        let mut registry = LeaseRegistry::new();
+        let first = registry.start_session(Some("agent".to_string()));
+        registry.backdate_session(&first.agent_session_id, 2 * 3_600_000);
+        registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        // Expire enough further sessions to push the first tombstone out.
+        for _ in 0..EXPIRED_SESSION_TOMBSTONE_CAP {
+            let session = registry.start_session(Some("agent".to_string()));
+            registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        }
+
+        assert_eq!(
+            registry.expired_sessions.len(),
+            EXPIRED_SESSION_TOMBSTONE_CAP
+        );
+        // The evicted id degrades to unknown_session, whose recovery is the
+        // same start_session the caller needed anyway.
+        let error = registry
+            .ensure_session(&first.agent_session_id)
+            .unwrap_err();
+        assert!(matches!(error.code, BrowserToolErrorCode::UnknownSession));
+    }
+
+    #[test]
+    fn an_absurdly_large_ttl_never_expires_sessions() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+        registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+
+        // A TTL whose millisecond count exceeds u64 must saturate to
+        // "effectively never", not wrap into a tiny window.
+        let expired = registry.expire_sessions(Duration::MAX, now_ms(), &HashSet::new());
+
+        assert!(expired.is_empty());
+        assert!(registry.has_sessions());
     }
 
     #[test]
@@ -866,7 +1079,8 @@ mod tests {
         registry.backdate_session(&session.agent_session_id, 3_600_000);
         registry.touch(&session.agent_session_id);
 
-        assert!(registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+        let expired = registry.expire_sessions(Duration::from_secs(60), now_ms(), &HashSet::new());
+        assert!(expired.is_empty());
     }
 
     #[test]
@@ -874,7 +1088,7 @@ mod tests {
         let mut registry = LeaseRegistry::new();
         registry.touch(&AgentSessionId("session-nonexistent".to_string()));
 
-        assert!(!registry.any_session_active_within(Duration::from_secs(60), now_ms()));
+        assert!(!registry.has_sessions());
     }
 
     #[test]

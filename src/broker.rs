@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -63,9 +63,6 @@ const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const TENANCY_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Sessions defer idle exit only while they were touched within this many
-/// idle windows; older sessions are treated as abandoned.
-const IDLE_SESSION_GRACE_FACTOR: u32 = 4;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
@@ -83,6 +80,11 @@ struct BrokerState {
     screencasts: Arc<AsyncMutex<HashMap<String, ActiveScreencast>>>,
     viewport_overrides: Arc<Mutex<HashMap<String, serde_json::Map<String, Value>>>>,
     focused_target_id: Arc<Mutex<Option<String>>>,
+    /// Sessions with a request currently being dispatched, with a count of
+    /// how many. The expiry sweep never expires an in-flight session: a
+    /// running request is proof of use, however stale the session's last
+    /// completed touch looks.
+    in_flight_sessions: Arc<Mutex<HashMap<AgentSessionId, usize>>>,
     browser: BrowserBackend,
 }
 
@@ -100,6 +102,7 @@ impl BrokerState {
             screencasts: Arc::new(AsyncMutex::new(HashMap::new())),
             viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
+            in_flight_sessions: Arc::new(Mutex::new(HashMap::new())),
             browser: BrowserBackend::new(config)?,
         })
     }
@@ -116,6 +119,7 @@ impl BrokerState {
             screencasts: Arc::new(AsyncMutex::new(HashMap::new())),
             viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
+            in_flight_sessions: Arc::new(Mutex::new(HashMap::new())),
             browser,
         }
     }
@@ -1909,6 +1913,14 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
                 .unwrap_or(0)
                 .to_string(),
         )
+        .arg("--session-ttl-secs")
+        .arg(
+            config
+                .session_ttl
+                .map(|ttl| ttl.as_secs())
+                .unwrap_or(0)
+                .to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -2022,9 +2034,10 @@ async fn serve_state(
                 if let Some(reason) = tenancy_violation(&config, stale_path.as_deref()) {
                     break ServeExit::TenancyLost(reason);
                 }
+                sweep_expired_sessions(&state, config.session_ttl).await;
             }
             window = idle.lapsed() => {
-                if idle_exit_permitted(&state, &open_connections, window) {
+                if idle_exit_permitted(&state, &open_connections) {
                     break ServeExit::Idle(window);
                 }
                 // A connection or live session vetoed the verdict; restart
@@ -2090,28 +2103,85 @@ impl IdleTracker {
 }
 
 /// Whether a lapsed idle deadline may actually end the broker's tenure. Open
-/// connections defer idleness outright. Sessions defer it only while recently
-/// touched: a session nobody has used in several idle windows is treated as
-/// abandoned rather than as a standing claim.
-fn idle_exit_permitted(
-    state: &BrokerState,
-    open_connections: &AtomicUsize,
-    window: Duration,
-) -> bool {
+/// connections defer idleness outright, and so does any live session: the
+/// expiry sweep is what removes abandoned sessions from the table, so a
+/// session that still exists is either in use or inside its TTL.
+fn idle_exit_permitted(state: &BrokerState, open_connections: &AtomicUsize) -> bool {
     if open_connections.load(Ordering::SeqCst) > 0 {
         return false;
     }
 
-    let grace = window.saturating_mul(IDLE_SESSION_GRACE_FACTOR);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0);
-    !state
+    !state.registry().lock().unwrap().has_sessions()
+}
+
+/// Expire every session whose last touch is older than the TTL, then reclaim
+/// the session-private state that lives outside the registry: artifact
+/// records with their on-disk files, element references for the session's
+/// tabs, and target-side emulation overrides (so a later claim does not
+/// inherit a stale viewport or user agent). Target-keyed diagnostics and
+/// screencasts are shared across sessions and stay. Sessions with a request
+/// in flight are skipped.
+async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
+    let Some(ttl) = ttl else {
+        return;
+    };
+
+    let now_ms = crate::leases::now_ms();
+    let in_flight: HashSet<AgentSessionId> = state
+        .in_flight_sessions
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let expired = state
         .registry()
         .lock()
         .unwrap()
-        .any_session_active_within(grace, now_ms)
+        .expire_sessions(ttl, now_ms, &in_flight);
+
+    for session in expired {
+        tracing::info!(
+            session = %session.session_id.0,
+            idle_secs = session.idle.as_secs(),
+            released_tabs = session.released.len(),
+            "session expired; leases released"
+        );
+        state
+            .artifacts()
+            .lock()
+            .unwrap()
+            .remove_session(&session.session_id);
+        {
+            let mut references = state.references().lock().unwrap();
+            for lease in &session.released {
+                references.reset_tab(&lease.tab_id);
+            }
+        }
+        for lease in &session.released {
+            // Same target-side reset an explicit release performs, so a
+            // later claim does not inherit this session's emulation
+            // overrides. Best-effort: the sweep has no caller to report
+            // failures to, and a vanished target needs no reset.
+            if let Ok(target) = target_by_id(state, &lease.target_id).await
+                && let Err(error) = state
+                    .browser
+                    .emulate(&target, "reset", &serde_json::Map::new())
+                    .await
+            {
+                tracing::warn!(
+                    target = %lease.target_id,
+                    error = %error.message,
+                    "failed to reset emulation on expired lease"
+                );
+            }
+            state
+                .viewport_overrides
+                .lock()
+                .unwrap()
+                .remove(&lease.target_id);
+        }
+    }
 }
 
 /// Re-verify the broker's claim to exist. Returns the violation when the
@@ -2201,6 +2271,12 @@ async fn dispatch_request(
 ) -> BrokerResponse {
     touch_request_session(state, &request);
     let session_id = request_session_id(&request);
+    // Mark the session in flight for the duration of this request so the
+    // expiry sweep cannot remove it mid-request; the guard un-marks on drop,
+    // including on panic unwind.
+    let _in_flight = session_id
+        .clone()
+        .map(|id| InFlightGuard::register(state, id));
 
     let response = match request.method.as_str() {
         "ping" => broker_response(request.id, broker_status(config, state).await),
@@ -2333,6 +2409,41 @@ fn touch_request_session(state: &BrokerState, request: &BrokerRequest) {
     };
 
     state.registry().lock().unwrap().touch(&session_id);
+}
+
+/// Marks a session as having a request in flight; the expiry sweep skips
+/// such sessions. Un-marks on drop, including on panic unwind, so a crashed
+/// handler cannot pin its session in the in-flight set forever.
+struct InFlightGuard {
+    sessions: Arc<Mutex<HashMap<AgentSessionId, usize>>>,
+    session_id: AgentSessionId,
+}
+
+impl InFlightGuard {
+    fn register(state: &BrokerState, session_id: AgentSessionId) -> Self {
+        let sessions = Arc::clone(&state.in_flight_sessions);
+        *sessions
+            .lock()
+            .unwrap()
+            .entry(session_id.clone())
+            .or_insert(0) += 1;
+        Self {
+            sessions,
+            session_id,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.sessions.lock().unwrap();
+        if let Some(count) = in_flight.get_mut(&self.session_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 fn request_session_id(request: &BrokerRequest) -> Option<AgentSessionId> {
@@ -6155,15 +6266,11 @@ mod tests {
         let state = fake_state(Vec::new());
         let connections = AtomicUsize::new(1);
 
-        assert!(!idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(!idle_exit_permitted(&state, &connections));
     }
 
     #[test]
-    fn idle_exit_is_denied_while_a_session_is_fresh() {
+    fn idle_exit_is_denied_while_any_session_exists() {
         let state = fake_state(Vec::new());
         state
             .registry
@@ -6172,11 +6279,101 @@ mod tests {
             .start_session(Some("agent".to_string()));
         let connections = AtomicUsize::new(0);
 
-        assert!(!idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(!idle_exit_permitted(&state, &connections));
+    }
+
+    #[tokio::test]
+    async fn idle_exit_is_denied_until_the_sweep_expires_a_stale_session() {
+        let state = fake_state(Vec::new());
+        let session = state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        let connections = AtomicUsize::new(0);
+
+        // Even stale, an unexpired session vetoes idle exit; the sweep is
+        // the single authority on session death.
+        assert!(!idle_exit_permitted(&state, &connections));
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert!(idle_exit_permitted(&state, &connections));
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_a_session_with_a_request_in_flight() {
+        let state = fake_state(Vec::new());
+        let session = state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+
+        // A long-running request (a slow wait_for, say) holds the guard
+        // while the maintenance tick fires. The sweep must not expire the
+        // session out from under it.
+        let guard = InFlightGuard::register(&state, session.agent_session_id.clone());
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+        assert!(state.registry.lock().unwrap().has_sessions());
+
+        // Once the request completes the session is fair game again.
+        drop(guard);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+        assert!(!state.registry.lock().unwrap().has_sessions());
+    }
+
+    #[tokio::test]
+    async fn sweep_clears_viewport_overrides_for_expired_leases() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let session = state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+        let summary = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        state
+            .viewport_overrides
+            .lock()
+            .unwrap()
+            .insert("target-a".to_string(), serde_json::Map::new());
+
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        // The next claim of this tab must not inherit the expired
+        // session's emulation state.
+        assert!(
+            !state
+                .viewport_overrides
+                .lock()
+                .unwrap()
+                .contains_key("target-a"),
+            "expired lease {} left viewport overrides behind",
+            summary.tab_id.0
+        );
     }
 
     #[tokio::test]
@@ -6208,13 +6405,15 @@ mod tests {
         };
         dispatch_request(&config, &state, request).await;
 
-        let refreshed = state
-            .registry
-            .lock()
-            .unwrap()
-            .any_session_active_within(Duration::from_secs(60), crate::leases::now_ms());
+        // The touch must have pulled the session back inside a 60s TTL:
+        // a sweep with that TTL finds nothing to expire.
+        let expired = state.registry.lock().unwrap().expire_sessions(
+            Duration::from_secs(60),
+            crate::leases::now_ms(),
+            &HashSet::new(),
+        );
         assert!(
-            refreshed,
+            expired.is_empty(),
             "an interaction-shaped request should refresh its session even when it fails"
         );
     }
@@ -6224,11 +6423,7 @@ mod tests {
         let state = fake_state(Vec::new());
         let connections = AtomicUsize::new(0);
 
-        assert!(idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(idle_exit_permitted(&state, &connections));
     }
 
     #[tokio::test(start_paused = true)]
