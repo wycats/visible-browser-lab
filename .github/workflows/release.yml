@@ -23,6 +23,55 @@ env:
   CODEX_CLI_VERSION: "0.136.0"
 
 jobs:
+  # A pull request dry-run already built, packaged, smoked, and attested the
+  # exact assets a release needs. When the tagged commit's tree matches a
+  # successful dry-run's tree (the normal squash-merge case), the release
+  # republishes those assets instead of rebuilding them.
+  reuse:
+    name: Find reusable dry-run assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.find.outputs.run_id }}
+    steps:
+      - name: Find dry-run with matching tree
+        id: find
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Annotated tag pushes can deliver the tag object's SHA; peel it to
+          # the tagged commit before reading the tree.
+          sha="${GITHUB_SHA}"
+          if ! tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha' 2>/dev/null); then
+            sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" -q '.object.sha')
+            tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha')
+          fi
+          run_id=""
+          while IFS=$'\t' read -r id head_sha; do
+            tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${head_sha}" -q '.tree.sha' 2>/dev/null) || continue
+            if [[ "$tree" == "$tag_tree" ]]; then
+              # The artifact must still exist; dry-run artifacts expire.
+              count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts" \
+                -q '[.artifacts[] | select(.name == "release-assets" and .expired == false)] | length')
+              if [[ "$count" == "1" ]]; then
+                run_id="$id"
+                break
+              fi
+            fi
+          done < <(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=pull_request&status=success&per_page=25" \
+            -q '.workflow_runs[] | [.id, .head_sha] | @tsv')
+          if [[ -n "$run_id" ]]; then
+            echo "Found dry-run ${run_id} with tree matching ${GITHUB_SHA}"
+          else
+            echo "No reusable dry-run for this tree; running the full pipeline"
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
   changes:
     name: Classify changed paths
     runs-on: ubuntu-latest
@@ -64,8 +113,10 @@ jobs:
 
   release-version:
     name: Resolve release version
-    needs: changes
-    if: needs.changes.outputs.required == 'true'
+    needs:
+      - changes
+      - reuse
+    if: needs.changes.outputs.required == 'true' && needs.reuse.outputs.run_id == ''
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -101,8 +152,13 @@ jobs:
   # commit, so the dry-run only repeats them for tag pushes and manual runs.
   tests:
     name: Tests
-    needs: changes
-    if: needs.changes.outputs.required == 'true' && github.event_name != 'pull_request'
+    needs:
+      - changes
+      - reuse
+    if: >-
+      needs.changes.outputs.required == 'true' &&
+      github.event_name != 'pull_request' &&
+      needs.reuse.outputs.run_id == ''
     uses: ./.github/workflows/tests.yml
 
   build:
@@ -111,11 +167,13 @@ jobs:
       - changes
       - tests
       - release-version
+      - reuse
     # Tests are skipped on pull requests because CI runs them on the same
     # commit; the build proceeds as long as no needed job failed.
     if: >-
       !cancelled() &&
       needs.changes.outputs.required == 'true' &&
+      needs.reuse.outputs.run_id == '' &&
       needs.release-version.result == 'success' &&
       (needs.tests.result == 'success' || needs.tests.result == 'skipped')
     runs-on: ${{ matrix.os }}
@@ -387,18 +445,59 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: package
+    needs:
+      - reuse
+      - package
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Publishes either the assets packaged in this run or the assets from a
+    # matching pull-request dry-run. The dry-run's attestations remain valid
+    # because they are keyed by asset digest and the bytes are unchanged.
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      (needs.reuse.outputs.run_id != '' || needs.package.result == 'success')
     permissions:
       contents: write
+      actions: read
 
     steps:
       - name: Download release assets
+        if: needs.reuse.outputs.run_id == ''
         uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: out/packages
+
+      - name: Download reused dry-run assets
+        if: needs.reuse.outputs.run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/packages
+          gh run download "${{ needs.reuse.outputs.run_id }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name release-assets \
+            --dir out/packages
+
+      - name: Verify reused dry-run assets
+        if: needs.reuse.outputs.run_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out/packages
+          sha256sum --check SHA256SUMS
+          version="${GITHUB_REF_NAME#v}"
+          # Every packaged asset embeds the release version in its filename,
+          # so a tag pointed at the wrong tree fails here.
+          for file in *; do
+            [[ "$file" == "SHA256SUMS" ]] && continue
+            if [[ "$file" != *"$version"* ]]; then
+              echo "Asset '$file' does not match release version ${version}" >&2
+              exit 1
+            fi
+          done
 
       - name: Create GitHub Release
         shell: bash
