@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -25,8 +25,8 @@ use chromiumoxide::{
             emulation::{
                 ClearDeviceMetricsOverrideParams, MediaFeature, SetCpuThrottlingRateParams,
                 SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
-                SetGeolocationOverrideParams, SetTouchEmulationEnabledParams,
-                SetUserAgentOverrideParams,
+                SetFocusEmulationEnabledParams, SetGeolocationOverrideParams,
+                SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
             },
             input::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
@@ -45,9 +45,10 @@ use chromiumoxide::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
                 CaptureScreenshotParams, EnableParams as PageEnableParams,
                 EventDomContentEventFired, EventJavascriptDialogOpening, EventLoadEventFired,
-                EventScreencastFrame, Frame, FrameTree, GetFrameTreeParams, GetLayoutMetricsParams,
-                GetNavigationHistoryParams, HandleJavaScriptDialogParams,
-                NavigateParams as PageNavigateParams, NavigateToHistoryEntryParams, ReloadParams,
+                EventScreencastFrame, EventScreencastVisibilityChanged, Frame, FrameTree,
+                GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
+                HandleJavaScriptDialogParams, NavigateParams as PageNavigateParams,
+                NavigateToHistoryEntryParams, ReloadParams,
                 RemoveScriptToEvaluateOnNewDocumentParams, ScreencastFrameAckParams,
                 ScriptIdentifier, StartScreencastFormat, StartScreencastParams,
                 StopScreencastParams, Viewport,
@@ -125,6 +126,43 @@ async fn release_object_group(page: &Page, object_group: &str) {
     let _ = page
         .execute(ReleaseObjectGroupParams::new(object_group))
         .await;
+}
+
+/// Broker-created tabs each get their own Chrome window (RFC 00010). Tabs
+/// sharing a window can background each other: activating one marks its
+/// siblings hidden, which stops frame production and starves screencasts.
+/// A tab that is alone in its window has no siblings, so the hazard cannot
+/// occur. Window-vs-window overlap is harmless under the occlusion launch
+/// flags in `managed_chrome.rs`.
+static WINDOW_SLOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// New windows cascade from this origin so they do not stack identically.
+const WINDOW_CASCADE_ORIGIN: (i64, i64) = (80, 80);
+const WINDOW_CASCADE_STEP: i64 = 40;
+const WINDOW_CASCADE_SLOTS: u64 = 10;
+const WINDOW_DEFAULT_WIDTH: i64 = 1280;
+const WINDOW_DEFAULT_HEIGHT: i64 = 900;
+
+fn next_window_slot() -> u64 {
+    WINDOW_SLOT_COUNTER.fetch_add(1, Ordering::Relaxed) % WINDOW_CASCADE_SLOTS
+}
+
+fn create_page_params(
+    url: Option<&str>,
+    focus: bool,
+    window_slot: u64,
+) -> Result<CreateTargetParams, BrowserToolError> {
+    let offset = WINDOW_CASCADE_STEP * i64::try_from(window_slot).unwrap_or(0);
+    CreateTargetParams::builder()
+        .url(url.unwrap_or("about:blank"))
+        .background(!focus)
+        .new_window(true)
+        .left(WINDOW_CASCADE_ORIGIN.0 + offset)
+        .top(WINDOW_CASCADE_ORIGIN.1 + offset)
+        .width(WINDOW_DEFAULT_WIDTH)
+        .height(WINDOW_DEFAULT_HEIGHT)
+        .build()
+        .map_err(BrowserToolError::invalid_input)
 }
 
 #[derive(Clone, Copy)]
@@ -221,11 +259,7 @@ impl CdpClient {
         focus: bool,
     ) -> Result<CdpTarget, BrowserToolError> {
         let connection = self.runtime.connection().await?;
-        let params = CreateTargetParams::builder()
-            .url(url.unwrap_or("about:blank"))
-            .background(!focus)
-            .build()
-            .map_err(BrowserToolError::invalid_input)?;
+        let params = create_page_params(url, focus, next_window_slot())?;
         let response = self
             .runtime
             .browser_command(
@@ -262,6 +296,21 @@ impl CdpClient {
                 "activate Chrome target",
             )
             .await?;
+        // Real activation makes the page genuinely visible, so a screencast
+        // no longer needs its focus-emulation override here. Clearing it
+        // restores honest page-side focus answers; if the page goes hidden
+        // again mid-cast, the cast's visibility listener re-engages it.
+        let engaged = self
+            .runtime
+            .screencast_focus_overrides
+            .lock()
+            .unwrap()
+            .remove(target_id);
+        if engaged && let Ok((page, _)) = self.page(target_id).await {
+            let _ = page
+                .execute(SetFocusEmulationEnabledParams::new(false))
+                .await;
+        }
         Ok(())
     }
 
@@ -1071,6 +1120,22 @@ impl CdpClient {
     }
 
     pub async fn has_focus(&self, target: &CdpTarget) -> Result<bool, BrowserToolError> {
+        // While a screencast's focus-emulation override is engaged, the page
+        // reports itself focused and visible by design; that lie keeps frames
+        // flowing but must not leak into user-focus checks (raw input would
+        // be accepted for a background tab). The override only exists because
+        // the page went hidden and no real activation has happened since, so
+        // the honest answer is "not focused". `focus_tab` activates the
+        // target, which clears the override before this check is polled.
+        if self
+            .runtime
+            .screencast_focus_overrides
+            .lock()
+            .unwrap()
+            .contains(&target.id)
+        {
+            return Ok(false);
+        }
         let (page, connection) = self.page(&target.id).await?;
         match page
             .evaluate_expression("document.hasFocus() && document.visibilityState === 'visible'")
@@ -2442,6 +2507,9 @@ impl CdpClient {
         let mut events = self
             .event_listener::<EventScreencastFrame>(&page, &connection)
             .await?;
+        let mut visibility = self
+            .event_listener::<EventScreencastVisibilityChanged>(&page, &connection)
+            .await?;
         self.runtime
             .page_command(
                 &connection,
@@ -2457,15 +2525,71 @@ impl CdpClient {
             .await?;
         let (done_tx, mut done_rx) = oneshot::channel();
         let event_page = page.clone();
+        let overrides = self.runtime.screencast_focus_overrides.clone();
+        let override_target = target.id.clone();
         let task = tokio::spawn(async move {
             let deadline = Instant::now() + max_duration;
             let sample_stride = (60 / fps.max(1)).max(1) as usize;
             let max_frames = ((fps as f64) * max_duration.as_secs_f64().ceil()) as usize;
             let mut frame_index = 0usize;
             let mut frames = Vec::new();
+            // The cast owns its frame guarantee (RFC 00010): if the page
+            // goes hidden mid-cast (a page-spawned sibling tab was
+            // activated), Chrome stops producing frames and the recording
+            // would silently collapse. Focus emulation forces the page
+            // back to visible, which restarts frame production. The shared
+            // registry is the source of truth for whether the override is
+            // engaged: `has_focus` consults it so the emulated focus never
+            // leaks into user-focus checks, and `activate_target` clears it
+            // when the tab becomes genuinely visible. If the page goes
+            // hidden again after a real activation, the cast re-engages.
+            //
+            // Enabling the emulation makes Chrome re-report the page as
+            // visible, so the first visible event after an enable is our
+            // own echo, not a genuine visibility change. Later visible
+            // events are genuine (the user returned to the tab or the
+            // covering sibling closed) and disengage the override so
+            // honest focus answers come back without waiting for the cast
+            // to end.
+            let mut visibility_open = true;
+            let mut emulation_echo_pending = false;
             loop {
                 tokio::select! {
                     _ = &mut done_rx => break,
+                    changed = visibility.next(), if visibility_open => {
+                        let Some(changed) = changed else {
+                            visibility_open = false;
+                            continue;
+                        };
+                        if changed.visible {
+                            if emulation_echo_pending {
+                                emulation_echo_pending = false;
+                            } else if overrides.lock().unwrap().remove(&override_target) {
+                                let _ = event_page
+                                    .execute(SetFocusEmulationEnabledParams::new(false))
+                                    .await;
+                            }
+                        } else if overrides.lock().unwrap().insert(override_target.clone()) {
+                            emulation_echo_pending = true;
+                            if event_page
+                                .execute(SetFocusEmulationEnabledParams::new(true))
+                                .await
+                                .is_err()
+                            {
+                                emulation_echo_pending = false;
+                                overrides.lock().unwrap().remove(&override_target);
+                            } else if !overrides.lock().unwrap().contains(&override_target) {
+                                // `activate_target` cleared the override while
+                                // the enable was in flight; honor the clear so
+                                // the emulation cannot outlive the registry
+                                // entry that makes `has_focus` distrust it.
+                                emulation_echo_pending = false;
+                                let _ = event_page
+                                    .execute(SetFocusEmulationEnabledParams::new(false))
+                                    .await;
+                            }
+                        }
+                    }
                     frame = events.next() => {
                         let Some(frame) = frame else { break };
                         let _ = event_page.execute(ScreencastFrameAckParams::new(frame.session_id)).await;
@@ -2481,6 +2605,11 @@ impl CdpClient {
                         frame_index += 1;
                     }
                 }
+            }
+            if overrides.lock().unwrap().remove(&override_target) {
+                let _ = event_page
+                    .execute(SetFocusEmulationEnabledParams::new(false))
+                    .await;
             }
             frames
         });
@@ -2875,6 +3004,12 @@ impl CdpClient {
 struct CdpRuntime {
     endpoint: CdpEndpoint,
     state: Mutex<RuntimeState>,
+    /// Targets whose screencast has engaged focus emulation to keep frames
+    /// flowing while the page is hidden (RFC 00010). The emulation makes the
+    /// page report itself focused and visible, so user-focus checks must
+    /// consult this registry instead of trusting the page while a cast's
+    /// override is engaged.
+    screencast_focus_overrides: Arc<StdMutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -2901,6 +3036,7 @@ impl CdpRuntime {
         Self {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
+            screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -3712,6 +3848,39 @@ mod tests {
             endpoint.targets_url().as_str(),
             "http://127.0.0.1:9222/json/list"
         );
+    }
+
+    #[test]
+    fn broker_created_tabs_own_their_windows() {
+        let params = create_page_params(Some("https://example.com"), true, 0).unwrap();
+        assert_eq!(params.new_window, Some(true));
+        assert_eq!(params.background, Some(false));
+        assert_eq!(params.left, Some(WINDOW_CASCADE_ORIGIN.0));
+        assert_eq!(params.top, Some(WINDOW_CASCADE_ORIGIN.1));
+        assert_eq!(params.width, Some(WINDOW_DEFAULT_WIDTH));
+        assert_eq!(params.height, Some(WINDOW_DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn windows_cascade_by_slot_and_wrap() {
+        let third = create_page_params(None, false, 3).unwrap();
+        assert_eq!(
+            third.left,
+            Some(WINDOW_CASCADE_ORIGIN.0 + 3 * WINDOW_CASCADE_STEP)
+        );
+        assert_eq!(third.background, Some(true));
+        assert_eq!(third.url, "about:blank");
+
+        // Slots advance by one per call and cycle: a full lap of the
+        // cascade returns to the same slot. Relative assertions because
+        // other tests share the process-wide counter.
+        let first = next_window_slot();
+        let second = next_window_slot();
+        assert_eq!(second, (first + 1) % WINDOW_CASCADE_SLOTS);
+        for _ in 0..(WINDOW_CASCADE_SLOTS - 1) {
+            next_window_slot();
+        }
+        assert_eq!(next_window_slot(), second);
     }
 
     #[test]

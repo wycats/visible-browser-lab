@@ -803,6 +803,11 @@ impl BrowserBackend {
                 if focus {
                     client.activate_target(&target.id).await?;
                     activate_managed_chrome_if_available(&browser.config);
+                    // App-level fronting raises whichever Chrome window the
+                    // OS picks; with one window per tab that may not be this
+                    // target's window. Re-asserting the target lets Chrome
+                    // raise the right window now that the app is frontmost.
+                    client.activate_target(&target.id).await?;
                 }
                 Ok(target)
             }
@@ -815,8 +820,14 @@ impl BrowserBackend {
             Self::Fake(browser) => browser.lock().unwrap().activate_target(target_id),
             Self::External(client) => client.activate_target(target_id).await,
             Self::Managed(browser) => {
-                browser.client().await?.activate_target(target_id).await?;
+                let client = browser.client().await?;
+                client.activate_target(target_id).await?;
                 activate_managed_chrome_if_available(&browser.config);
+                // App-level fronting raises whichever Chrome window the OS
+                // picks; with one window per tab that may not be this
+                // target's window. Re-asserting the target lets Chrome raise
+                // the right window now that the app is frontmost.
+                client.activate_target(target_id).await?;
                 Ok(())
             }
         }
