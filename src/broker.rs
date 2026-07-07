@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -63,9 +63,6 @@ const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
 const TENANCY_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Sessions defer idle exit only while they were touched within this many
-/// idle windows; older sessions are treated as abandoned.
-const IDLE_SESSION_GRACE_FACTOR: u32 = 4;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_CLICK_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_ELEMENT_TIMEOUT_MS: u64 = 5_000;
@@ -1909,6 +1906,14 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
                 .unwrap_or(0)
                 .to_string(),
         )
+        .arg("--session-ttl-secs")
+        .arg(
+            config
+                .session_ttl
+                .map(|ttl| ttl.as_secs())
+                .unwrap_or(0)
+                .to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -2022,9 +2027,10 @@ async fn serve_state(
                 if let Some(reason) = tenancy_violation(&config, stale_path.as_deref()) {
                     break ServeExit::TenancyLost(reason);
                 }
+                sweep_expired_sessions(&state, config.session_ttl);
             }
             window = idle.lapsed() => {
-                if idle_exit_permitted(&state, &open_connections, window) {
+                if idle_exit_permitted(&state, &open_connections) {
                     break ServeExit::Idle(window);
                 }
                 // A connection or live session vetoed the verdict; restart
@@ -2090,28 +2096,51 @@ impl IdleTracker {
 }
 
 /// Whether a lapsed idle deadline may actually end the broker's tenure. Open
-/// connections defer idleness outright. Sessions defer it only while recently
-/// touched: a session nobody has used in several idle windows is treated as
-/// abandoned rather than as a standing claim.
-fn idle_exit_permitted(
-    state: &BrokerState,
-    open_connections: &AtomicUsize,
-    window: Duration,
-) -> bool {
+/// connections defer idleness outright, and so does any live session: the
+/// expiry sweep is what removes abandoned sessions from the table, so a
+/// session that still exists is either in use or inside its TTL.
+fn idle_exit_permitted(state: &BrokerState, open_connections: &AtomicUsize) -> bool {
     if open_connections.load(Ordering::SeqCst) > 0 {
         return false;
     }
 
-    let grace = window.saturating_mul(IDLE_SESSION_GRACE_FACTOR);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0);
-    !state
+    !state.registry().lock().unwrap().has_sessions()
+}
+
+/// Expire every session whose last touch is older than the TTL, then reclaim
+/// the session-private state that lives outside the registry: artifact
+/// records with their on-disk files, and element references for the
+/// session's tabs. Target-keyed state (diagnostics, screencasts) is shared
+/// across sessions and stays.
+fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
+    let Some(ttl) = ttl else {
+        return;
+    };
+
+    let now_ms = crate::leases::now_ms();
+    let expired = state
         .registry()
         .lock()
         .unwrap()
-        .any_session_active_within(grace, now_ms)
+        .expire_sessions(ttl, now_ms);
+
+    for session in expired {
+        tracing::info!(
+            session = %session.session_id.0,
+            idle_secs = session.idle.as_secs(),
+            released_tabs = session.released_tab_ids.len(),
+            "session expired; leases released"
+        );
+        state
+            .artifacts()
+            .lock()
+            .unwrap()
+            .remove_session(&session.session_id);
+        let mut references = state.references().lock().unwrap();
+        for tab_id in &session.released_tab_ids {
+            references.reset_tab(tab_id);
+        }
+    }
 }
 
 /// Re-verify the broker's claim to exist. Returns the violation when the
@@ -6155,15 +6184,11 @@ mod tests {
         let state = fake_state(Vec::new());
         let connections = AtomicUsize::new(1);
 
-        assert!(!idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(!idle_exit_permitted(&state, &connections));
     }
 
     #[test]
-    fn idle_exit_is_denied_while_a_session_is_fresh() {
+    fn idle_exit_is_denied_while_any_session_exists() {
         let state = fake_state(Vec::new());
         state
             .registry
@@ -6172,11 +6197,31 @@ mod tests {
             .start_session(Some("agent".to_string()));
         let connections = AtomicUsize::new(0);
 
-        assert!(!idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(!idle_exit_permitted(&state, &connections));
+    }
+
+    #[test]
+    fn idle_exit_is_denied_until_the_sweep_expires_a_stale_session() {
+        let state = fake_state(Vec::new());
+        let session = state
+            .registry
+            .lock()
+            .unwrap()
+            .start_session(Some("agent".to_string()));
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        let connections = AtomicUsize::new(0);
+
+        // Even stale, an unexpired session vetoes idle exit; the sweep is
+        // the single authority on session death.
+        assert!(!idle_exit_permitted(&state, &connections));
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600)));
+
+        assert!(idle_exit_permitted(&state, &connections));
     }
 
     #[tokio::test]
@@ -6208,13 +6253,15 @@ mod tests {
         };
         dispatch_request(&config, &state, request).await;
 
-        let refreshed = state
+        // The touch must have pulled the session back inside a 60s TTL:
+        // a sweep with that TTL finds nothing to expire.
+        let expired = state
             .registry
             .lock()
             .unwrap()
-            .any_session_active_within(Duration::from_secs(60), crate::leases::now_ms());
+            .expire_sessions(Duration::from_secs(60), crate::leases::now_ms());
         assert!(
-            refreshed,
+            expired.is_empty(),
             "an interaction-shaped request should refresh its session even when it fails"
         );
     }
@@ -6224,11 +6271,7 @@ mod tests {
         let state = fake_state(Vec::new());
         let connections = AtomicUsize::new(0);
 
-        assert!(idle_exit_permitted(
-            &state,
-            &connections,
-            Duration::from_secs(60)
-        ));
+        assert!(idle_exit_permitted(&state, &connections));
     }
 
     #[tokio::test(start_paused = true)]

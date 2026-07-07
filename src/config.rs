@@ -17,6 +17,12 @@ const STATE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_STATE_DIR";
 pub const CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_PATH";
 pub const BROKER_IDLE_TIMEOUT_ENV: &str = "VISIBLE_BROWSER_LAB_BROKER_IDLE_TIMEOUT_SECS";
 pub const DEFAULT_BROKER_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub const SESSION_TTL_ENV: &str = "VISIBLE_BROWSER_LAB_SESSION_TTL_SECS";
+/// Four times the broker's idle window, mirroring the staleness bound it
+/// replaces: long enough that no plausible pause in active work hits it,
+/// short enough that the tab pool recovers from a crashed client within
+/// the hour.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +57,9 @@ pub struct BrokerArgs {
 
     #[arg(long, value_name = "SECS")]
     pub idle_timeout_secs: Option<u64>,
+
+    #[arg(long, value_name = "SECS")]
+    pub session_ttl_secs: Option<u64>,
 }
 
 impl BrokerArgs {
@@ -60,6 +69,9 @@ impl BrokerArgs {
         }
         if let Some(secs) = self.idle_timeout_secs {
             config.idle_timeout = idle_timeout_from_secs(secs);
+        }
+        if let Some(secs) = self.session_ttl_secs {
+            config.session_ttl = idle_timeout_from_secs(secs);
         }
 
         config
@@ -109,6 +121,7 @@ impl RuntimeOptions {
         let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
         let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
         let idle_timeout = resolve_idle_timeout(env::var(BROKER_IDLE_TIMEOUT_ENV).ok().as_deref())?;
+        let session_ttl = resolve_session_ttl(env::var(SESSION_TTL_ENV).ok().as_deref())?;
 
         let mut config = match cdp_endpoint {
             Some(cdp_endpoint) => {
@@ -117,6 +130,7 @@ impl RuntimeOptions {
             None => RuntimeConfig::managed(state_dir, chrome_path),
         };
         config.idle_timeout = idle_timeout;
+        config.session_ttl = session_ttl;
         Ok(config)
     }
 }
@@ -145,6 +159,9 @@ pub struct RuntimeConfig {
     /// How long the broker may sit with no connections and no sessions before
     /// exiting on its own. `None` disables idle exit.
     pub idle_timeout: Option<Duration>,
+    /// How long a session may go untouched before the expiry sweep releases
+    /// its tabs and removes it. `None` disables expiry.
+    pub session_ttl: Option<Duration>,
 }
 
 impl RuntimeConfig {
@@ -174,6 +191,7 @@ impl RuntimeConfig {
             chrome_path,
             state_dir,
             idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
+            session_ttl: Some(DEFAULT_SESSION_TTL),
         })
     }
 
@@ -193,6 +211,7 @@ impl RuntimeConfig {
             chrome_path,
             state_dir,
             idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
+            session_ttl: Some(DEFAULT_SESSION_TTL),
         }
     }
 }
@@ -216,6 +235,19 @@ fn idle_timeout_from_secs(secs: u64) -> Option<Duration> {
     } else {
         Some(Duration::from_secs(secs))
     }
+}
+
+/// Resolve the session TTL from the environment. Zero disables expiry,
+/// the same convention as the broker's idle window.
+pub fn resolve_session_ttl(env_secs: Option<&str>) -> Result<Option<Duration>> {
+    let Some(raw) = non_empty(env_secs) else {
+        return Ok(Some(DEFAULT_SESSION_TTL));
+    };
+
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("invalid {SESSION_TTL_ENV} value `{raw}`"))?;
+    Ok(idle_timeout_from_secs(secs))
 }
 
 pub fn derive_ipc_endpoint(state_dir: &std::path::Path) -> String {
