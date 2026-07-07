@@ -44,29 +44,42 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Annotated tag pushes can deliver the tag object's SHA; peel it to
-          # the tagged commit before reading the tree.
-          sha="${GITHUB_SHA}"
-          if ! tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha' 2>/dev/null); then
-            sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" -q '.object.sha')
-            tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha')
-          fi
-          run_id=""
-          while IFS=$'\t' read -r id head_sha; do
-            tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${head_sha}" -q '.tree.sha' 2>/dev/null) || continue
-            if [[ "$tree" == "$tag_tree" ]]; then
+          # The lookup is an optimization. Any failure inside find_reuse (API
+          # blip, rate limit, missing object) yields an empty run_id and the
+          # full pipeline runs instead of the release being blocked.
+          find_reuse() {
+            local sha tag_tree id head_sha tree count ci_runs
+            # Annotated tag pushes deliver the tag object's SHA; peel it to
+            # the tagged commit before reading the tree.
+            sha="${GITHUB_SHA}"
+            if ! tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha' 2>/dev/null); then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" -q '.object.sha') || return 0
+              tag_tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${sha}" -q '.tree.sha') || return 0
+            fi
+            while IFS=$'\t' read -r id head_sha; do
+              # Dry-run jobs check out the PR head, so the head commit's tree
+              # is the tree the artifacts were actually built from.
+              tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${head_sha}" -q '.tree.sha' 2>/dev/null) || continue
+              [[ "$tree" == "$tag_tree" ]] || continue
               # The artifact must still exist; dry-run artifacts expire.
               count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts" \
-                -q '[.artifacts[] | select(.name == "release-assets" and .expired == false)] | length')
-              if [[ "$count" == "1" ]]; then
-                run_id="$id"
-                break
-              fi
-            fi
-          done < <(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=pull_request&status=success&per_page=25" \
-            -q '.workflow_runs[] | [.id, .head_sha] | @tsv')
+                -q '[.artifacts[] | select(.name == "release-assets" and .expired == false)] | length' 2>/dev/null) || continue
+              [[ "$count" == "1" ]] || continue
+              # Dry-runs skip the test suite on pull requests because the CI
+              # workflow runs it on the same commit. Reuse is only safe when
+              # that CI run actually succeeded.
+              ci_runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&status=success&per_page=1" \
+                -q '.workflow_runs | length' 2>/dev/null) || continue
+              [[ "$ci_runs" -ge 1 ]] || continue
+              echo "$id"
+              return 0
+            done < <(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=pull_request&status=success&per_page=25" \
+              -q '.workflow_runs[] | [.id, .head_sha] | @tsv' 2>/dev/null)
+            return 0
+          }
+          run_id=$(find_reuse || true)
           if [[ -n "$run_id" ]]; then
-            echo "Found dry-run ${run_id} with tree matching ${GITHUB_SHA}"
+            echo "Found dry-run ${run_id} with tree matching the tagged commit"
           else
             echo "No reusable dry-run for this tree; running the full pipeline"
           fi
@@ -122,8 +135,14 @@ jobs:
       version: ${{ steps.version.outputs.version }}
 
     steps:
+      # Dry-runs build the PR head rather than the synthetic merge ref, so
+      # the artifacts' tree is exactly the head tree the reuse job matches
+      # against tags, and the package manifest's source_commit records a
+      # permanent commit instead of an ephemeral merge ref.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
 
       - name: Install Rust stable
         shell: bash
@@ -197,8 +216,11 @@ jobs:
             os: windows-11-arm
 
     steps:
+      # PR head, not the synthetic merge ref; see the release-version job.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
 
       # The staged binary is fully determined by the runtime crates, the
       # workspace lockfile, and the release version. Packaging-only changes
@@ -288,8 +310,11 @@ jobs:
       attestations: write
 
     steps:
+      # PR head, not the synthetic merge ref; see the release-version job.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
 
       - name: Install Rust stable
         shell: bash
@@ -489,11 +514,15 @@ jobs:
           cd out/packages
           sha256sum --check SHA256SUMS
           version="${GITHUB_REF_NAME#v}"
-          # Every packaged asset embeds the release version in its filename,
-          # so a tag pointed at the wrong tree fails here.
+          # Every packaged asset is named
+          # visible-browser-lab-<host>-<version>-<target>.<ext>. Parsing the
+          # name and comparing the version segment for equality rejects both
+          # prefix tags (v0.4 against 0.4.4 assets) and pre-release drift
+          # (v1.2.3 against 1.2.3-rc.1 assets).
+          pattern='^visible-browser-lab-(claude-code|codex|mcp|vscode)-(.+)-(aarch64|x86_64)-(apple-darwin|pc-windows-msvc|unknown-linux-musl)\.(zip|vsix)$'
           for file in *; do
             [[ "$file" == "SHA256SUMS" ]] && continue
-            if [[ "$file" != *"$version"* ]]; then
+            if [[ ! "$file" =~ $pattern ]] || [[ "${BASH_REMATCH[2]}" != "$version" ]]; then
               echo "Asset '$file' does not match release version ${version}" >&2
               exit 1
             fi
