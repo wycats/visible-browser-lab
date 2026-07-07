@@ -24,12 +24,14 @@ use chromiumoxide::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, InsertTextParams, MouseButton,
             },
-            log::{EnableParams as LogEnableParams, EventEntryAdded},
+            log::{
+                DisableParams as LogDisableParams, EnableParams as LogEnableParams, EventEntryAdded,
+            },
             network::{
-                EmulateNetworkConditionsParams, EnableParams as NetworkEnableParams,
-                EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
-                EventResponseReceived, GetRequestPostDataParams, GetResponseBodyParams, Headers,
-                RequestId, SetExtraHttpHeadersParams,
+                DisableParams as NetworkDisableParams, EmulateNetworkConditionsParams,
+                EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
+                EventRequestWillBeSent, EventResponseReceived, GetRequestPostDataParams,
+                GetResponseBodyParams, Headers, RequestId, SetExtraHttpHeadersParams,
             },
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
@@ -55,8 +57,10 @@ use chromiumoxide::{
             EnableParams as HeapEnableParams, EventAddHeapSnapshotChunk, TakeHeapSnapshotParams,
         },
         js_protocol::runtime::{
-            CallArgument, CallFunctionOnParams, EnableParams as RuntimeEnableParams,
-            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled, RemoteObjectId,
+            CallArgument, CallFunctionOnParams, DisableParams as RuntimeDisableParams,
+            DiscardConsoleEntriesParams, EnableParams as RuntimeEnableParams,
+            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled,
+            ReleaseObjectGroupParams, RemoteObjectId,
         },
     },
     error::CdpError,
@@ -80,6 +84,26 @@ use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
+
+/// Object group for every remote handle we create. Ungrouped handles pin
+/// their DOM nodes (including whole detached trees) in the renderer heap
+/// until the page navigates, which is how long agent sessions ballooned
+/// Chrome to gigabytes of RSS.
+const VBL_OBJECT_GROUP: &str = "visible-browser-lab";
+/// Caps for Chrome's per-target network buffering while Network is enabled.
+const NETWORK_TOTAL_BUFFER_BYTES: i64 = 10 * 1024 * 1024;
+const NETWORK_RESOURCE_BUFFER_BYTES: i64 = 2 * 1024 * 1024;
+/// How many console events we let Chrome retain before asking it to drop
+/// its copies (the arguments stay pinned as remote objects otherwise).
+const CONSOLE_DISCARD_INTERVAL: usize = 50;
+
+/// Free every handle in our object group. Best-effort: the handles get
+/// reclaimed on navigation anyway; this just keeps long-lived pages lean.
+async fn release_object_group(page: &Page) {
+    let _ = page
+        .execute(ReleaseObjectGroupParams::new(VBL_OBJECT_GROUP))
+        .await;
+}
 
 #[derive(Clone, Copy)]
 pub struct ElementEvaluation<'a> {
@@ -912,6 +936,7 @@ impl CdpClient {
                     RuntimeEvaluateParams::builder()
                         .expression(format!("document.querySelector({selector_json})"))
                         .return_by_value(false)
+                        .object_group(VBL_OBJECT_GROUP)
                         .build()
                         .map_err(BrowserToolError::invalid_input)?,
                 ),
@@ -1876,7 +1901,12 @@ impl CdpClient {
         self.runtime
             .page_command(
                 &connection,
-                page.execute(NetworkEnableParams::default()),
+                page.execute(
+                    NetworkEnableParams::builder()
+                        .max_total_buffer_size(NETWORK_TOTAL_BUFFER_BYTES)
+                        .max_resource_buffer_size(NETWORK_RESOURCE_BUFFER_BYTES)
+                        .build(),
+                ),
                 "enable network diagnostics",
             )
             .await?;
@@ -1901,11 +1931,16 @@ impl CdpClient {
             .await?;
         let (stop_tx, mut stop_rx) = oneshot::channel();
 
+        let monitor_page = page.clone();
         let task = tokio::spawn(async move {
+            let mut console_since_discard = 0usize;
             loop {
                 let event = tokio::select! {
                     _ = &mut stop_rx => break,
-                    event = console.next() => typed_event("Runtime.consoleAPICalled", event),
+                    event = console.next() => {
+                        console_since_discard += 1;
+                        typed_event("Runtime.consoleAPICalled", event)
+                    }
                     event = log.next() => typed_event("Log.entryAdded", event),
                     event = request.next() => typed_event("Network.requestWillBeSent", event),
                     event = response.next() => typed_event("Network.responseReceived", event),
@@ -1917,7 +1952,27 @@ impl CdpClient {
                     Some(event) => sink(event),
                     None => break,
                 }
+
+                // Chrome pins every console argument as a remote object while
+                // Runtime is enabled. We already delivered the event, so drop
+                // Chrome's copies before a chatty page piles them up.
+                if console_since_discard >= CONSOLE_DISCARD_INTERVAL {
+                    console_since_discard = 0;
+                    let _ = monitor_page
+                        .execute(DiscardConsoleEntriesParams::default())
+                        .await;
+                }
             }
+
+            // Enabled diagnostics domains keep buffering (console arguments,
+            // response bodies) for the life of the target. The monitor is the
+            // only consumer, so shut them off when it stops.
+            let _ = monitor_page
+                .execute(DiscardConsoleEntriesParams::default())
+                .await;
+            let _ = monitor_page.execute(RuntimeDisableParams::default()).await;
+            let _ = monitor_page.execute(LogDisableParams::default()).await;
+            let _ = monitor_page.execute(NetworkDisableParams::default()).await;
         });
 
         Ok(CdpDiagnosticsMonitor {
@@ -2547,6 +2602,7 @@ impl CdpClient {
                 page.execute(
                     ResolveNodeParams::builder()
                         .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .object_group(VBL_OBJECT_GROUP)
                         .build(),
                 ),
                 "resolve element reference",
@@ -2584,12 +2640,14 @@ impl CdpClient {
                         .arguments(arguments)
                         .return_by_value(true)
                         .await_promise(true)
+                        .object_group(VBL_OBJECT_GROUP)
                         .build()
                         .map_err(BrowserToolError::invalid_input)?,
                 ),
                 "inspect referenced element",
             )
             .await?;
+        release_object_group(page).await;
         if let Some(exception) = response.result.exception_details {
             return Err(BrowserToolError::element_not_actionable(format!(
                 "element operation failed: {}",
@@ -2641,12 +2699,14 @@ impl CdpClient {
                         .arguments(arguments)
                         .return_by_value(true)
                         .await_promise(evaluation.await_promise)
+                        .object_group(VBL_OBJECT_GROUP)
                         .build()
                         .map_err(BrowserToolError::invalid_input)?,
                 ),
                 "evaluate on element target",
             )
             .await?;
+        release_object_group(page).await;
         if let Some(exception) = response.result.exception_details {
             return Err(BrowserToolError::invalid_input(format!(
                 "evaluation failed: {}",
@@ -2999,9 +3059,14 @@ impl CdpDiagnosticsMonitor {
 impl Drop for CdpDiagnosticsMonitor {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
+            // The stop signal breaks the event loop, and the task then
+            // disables the diagnostics domains before exiting. Aborting
+            // here would kill that cleanup, so let the task finish on its
+            // own (its commands time out if Chrome is gone).
             let _ = stop.send(());
+        } else {
+            self.task.abort();
         }
-        self.task.abort();
     }
 }
 
