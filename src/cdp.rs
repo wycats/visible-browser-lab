@@ -25,8 +25,8 @@ use chromiumoxide::{
             emulation::{
                 ClearDeviceMetricsOverrideParams, MediaFeature, SetCpuThrottlingRateParams,
                 SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
-                SetGeolocationOverrideParams, SetTouchEmulationEnabledParams,
-                SetUserAgentOverrideParams,
+                SetFocusEmulationEnabledParams, SetGeolocationOverrideParams,
+                SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
             },
             input::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
@@ -45,9 +45,10 @@ use chromiumoxide::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
                 CaptureScreenshotParams, EnableParams as PageEnableParams,
                 EventDomContentEventFired, EventJavascriptDialogOpening, EventLoadEventFired,
-                EventScreencastFrame, Frame, FrameTree, GetFrameTreeParams, GetLayoutMetricsParams,
-                GetNavigationHistoryParams, HandleJavaScriptDialogParams,
-                NavigateParams as PageNavigateParams, NavigateToHistoryEntryParams, ReloadParams,
+                EventScreencastFrame, EventScreencastVisibilityChanged, Frame, FrameTree,
+                GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
+                HandleJavaScriptDialogParams, NavigateParams as PageNavigateParams,
+                NavigateToHistoryEntryParams, ReloadParams,
                 RemoveScriptToEvaluateOnNewDocumentParams, ScreencastFrameAckParams,
                 ScriptIdentifier, StartScreencastFormat, StartScreencastParams,
                 StopScreencastParams, Viewport,
@@ -125,6 +126,43 @@ async fn release_object_group(page: &Page, object_group: &str) {
     let _ = page
         .execute(ReleaseObjectGroupParams::new(object_group))
         .await;
+}
+
+/// Broker-created tabs each get their own Chrome window (RFC 00010). Tabs
+/// sharing a window can background each other: activating one marks its
+/// siblings hidden, which stops frame production and starves screencasts.
+/// A tab that is alone in its window has no siblings, so the hazard cannot
+/// occur. Window-vs-window overlap is harmless under the occlusion launch
+/// flags in `managed_chrome.rs`.
+static WINDOW_SLOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// New windows cascade from this origin so they do not stack identically.
+const WINDOW_CASCADE_ORIGIN: (i64, i64) = (80, 80);
+const WINDOW_CASCADE_STEP: i64 = 40;
+const WINDOW_CASCADE_SLOTS: u64 = 10;
+const WINDOW_DEFAULT_WIDTH: i64 = 1280;
+const WINDOW_DEFAULT_HEIGHT: i64 = 900;
+
+fn next_window_slot() -> u64 {
+    WINDOW_SLOT_COUNTER.fetch_add(1, Ordering::Relaxed) % WINDOW_CASCADE_SLOTS
+}
+
+fn create_page_params(
+    url: Option<&str>,
+    focus: bool,
+    window_slot: u64,
+) -> Result<CreateTargetParams, BrowserToolError> {
+    let offset = WINDOW_CASCADE_STEP * i64::try_from(window_slot).unwrap_or(0);
+    CreateTargetParams::builder()
+        .url(url.unwrap_or("about:blank"))
+        .background(!focus)
+        .new_window(true)
+        .left(WINDOW_CASCADE_ORIGIN.0 + offset)
+        .top(WINDOW_CASCADE_ORIGIN.1 + offset)
+        .width(WINDOW_DEFAULT_WIDTH)
+        .height(WINDOW_DEFAULT_HEIGHT)
+        .build()
+        .map_err(BrowserToolError::invalid_input)
 }
 
 #[derive(Clone, Copy)]
@@ -221,11 +259,7 @@ impl CdpClient {
         focus: bool,
     ) -> Result<CdpTarget, BrowserToolError> {
         let connection = self.runtime.connection().await?;
-        let params = CreateTargetParams::builder()
-            .url(url.unwrap_or("about:blank"))
-            .background(!focus)
-            .build()
-            .map_err(BrowserToolError::invalid_input)?;
+        let params = create_page_params(url, focus, next_window_slot())?;
         let response = self
             .runtime
             .browser_command(
@@ -2442,6 +2476,9 @@ impl CdpClient {
         let mut events = self
             .event_listener::<EventScreencastFrame>(&page, &connection)
             .await?;
+        let mut visibility = self
+            .event_listener::<EventScreencastVisibilityChanged>(&page, &connection)
+            .await?;
         self.runtime
             .page_command(
                 &connection,
@@ -2463,9 +2500,33 @@ impl CdpClient {
             let max_frames = ((fps as f64) * max_duration.as_secs_f64().ceil()) as usize;
             let mut frame_index = 0usize;
             let mut frames = Vec::new();
+            // The cast owns its frame guarantee (RFC 00010): if the page
+            // goes hidden mid-cast (a page-spawned sibling tab was
+            // activated), Chrome stops producing frames and the recording
+            // would silently collapse. Focus emulation forces the page
+            // back to visible, which restarts frame production. Engaged at
+            // most once per cast and undone below when the cast ends, on
+            // every path.
+            let mut focus_emulation_engaged = false;
+            let mut visibility_open = true;
             loop {
                 tokio::select! {
                     _ = &mut done_rx => break,
+                    changed = visibility.next(), if visibility_open => {
+                        let Some(changed) = changed else {
+                            visibility_open = false;
+                            continue;
+                        };
+                        if !changed.visible
+                            && !focus_emulation_engaged
+                            && event_page
+                                .execute(SetFocusEmulationEnabledParams::new(true))
+                                .await
+                                .is_ok()
+                        {
+                            focus_emulation_engaged = true;
+                        }
+                    }
                     frame = events.next() => {
                         let Some(frame) = frame else { break };
                         let _ = event_page.execute(ScreencastFrameAckParams::new(frame.session_id)).await;
@@ -2481,6 +2542,11 @@ impl CdpClient {
                         frame_index += 1;
                     }
                 }
+            }
+            if focus_emulation_engaged {
+                let _ = event_page
+                    .execute(SetFocusEmulationEnabledParams::new(false))
+                    .await;
             }
             frames
         });
@@ -3712,6 +3778,32 @@ mod tests {
             endpoint.targets_url().as_str(),
             "http://127.0.0.1:9222/json/list"
         );
+    }
+
+    #[test]
+    fn broker_created_tabs_own_their_windows() {
+        let params = create_page_params(Some("https://example.com"), true, 0).unwrap();
+        assert_eq!(params.new_window, Some(true));
+        assert_eq!(params.background, Some(false));
+        assert_eq!(params.left, Some(WINDOW_CASCADE_ORIGIN.0));
+        assert_eq!(params.top, Some(WINDOW_CASCADE_ORIGIN.1));
+        assert_eq!(params.width, Some(WINDOW_DEFAULT_WIDTH));
+        assert_eq!(params.height, Some(WINDOW_DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn windows_cascade_by_slot_and_wrap() {
+        let third = create_page_params(None, false, 3).unwrap();
+        assert_eq!(
+            third.left,
+            Some(WINDOW_CASCADE_ORIGIN.0 + 3 * WINDOW_CASCADE_STEP)
+        );
+        assert_eq!(third.background, Some(true));
+        assert_eq!(third.url, "about:blank");
+
+        for _ in 0..(WINDOW_CASCADE_SLOTS * 2) {
+            assert!(next_window_slot() < WINDOW_CASCADE_SLOTS);
+        }
     }
 
     #[test]
