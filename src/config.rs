@@ -22,7 +22,8 @@ pub const SESSION_TTL_ENV: &str = "VISIBLE_BROWSER_LAB_SESSION_TTL_SECS";
 /// replaces: long enough that no plausible pause in active work hits it,
 /// short enough that the tab pool recovers from a crashed client within
 /// the hour.
-pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_SESSION_TTL: Duration =
+    Duration::from_secs(DEFAULT_BROKER_IDLE_TIMEOUT.as_secs() * 4);
 
 #[derive(Debug, Parser)]
 #[command(
