@@ -198,10 +198,10 @@ impl DiagnosticsRegistry {
         }
     }
 
-    fn reset_target(&mut self, target_id: &str) {
+    fn reset_target(&mut self, target_id: &str) -> Option<CdpDiagnosticsMonitor> {
         self.targets.remove(target_id);
         self.monitored_targets.remove(target_id);
-        self.monitors.remove(target_id);
+        self.monitors.remove(target_id)
     }
 
     fn push_event(&mut self, target_id: &str, event: CdpDiagnosticEvent) {
@@ -2526,8 +2526,13 @@ async fn broker_claim_tab(
         params.takeover,
         params.user_instruction.as_deref(),
     )?;
-    state.diagnostics().lock().unwrap().reset_target(&target.id);
+    let old_monitor = state.diagnostics().lock().unwrap().reset_target(&target.id);
     state.references().lock().unwrap().reset_target(&target.id);
+    if let Some(monitor) = old_monitor {
+        // Wait for the old monitor's domain disables to land before the
+        // replacement enables them, or the replacement goes silent.
+        monitor.shutdown().await;
+    }
     ensure_diagnostics_monitor(state, &target).await?;
 
     Ok(TabResult { tab })
@@ -2571,12 +2576,18 @@ async fn broker_release_tab(
             .await?;
         state.viewport_overrides.lock().unwrap().remove(&target.id);
     }
-    state
+    let old_monitor = state
         .diagnostics()
         .lock()
         .unwrap()
         .reset_target(&lease.target_id);
     state.references().lock().unwrap().reset_tab(&params.tab_id);
+    if let Some(monitor) = old_monitor {
+        // A released target can be reclaimed immediately; wait for this
+        // monitor's domain disables so they cannot land after the next
+        // claim's monitor has enabled the same domains.
+        monitor.shutdown().await;
+    }
     Ok(ReleaseTabResult { released: true })
 }
 
