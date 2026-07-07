@@ -2543,7 +2543,16 @@ impl CdpClient {
             // leaks into user-focus checks, and `activate_target` clears it
             // when the tab becomes genuinely visible. If the page goes
             // hidden again after a real activation, the cast re-engages.
+            //
+            // Enabling the emulation makes Chrome re-report the page as
+            // visible, so the first visible event after an enable is our
+            // own echo, not a genuine visibility change. Later visible
+            // events are genuine (the user returned to the tab or the
+            // covering sibling closed) and disengage the override so
+            // honest focus answers come back without waiting for the cast
+            // to end.
             let mut visibility_open = true;
+            let mut emulation_echo_pending = false;
             loop {
                 tokio::select! {
                     _ = &mut done_rx => break,
@@ -2552,14 +2561,33 @@ impl CdpClient {
                             visibility_open = false;
                             continue;
                         };
-                        if !changed.visible
-                            && overrides.lock().unwrap().insert(override_target.clone())
-                            && event_page
+                        if changed.visible {
+                            if emulation_echo_pending {
+                                emulation_echo_pending = false;
+                            } else if overrides.lock().unwrap().remove(&override_target) {
+                                let _ = event_page
+                                    .execute(SetFocusEmulationEnabledParams::new(false))
+                                    .await;
+                            }
+                        } else if overrides.lock().unwrap().insert(override_target.clone()) {
+                            emulation_echo_pending = true;
+                            if event_page
                                 .execute(SetFocusEmulationEnabledParams::new(true))
                                 .await
                                 .is_err()
-                        {
-                            overrides.lock().unwrap().remove(&override_target);
+                            {
+                                emulation_echo_pending = false;
+                                overrides.lock().unwrap().remove(&override_target);
+                            } else if !overrides.lock().unwrap().contains(&override_target) {
+                                // `activate_target` cleared the override while
+                                // the enable was in flight; honor the clear so
+                                // the emulation cannot outlive the registry
+                                // entry that makes `has_focus` distrust it.
+                                emulation_echo_pending = false;
+                                let _ = event_page
+                                    .execute(SetFocusEmulationEnabledParams::new(false))
+                                    .await;
+                            }
                         }
                     }
                     frame = events.next() => {
