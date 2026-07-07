@@ -453,6 +453,14 @@ fn chrome_arguments_for(
         "--disable-background-networking".into(),
         "--disable-component-update".into(),
         "--disable-sync".into(),
+        // An agent works against this window whether or not a human has it
+        // frontmost. Without these, occluding the window shuts down the
+        // compositor (screencasts collapse to one frame) and throttles
+        // timers (HMR and websocket updates stall). Same flags Playwright
+        // and Puppeteer ship by default.
+        "--disable-backgrounding-occluded-windows".into(),
+        "--disable-renderer-backgrounding".into(),
+        "--disable-background-timer-throttling".into(),
     ];
 
     #[cfg(target_os = "macos")]
@@ -834,6 +842,25 @@ mod tests {
             )
         );
         assert!(!args.contains(&"--headless=new".into()));
+    }
+
+    #[test]
+    fn chrome_arguments_disable_occlusion_and_background_throttling() {
+        let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
+        let args = chrome_arguments_for(
+            &config,
+            ChromeFamily::GoogleChrome,
+            BrowserLaunchMode::Visible,
+            false,
+        );
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&"--disable-backgrounding-occluded-windows".into()));
+        assert!(args.contains(&"--disable-renderer-backgrounding".into()));
+        assert!(args.contains(&"--disable-background-timer-throttling".into()));
     }
 
     #[test]
