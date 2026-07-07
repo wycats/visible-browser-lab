@@ -18,11 +18,11 @@
 //!
 //!   A  visible baseline
 //!   B  occluded, no intervention
-//!   C1 occluded + Emulation.setFocusEmulationEnabled(true)
-//!   C2 occluded + Page.setWebLifecycleState(active)
+//!   C1 occluded + Emulation.setFocusEmulationEnabled(true), reset afterwards
+//!   C2 occluded + Page.setWebLifecycleState(active), measured in isolation
 //!   D  Target.activateTarget (fronting fallback — expected to un-occlude)
 //!
-//! Usage: occlusion_starvation [occlude|minimize|tab] [--bare]
+//! Usage: occlusion_starvation [occlude|minimize|tab|window] [--bare]
 //!
 //!   occlude   (default) human covers the window with a non-Chrome window
 //!   minimize  human minimizes the window to the Dock
@@ -210,13 +210,15 @@ async fn main() -> Result<()> {
             eprintln!("opened + activated a second tab; screencasted tab is now backgrounded");
         }
         Mode::Window => {
+            // Same position and size as the casting window (launch args below)
+            // so the second window covers it completely, not just overlaps.
             let second = browser
                 .execute(
                     CreateTargetParams::builder()
                         .url("about:blank")
                         .new_window(true)
-                        .left(400)
-                        .top(200)
+                        .left(80)
+                        .top(80)
                         .width(800)
                         .height(600)
                         .build()
@@ -229,8 +231,8 @@ async fn main() -> Result<()> {
                 .await
                 .context("failed to activate second window")?;
             eprintln!(
-                "opened + activated a second WINDOW (overlapping); screencasted tab keeps \
-                 its own window"
+                "opened + activated a second WINDOW directly over the casting window; \
+                 screencasted tab keeps its own window"
             );
         }
     }
@@ -241,6 +243,13 @@ async fn main() -> Result<()> {
         .await
         .context("Emulation.setFocusEmulationEnabled failed")?;
     reports.push(measure_phase(&page, &frames, "C1 + focus emulation", 15).await?);
+
+    // Reset C1's intervention so C2 measures the lifecycle knob in isolation
+    // rather than on top of still-engaged focus emulation.
+    page.execute(SetFocusEmulationEnabledParams::new(false))
+        .await
+        .context("Emulation.setFocusEmulationEnabled(false) failed")?;
+    reports.push(measure_phase(&page, &frames, "C1r emulation reset", 10).await?);
 
     page.execute(SetWebLifecycleStateParams::new(
         SetWebLifecycleStateState::Active,
@@ -442,12 +451,16 @@ fn launch_visible_chrome(production_flags: bool) -> Result<SpikeChrome> {
             executable.display()
         )
     })?;
-    let endpoint = wait_for_devtools_endpoint(profile_dir.path())?;
-    Ok(SpikeChrome {
+    // Hold the child in the Drop guard before endpoint discovery: if Chrome
+    // never writes DevToolsActivePort, the error path kills it instead of
+    // leaking a headed Chrome and its profile.
+    let mut chrome = SpikeChrome {
         child,
         _profile_dir: profile_dir,
-        endpoint,
-    })
+        endpoint: String::new(),
+    };
+    chrome.endpoint = wait_for_devtools_endpoint(chrome._profile_dir.path())?;
+    Ok(chrome)
 }
 
 fn wait_for_devtools_endpoint(profile_dir: &Path) -> Result<String> {
