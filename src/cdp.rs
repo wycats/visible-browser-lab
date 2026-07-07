@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -296,6 +296,21 @@ impl CdpClient {
                 "activate Chrome target",
             )
             .await?;
+        // Real activation makes the page genuinely visible, so a screencast
+        // no longer needs its focus-emulation override here. Clearing it
+        // restores honest page-side focus answers; if the page goes hidden
+        // again mid-cast, the cast's visibility listener re-engages it.
+        let engaged = self
+            .runtime
+            .screencast_focus_overrides
+            .lock()
+            .unwrap()
+            .remove(target_id);
+        if engaged && let Ok((page, _)) = self.page(target_id).await {
+            let _ = page
+                .execute(SetFocusEmulationEnabledParams::new(false))
+                .await;
+        }
         Ok(())
     }
 
@@ -1105,6 +1120,22 @@ impl CdpClient {
     }
 
     pub async fn has_focus(&self, target: &CdpTarget) -> Result<bool, BrowserToolError> {
+        // While a screencast's focus-emulation override is engaged, the page
+        // reports itself focused and visible by design; that lie keeps frames
+        // flowing but must not leak into user-focus checks (raw input would
+        // be accepted for a background tab). The override only exists because
+        // the page went hidden and no real activation has happened since, so
+        // the honest answer is "not focused". `focus_tab` activates the
+        // target, which clears the override before this check is polled.
+        if self
+            .runtime
+            .screencast_focus_overrides
+            .lock()
+            .unwrap()
+            .contains(&target.id)
+        {
+            return Ok(false);
+        }
         let (page, connection) = self.page(&target.id).await?;
         match page
             .evaluate_expression("document.hasFocus() && document.visibilityState === 'visible'")
@@ -2494,6 +2525,8 @@ impl CdpClient {
             .await?;
         let (done_tx, mut done_rx) = oneshot::channel();
         let event_page = page.clone();
+        let overrides = self.runtime.screencast_focus_overrides.clone();
+        let override_target = target.id.clone();
         let task = tokio::spawn(async move {
             let deadline = Instant::now() + max_duration;
             let sample_stride = (60 / fps.max(1)).max(1) as usize;
@@ -2504,10 +2537,12 @@ impl CdpClient {
             // goes hidden mid-cast (a page-spawned sibling tab was
             // activated), Chrome stops producing frames and the recording
             // would silently collapse. Focus emulation forces the page
-            // back to visible, which restarts frame production. Engaged at
-            // most once per cast and undone below when the cast ends, on
-            // every path.
-            let mut focus_emulation_engaged = false;
+            // back to visible, which restarts frame production. The shared
+            // registry is the source of truth for whether the override is
+            // engaged: `has_focus` consults it so the emulated focus never
+            // leaks into user-focus checks, and `activate_target` clears it
+            // when the tab becomes genuinely visible. If the page goes
+            // hidden again after a real activation, the cast re-engages.
             let mut visibility_open = true;
             loop {
                 tokio::select! {
@@ -2518,13 +2553,13 @@ impl CdpClient {
                             continue;
                         };
                         if !changed.visible
-                            && !focus_emulation_engaged
+                            && overrides.lock().unwrap().insert(override_target.clone())
                             && event_page
                                 .execute(SetFocusEmulationEnabledParams::new(true))
                                 .await
-                                .is_ok()
+                                .is_err()
                         {
-                            focus_emulation_engaged = true;
+                            overrides.lock().unwrap().remove(&override_target);
                         }
                     }
                     frame = events.next() => {
@@ -2543,7 +2578,7 @@ impl CdpClient {
                     }
                 }
             }
-            if focus_emulation_engaged {
+            if overrides.lock().unwrap().remove(&override_target) {
                 let _ = event_page
                     .execute(SetFocusEmulationEnabledParams::new(false))
                     .await;
@@ -2941,6 +2976,12 @@ impl CdpClient {
 struct CdpRuntime {
     endpoint: CdpEndpoint,
     state: Mutex<RuntimeState>,
+    /// Targets whose screencast has engaged focus emulation to keep frames
+    /// flowing while the page is hidden (RFC 00010). The emulation makes the
+    /// page report itself focused and visible, so user-focus checks must
+    /// consult this registry instead of trusting the page while a cast's
+    /// override is engaged.
+    screencast_focus_overrides: Arc<StdMutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -2967,6 +3008,7 @@ impl CdpRuntime {
         Self {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
+            screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -3801,9 +3843,16 @@ mod tests {
         assert_eq!(third.background, Some(true));
         assert_eq!(third.url, "about:blank");
 
-        for _ in 0..(WINDOW_CASCADE_SLOTS * 2) {
-            assert!(next_window_slot() < WINDOW_CASCADE_SLOTS);
+        // Slots advance by one per call and cycle: a full lap of the
+        // cascade returns to the same slot. Relative assertions because
+        // other tests share the process-wide counter.
+        let first = next_window_slot();
+        let second = next_window_slot();
+        assert_eq!(second, (first + 1) % WINDOW_CASCADE_SLOTS);
+        for _ in 0..(WINDOW_CASCADE_SLOTS - 1) {
+            next_window_slot();
         }
+        assert_eq!(next_window_slot(), second);
     }
 
     #[test]
