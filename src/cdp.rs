@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 #[allow(deprecated)]
@@ -24,12 +32,14 @@ use chromiumoxide::{
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, InsertTextParams, MouseButton,
             },
-            log::{EnableParams as LogEnableParams, EventEntryAdded},
+            log::{
+                DisableParams as LogDisableParams, EnableParams as LogEnableParams, EventEntryAdded,
+            },
             network::{
-                EmulateNetworkConditionsParams, EnableParams as NetworkEnableParams,
-                EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
-                EventResponseReceived, GetRequestPostDataParams, GetResponseBodyParams, Headers,
-                RequestId, SetExtraHttpHeadersParams,
+                DisableParams as NetworkDisableParams, EmulateNetworkConditionsParams,
+                EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
+                EventRequestWillBeSent, EventResponseReceived, GetRequestPostDataParams,
+                GetResponseBodyParams, Headers, RequestId, SetExtraHttpHeadersParams,
             },
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
@@ -55,8 +65,10 @@ use chromiumoxide::{
             EnableParams as HeapEnableParams, EventAddHeapSnapshotChunk, TakeHeapSnapshotParams,
         },
         js_protocol::runtime::{
-            CallArgument, CallFunctionOnParams, EnableParams as RuntimeEnableParams,
-            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled, RemoteObjectId,
+            CallArgument, CallFunctionOnParams, DisableParams as RuntimeDisableParams,
+            DiscardConsoleEntriesParams, EnableParams as RuntimeEnableParams,
+            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled,
+            ReleaseObjectGroupParams, RemoteObjectId,
         },
     },
     error::CdpError,
@@ -80,6 +92,40 @@ use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
+
+/// Every remote handle we create is tagged with a per-operation object
+/// group. Ungrouped handles pin their DOM nodes (including whole detached
+/// trees) in the renderer heap until the page navigates, which is how long
+/// agent sessions ballooned Chrome to gigabytes of RSS. The group is unique
+/// per operation so releasing it cannot free a handle a concurrent request
+/// on the same tab is still using.
+static OBJECT_GROUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_object_group() -> String {
+    format!(
+        "visible-browser-lab-{}",
+        OBJECT_GROUP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Caps for Chrome's per-target network buffering while Network is enabled.
+/// The per-resource cap has to fit the largest response body the network
+/// tool can hand back as an artifact (bodies over the 1MB inline limit
+/// become artifacts, so the cap bounds artifacts too).
+const NETWORK_TOTAL_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+const NETWORK_RESOURCE_BUFFER_BYTES: i64 = 32 * 1024 * 1024;
+/// How many console events we let Chrome retain before asking it to drop
+/// its copies (the arguments stay pinned as remote objects otherwise).
+const CONSOLE_DISCARD_INTERVAL: usize = 50;
+
+/// Free every handle in one operation's object group. Best-effort: the
+/// handles get reclaimed on navigation anyway; this just keeps long-lived
+/// pages lean.
+async fn release_object_group(page: &Page, object_group: &str) {
+    let _ = page
+        .execute(ReleaseObjectGroupParams::new(object_group))
+        .await;
+}
 
 #[derive(Clone, Copy)]
 pub struct ElementEvaluation<'a> {
@@ -745,10 +791,10 @@ impl CdpClient {
         evaluation: ElementEvaluation<'_>,
     ) -> Result<EvaluateResult, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
-        self.evaluate_on_object(&page, &connection, object_id, evaluation)
+        self.evaluate_on_object(&page, &connection, object_id, &object_group, evaluation)
             .await
     }
 
@@ -904,6 +950,7 @@ impl CdpClient {
                 ));
             }
         }
+        let object_group = next_object_group();
         let result = self
             .runtime
             .page_command(
@@ -912,6 +959,7 @@ impl CdpClient {
                     RuntimeEvaluateParams::builder()
                         .expression(format!("document.querySelector({selector_json})"))
                         .return_by_value(false)
+                        .object_group(object_group.clone())
                         .build()
                         .map_err(BrowserToolError::invalid_input)?,
                 ),
@@ -923,7 +971,7 @@ impl CdpClient {
             .result
             .object_id
             .ok_or_else(|| BrowserToolError::element_stale(selector))?;
-        self.evaluate_on_object(&page, &connection, object_id, evaluation)
+        self.evaluate_on_object(&page, &connection, object_id, &object_group, evaluation)
             .await
     }
 
@@ -1068,7 +1116,7 @@ impl CdpClient {
         modifiers: &[String],
     ) -> Result<Value, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         let actionability = self
@@ -1076,6 +1124,7 @@ impl CdpClient {
                 &page,
                 &connection,
                 object_id,
+                &object_group,
                 r#"async function() {
   if (!this.isConnected) return { state: "stale" };
   this.scrollIntoView({ block: "center", inline: "center" });
@@ -1185,7 +1234,7 @@ impl CdpClient {
         backend_node_id: i64,
     ) -> Result<Value, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         let mut result = self
@@ -1193,6 +1242,7 @@ impl CdpClient {
                 &page,
                 &connection,
                 object_id,
+                &object_group,
                 r#"function() {
   if (!this.isConnected) return { state: "stale" };
   if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
@@ -1237,7 +1287,7 @@ impl CdpClient {
         value: &str,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         let result = self
@@ -1245,6 +1295,7 @@ impl CdpClient {
                 &page,
                 &connection,
                 object_id,
+                &object_group,
                 r#"function(value) {
   if (!this.isConnected) return { state: "stale" };
   const rect = this.getBoundingClientRect();
@@ -1276,7 +1327,7 @@ impl CdpClient {
         text: &str,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         let result = self
@@ -1284,6 +1335,7 @@ impl CdpClient {
                 &page,
                 &connection,
                 object_id,
+                &object_group,
                 r#"function() {
   if (!this.isConnected) return { state: "stale" };
   if (!(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable)) return { state: "not_editable" };
@@ -1475,13 +1527,14 @@ impl CdpClient {
         backend_node_id: i64,
     ) -> Result<Value, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         self.call_on_element(
             &page,
             &connection,
             object_id,
+            &object_group,
             r#"function() {
   if (!this.isConnected) return { attached: false, visible: false };
   const rect = this.getBoundingClientRect();
@@ -1739,11 +1792,18 @@ impl CdpClient {
         arguments: Vec<CallArgument>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let object_id = self
+        let (object_id, object_group) = self
             .resolve_backend_node(&page, &connection, backend_node_id)
             .await?;
         let result = self
-            .call_on_element(&page, &connection, object_id, function, arguments)
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                &object_group,
+                function,
+                arguments,
+            )
             .await?;
         actionable_state(result)
     }
@@ -1876,7 +1936,12 @@ impl CdpClient {
         self.runtime
             .page_command(
                 &connection,
-                page.execute(NetworkEnableParams::default()),
+                page.execute(
+                    NetworkEnableParams::builder()
+                        .max_total_buffer_size(NETWORK_TOTAL_BUFFER_BYTES)
+                        .max_resource_buffer_size(NETWORK_RESOURCE_BUFFER_BYTES)
+                        .build(),
+                ),
                 "enable network diagnostics",
             )
             .await?;
@@ -1901,11 +1966,16 @@ impl CdpClient {
             .await?;
         let (stop_tx, mut stop_rx) = oneshot::channel();
 
+        let monitor_page = page.clone();
         let task = tokio::spawn(async move {
+            let mut console_since_discard = 0usize;
             loop {
                 let event = tokio::select! {
                     _ = &mut stop_rx => break,
-                    event = console.next() => typed_event("Runtime.consoleAPICalled", event),
+                    event = console.next() => {
+                        console_since_discard += 1;
+                        typed_event("Runtime.consoleAPICalled", event)
+                    }
                     event = log.next() => typed_event("Log.entryAdded", event),
                     event = request.next() => typed_event("Network.requestWillBeSent", event),
                     event = response.next() => typed_event("Network.responseReceived", event),
@@ -1917,7 +1987,27 @@ impl CdpClient {
                     Some(event) => sink(event),
                     None => break,
                 }
+
+                // Chrome pins every console argument as a remote object while
+                // Runtime is enabled. We already delivered the event, so drop
+                // Chrome's copies before a chatty page piles them up.
+                if console_since_discard >= CONSOLE_DISCARD_INTERVAL {
+                    console_since_discard = 0;
+                    let _ = monitor_page
+                        .execute(DiscardConsoleEntriesParams::default())
+                        .await;
+                }
             }
+
+            // Enabled diagnostics domains keep buffering (console arguments,
+            // response bodies) for the life of the target. The monitor is the
+            // only consumer, so shut them off when it stops.
+            let _ = monitor_page
+                .execute(DiscardConsoleEntriesParams::default())
+                .await;
+            let _ = monitor_page.execute(RuntimeDisableParams::default()).await;
+            let _ = monitor_page.execute(LogDisableParams::default()).await;
+            let _ = monitor_page.execute(NetworkDisableParams::default()).await;
         });
 
         Ok(CdpDiagnosticsMonitor {
@@ -2539,7 +2629,8 @@ impl CdpClient {
         page: &Page,
         connection: &RuntimeConnection,
         backend_node_id: i64,
-    ) -> Result<RemoteObjectId, BrowserToolError> {
+    ) -> Result<(RemoteObjectId, String), BrowserToolError> {
+        let object_group = next_object_group();
         let resolved = self
             .runtime
             .page_command(
@@ -2547,6 +2638,7 @@ impl CdpClient {
                 page.execute(
                     ResolveNodeParams::builder()
                         .backend_node_id(BackendNodeId::new(backend_node_id))
+                        .object_group(object_group.clone())
                         .build(),
                 ),
                 "resolve element reference",
@@ -2558,11 +2650,12 @@ impl CdpClient {
                 }
                 _ => error,
             })?;
-        resolved
+        let object_id = resolved
             .result
             .object
             .object_id
-            .ok_or_else(|| BrowserToolError::element_stale("resolved node"))
+            .ok_or_else(|| BrowserToolError::element_stale("resolved node"))?;
+        Ok((object_id, object_group))
     }
 
     async fn call_on_element(
@@ -2570,26 +2663,34 @@ impl CdpClient {
         page: &Page,
         connection: &RuntimeConnection,
         object_id: RemoteObjectId,
+        object_group: &str,
         function: &str,
         arguments: Vec<CallArgument>,
     ) -> Result<Value, BrowserToolError> {
-        let response = self
-            .runtime
-            .page_command(
-                connection,
-                page.execute(
-                    CallFunctionOnParams::builder()
-                        .function_declaration(function)
-                        .object_id(object_id)
-                        .arguments(arguments)
-                        .return_by_value(true)
-                        .await_promise(true)
-                        .build()
-                        .map_err(BrowserToolError::invalid_input)?,
-                ),
-                "inspect referenced element",
-            )
-            .await?;
+        let response = async {
+            self.runtime
+                .page_command(
+                    connection,
+                    page.execute(
+                        CallFunctionOnParams::builder()
+                            .function_declaration(function)
+                            .object_id(object_id)
+                            .arguments(arguments)
+                            .return_by_value(true)
+                            .await_promise(true)
+                            .object_group(object_group)
+                            .build()
+                            .map_err(BrowserToolError::invalid_input)?,
+                    ),
+                    "inspect referenced element",
+                )
+                .await
+        }
+        .await;
+        // Release on every exit path, including transport failures, so a
+        // timed-out call cannot leave the element pinned.
+        release_object_group(page, object_group).await;
+        let response = response?;
         if let Some(exception) = response.result.exception_details {
             return Err(BrowserToolError::element_not_actionable(format!(
                 "element operation failed: {}",
@@ -2606,47 +2707,55 @@ impl CdpClient {
         page: &Page,
         connection: &RuntimeConnection,
         object_id: RemoteObjectId,
+        object_group: &str,
         evaluation: ElementEvaluation<'_>,
     ) -> Result<EvaluateResult, BrowserToolError> {
-        let function = match evaluation.mode {
-            "expression" if evaluation.args.is_empty() => {
-                format!("function() {{ return ({}); }}", evaluation.source)
-            }
-            "expression" => {
-                return Err(BrowserToolError::invalid_input(
-                    "evaluate arguments require mode `function`",
-                ));
-            }
-            "function" => evaluation.source.to_string(),
-            other => {
-                return Err(BrowserToolError::invalid_input(format!(
-                    "unknown evaluation mode `{other}`"
-                )));
-            }
-        };
-        let arguments = evaluation
-            .args
-            .iter()
-            .cloned()
-            .map(|value| CallArgument::builder().value(value).build())
-            .collect::<Vec<_>>();
-        let response = self
-            .runtime
-            .page_command(
-                connection,
-                page.execute(
-                    CallFunctionOnParams::builder()
-                        .function_declaration(function)
-                        .object_id(object_id)
-                        .arguments(arguments)
-                        .return_by_value(true)
-                        .await_promise(evaluation.await_promise)
-                        .build()
-                        .map_err(BrowserToolError::invalid_input)?,
-                ),
-                "evaluate on element target",
-            )
-            .await?;
+        let response = async {
+            let function = match evaluation.mode {
+                "expression" if evaluation.args.is_empty() => {
+                    format!("function() {{ return ({}); }}", evaluation.source)
+                }
+                "expression" => {
+                    return Err(BrowserToolError::invalid_input(
+                        "evaluate arguments require mode `function`",
+                    ));
+                }
+                "function" => evaluation.source.to_string(),
+                other => {
+                    return Err(BrowserToolError::invalid_input(format!(
+                        "unknown evaluation mode `{other}`"
+                    )));
+                }
+            };
+            let arguments = evaluation
+                .args
+                .iter()
+                .cloned()
+                .map(|value| CallArgument::builder().value(value).build())
+                .collect::<Vec<_>>();
+            self.runtime
+                .page_command(
+                    connection,
+                    page.execute(
+                        CallFunctionOnParams::builder()
+                            .function_declaration(function)
+                            .object_id(object_id)
+                            .arguments(arguments)
+                            .return_by_value(true)
+                            .await_promise(evaluation.await_promise)
+                            .object_group(object_group)
+                            .build()
+                            .map_err(BrowserToolError::invalid_input)?,
+                    ),
+                    "evaluate on element target",
+                )
+                .await
+        }
+        .await;
+        // Release on every exit path — rejected inputs and transport
+        // failures must not leave the resolved element pinned.
+        release_object_group(page, object_group).await;
+        let response = response?;
         if let Some(exception) = response.result.exception_details {
             return Err(BrowserToolError::invalid_input(format!(
                 "evaluation failed: {}",
@@ -2994,14 +3103,33 @@ impl CdpDiagnosticsMonitor {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
+
+    /// Stop the monitor and wait for its cleanup (domain disables) to
+    /// finish. Callers that start a replacement monitor on the same target
+    /// must use this instead of dropping, or the old task's `Runtime.disable`
+    /// can land after the new monitor enabled the domain and silence it.
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        // Bound the wait so a wedged Chrome cannot hang the caller; on
+        // timeout the abort in Drop kills the cleanup task, which also
+        // prevents any late disables.
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut self.task).await;
+    }
 }
 
 impl Drop for CdpDiagnosticsMonitor {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
+            // The stop signal breaks the event loop, and the task then
+            // disables the diagnostics domains before exiting. Aborting
+            // here would kill that cleanup, so let the task finish on its
+            // own (its commands time out if Chrome is gone).
             let _ = stop.send(());
+        } else {
+            self.task.abort();
         }
-        self.task.abort();
     }
 }
 
