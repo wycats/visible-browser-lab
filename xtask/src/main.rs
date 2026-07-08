@@ -1775,6 +1775,12 @@ fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBu
             dist.join("extension.js").display()
         );
     }
+    if !dist.join("invocation_context.js").is_file() {
+        bail!(
+            "extension invocation-context module not found at `{}`. Run `pnpm build` first.",
+            dist.join("invocation_context.js").display()
+        );
+    }
     Ok(dist)
 }
 
@@ -1896,6 +1902,12 @@ fn write_vsix_archive(
     )?;
     add_file(
         &mut zip,
+        "extension/dist/invocation_context.js",
+        &extension_dist.join("invocation_context.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
         &format!("extension/bin/{binary_name}"),
         binary,
         executable_mode(target),
@@ -1952,6 +1964,7 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension.vsixmanifest",
         "extension/package.json",
         "extension/dist/extension.js",
+        "extension/dist/invocation_context.js",
         "extension/skills/visible-browser-lab/SKILL.md",
     ] {
         if !names.iter().any(|name| name == required) {
@@ -2919,6 +2932,7 @@ mod tests {
         let dist = output.path().join("dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(dist.join("extension.js"), b"// bundle").unwrap();
+        fs::write(dist.join("invocation_context.js"), b"// context module").unwrap();
         let vsix = output.path().join(format!(
             "visible-browser-lab-vscode-{version}-{target}.vsix"
         ));
