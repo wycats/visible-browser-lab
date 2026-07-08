@@ -32,19 +32,19 @@ VS Code 1.128 constructs each chat request with a `toolInvocationToken` whose in
 
 The gateway alternative also collides with strict tool schemas. VS Code validates tool inputs against their declared schemas before invoking an extension; an extra stamped argument is rejected by tools with `additionalProperties: false` unless every participating schema admits it. It would also cover only conversations served by that provider. Host-owned invocation context covers the conversation at the tool boundary without altering arguments, transcripts, or provider behavior.
 
-# Guide-Level Explanation
+# Guide-level explanation
 
 In Codex or a supported VS Code chat, an agent calls `new_tab`, `list_tabs`, `snapshot`, and the other browser tools directly. It does not call `start_session` first and does not copy a session handle between calls.
 
 On the first stateful browser call, the broker creates a browser session for the host conversation. Later calls carrying the same identity resolve to that session. Two Codex threads or two VS Code chats receive distinct identities and therefore distinct lease sets, even when they share the same Chrome profile and broker.
 
-The identity is infrastructure metadata. It never appears in the tool's input schema, the model-visible arguments, normal tool results, help examples, or logs. The internal `agent_session_id` remains available to the broker and to explicit clients but is not disclosed during ambient operation.
+The identity is infrastructure metadata. It never appears in the tool's input schema, the model-visible arguments, normal browser-operation results, help examples, or logs. The internal `agent_session_id` remains available to the broker and to explicit clients. A caller that deliberately invokes `start_session` still receives the handle for backward compatibility, but ordinary ambient calls do not disclose it.
 
 If the host does not provide a usable identity, VBL behaves like the explicit protocol. A stateful call without `agent_session_id` returns `session_required`; the agent calls `start_session` and passes the returned handle thereafter. Global VS Code tool invocations, older host versions, and bare MCP clients therefore degrade to an existing supported mode rather than failing unpredictably.
 
 A persisted host identity does not make broker state persistent. Reopening a chat or resuming a Codex thread reuses the session while the broker and its TTL binding remain live. If the broker restarts or the session expires, the next ambient call creates a new session. RFC 00009 leaves the old tabs open and claimable, so the failure is recoverable without destroying browser state.
 
-# Reference-Level Explanation
+# Reference-level explanation
 
 ## Canonical Conversation Identity
 
@@ -72,7 +72,7 @@ mcp-twill defines this schema and the corresponding public framework type. VBL m
 
 ### Codex
 
-Codex supplies top-level MCP request metadata `_meta.threadId`. The VBL MCP adapter normalizes it to:
+Codex supplies top-level MCP request metadata `_meta.threadId`. Because that compatibility key is not namespaced or authenticated, VBL honors it only when its deployment explicitly enables trusted Codex compatibility mode. The packaged Codex integration enables that mode; generic MCP deployments leave it disabled and require the canonical namespaced value. When enabled, the VBL MCP adapter normalizes `threadId` to:
 
 ```json
 {
@@ -82,7 +82,7 @@ Codex supplies top-level MCP request metadata `_meta.threadId`. The VBL MCP adap
 }
 ```
 
-A future Codex version may send the canonical namespaced value directly. When both observations are present, they must normalize to the same identity. A mismatch is an invalid request and fails before broker dispatch.
+A future Codex version may send the canonical namespaced value directly. The canonical value is accepted independently of compatibility mode. When trusted Codex compatibility is enabled and both observations are present, they must normalize to the same identity. A mismatch is an invalid request and fails before broker dispatch. The compatibility mode is deployment configuration, never request metadata.
 
 The process identifier, MCP connection, and stdio lifetime are not identity sources or teardown authority.
 
@@ -113,7 +113,7 @@ Identity resolution has two layers.
 At the framework/transport layer:
 
 1. Canonical namespaced metadata.
-2. Codex `_meta.threadId`, normalized to the canonical type.
+2. Codex `_meta.threadId`, normalized to the canonical type only when trusted Codex compatibility is enabled by deployment configuration.
 3. No ambient identity.
 
 At the VBL application layer:
@@ -133,7 +133,7 @@ Twill's public surface is:
 - `ConversationIdentity` and `CONVERSATION_IDENTITY_META_KEY`.
 - `CommandBuilder::uses_conversation_identity()` and the corresponding optional command-spec declaration.
 - `CommandContext::conversation_identity() -> Option<&ConversationIdentity>`.
-- rmcp-adapter normalization for canonical metadata and Codex `threadId`.
+- rmcp-adapter normalization for canonical metadata, plus an explicit trusted-host policy that enables Codex `threadId` compatibility only for known Codex deployments.
 - An explicit host/test injection path for direct registry execution.
 
 The declaration means that a command can consume ambient identity when the host provides it; it is not a hard requirement. Catalog and help projections expose the capability without exposing a value. The raw identity travels in a private, non-serializing invocation context. A digest participates in the invocation fingerprint for declaring commands so a permission approval cannot replay across conversations, while the raw identity remains absent from the plan and response.
@@ -144,7 +144,7 @@ A future Twill-based VBL uses only the declaration and context accessor. It does
 
 ## VBL Adapter and Broker Protocol
 
-`surface call` accepts `--conversation-identity-json` alongside its existing workspace option. The VS Code extension passes the canonical JSON through this out-of-band option; tool input remains the exact model-supplied object.
+`surface call` keeps identity out of process arguments. The VS Code extension invokes it with the non-sensitive flag `--request-envelope-version 1` and writes a versioned private envelope to stdin containing separate `arguments` and `context` members. The context carries conversation identity and workspace root; `arguments` remains the exact model-supplied object. Existing callers that omit the envelope flag continue to send the legacy raw argument object on stdin.
 
 Broker protocol version 4 adds an optional request context:
 
@@ -171,7 +171,7 @@ Before dispatching a stateful operation, the broker resolves the session:
 
 `help` remains stateless and does not create a session.
 
-An ambient `start_session` call resolves or creates the ambient session rather than creating a second session. Its result reports `mode: "ambient"` and omits `agent_session_id`. An explicit `start_session` reports `mode: "explicit"` and the handle as today. An optional `start_url` still creates and leases a tab in the selected session.
+An ambient `start_session` call resolves or creates the ambient session rather than creating a second session. Its result reports `mode: "ambient"` and retains `agent_session_id` for backward compatibility with the documented explicit workflow. An explicit `start_session` reports `mode: "explicit"` and the same handle shape as today. An optional `start_url` still creates and leases a tab in the selected session. New ambient guidance does not require the agent to call `start_session` or carry the returned handle.
 
 When the TTL sweep expires a session, it removes the identity binding as part of the same critical section that removes the session and releases its leases. The next call for that host identity can therefore mint a new ambient session. Conversation identity does not weaken RFC 00009's release-not-close behavior or in-flight expiry protection.
 
@@ -179,7 +179,7 @@ When the TTL sweep expires a session, it removes the identity binding as part of
 
 Workspace identity is not part of `ConversationIdentity`. Codex thread ids and VS Code session-resource URIs are globally unique within their issuers, and combining the workspace with them would split one conversation when a multi-root editor changes focus.
 
-The first non-empty workspace root supplied when an ambient session is created is canonicalized and bound to that browser session. A later equal root is accepted. A later conflicting non-empty root fails with a workspace-context diagnostic rather than silently changing where artifact operations write. An absent later root does not erase the binding.
+The first non-empty workspace root supplied when an ambient session is created is canonicalized and bound to that browser session. Later workspace observations do not retarget the session and do not block ordinary browser operations such as navigation, snapshot, or interaction. Before a workspace-sensitive operation reads or writes local files—artifact export, file upload, or a file-backed drop—the broker compares the current non-empty observation with the bound root. An equal root is accepted; a conflicting root fails that workspace-sensitive operation with a workspace-context diagnostic. An absent later root does not erase the binding.
 
 For VS Code, the invocation token's working directory takes precedence over the existing active-editor/workspace-folder heuristic. Codex continues to obtain its workspace observation from sandbox metadata.
 
@@ -213,7 +213,7 @@ Conversation identity survives model context changes, but browser-session state 
 
 VBL temporarily mirrors a type and normalization rule that Twill ultimately owns. The duplication is bounded to the native-rmcp transition and must be removed when VBL ports.
 
-# Rationale And Alternatives
+# Rationale and alternatives
 
 **Gateway argument stamping.** Rejected. It changes model-visible tool inputs, conflicts with strict schemas, requires transcript stripping, applies only to gateway-served models, and creates provider-switch demotion machinery. Host invocation context is broader and does not alter arguments.
 
@@ -236,18 +236,18 @@ Language servers and IDE chat systems similarly attach workspace and session con
 # Acceptance Tests
 
 - Canonical metadata parses to the exact version/issuer/id tuple; invalid versions, unknown fields, malformed lowercase reverse-DNS issuers, and empty ids fail before dispatch.
-- Codex `threadId` normalizes to issuer `com.openai.codex`.
+- Codex `threadId` is ignored when trusted Codex compatibility is disabled and normalizes to issuer `com.openai.codex` only when the deployment enables it.
 - Matching canonical and Codex observations succeed; conflicting or malformed observations fail before dispatch.
 - Raw identities do not serialize through plans, responses, help, previews, events, or logs.
 - Repeated ambient calls reuse one session; two identities receive disjoint sessions and lease sets.
 - An explicit `agent_session_id` takes precedence over ambient identity.
 - A stateful call with neither source returns `session_required`; the explicit workflow remains functional.
-- Ambient `start_session` omits the handle and explicit `start_session` retains it.
+- Ambient and explicit `start_session` both retain the legacy handle shape; ordinary ambient browser operations expose no handle.
 - Expiry removes the identity binding and releases rather than closes tabs.
-- Equal workspace observations are accepted and conflicting observations fail without changing the binding.
+- Workspace changes do not block ordinary browser operations; equal observations are accepted for workspace-sensitive operations, and conflicting observations fail only those operations without changing the binding.
 - Codex installed-artifact testing proves direct operation, thread isolation, and resume/compaction continuity while the TTL binding remains live.
 - VS Code 1.128 installed-artifact testing proves direct operation, simultaneous-chat isolation, history restoration, provider-independent continuity, and explicit fallback for a global invocation.
-- Tool-call arguments and normal results in both hosts contain no ambient session handle.
+- Tool-call arguments and normal non-`start_session` results in both hosts contain no ambient session handle.
 
 # Unresolved Questions
 
