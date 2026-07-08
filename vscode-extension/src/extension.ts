@@ -179,7 +179,7 @@ async function invokeSurfaceCall(
   const binary = resolveBinary(context);
   const workspaceRoot = invocationContext?.workspace_root ?? activeWorkspaceRoot();
   const args = ["surface", "call", method, "--request-envelope-version", "1"];
-  const requestContext: SurfaceRequestContext = { ...invocationContext };
+  const requestContext: SurfaceRequestContext = invocationContext ? { ...invocationContext } : {};
   if (workspaceRoot) {
     requestContext.workspace_root = workspaceRoot;
   }
