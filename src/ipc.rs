@@ -69,21 +69,31 @@ pub async fn accept(listener: &BrokerListener) -> std::io::Result<BrokerStream> 
 
 #[cfg(windows)]
 pub fn default_endpoint_display(state_dir: &Path) -> String {
+    endpoint_display_for_protocol(state_dir, BROKER_PROTOCOL_VERSION)
+}
+
+#[cfg(windows)]
+pub fn endpoint_display_for_protocol(state_dir: &Path, protocol_version: u32) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     state_dir.hash(&mut hasher);
     format!(
-        "visible-browser-lab-v{BROKER_PROTOCOL_VERSION}-{:016x}",
+        "visible-browser-lab-v{protocol_version}-{:016x}",
         hasher.finish()
     )
 }
 
 #[cfg(not(windows))]
 pub fn default_endpoint_display(state_dir: &Path) -> String {
+    endpoint_display_for_protocol(state_dir, BROKER_PROTOCOL_VERSION)
+}
+
+#[cfg(not(windows))]
+pub fn endpoint_display_for_protocol(state_dir: &Path, protocol_version: u32) -> String {
     state_dir
-        .join(format!("broker-v{BROKER_PROTOCOL_VERSION}.sock"))
+        .join(format!("broker-v{protocol_version}.sock"))
         .to_string_lossy()
         .into_owned()
 }
@@ -128,6 +138,20 @@ mod tests {
         let endpoint = default_endpoint_display(Path::new("/tmp/visible-browser-lab-test"));
 
         assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker-v4.sock");
+    }
+
+    #[test]
+    fn endpoint_can_address_the_previous_protocol() {
+        let endpoint = endpoint_display_for_protocol(
+            Path::new("/tmp/visible-browser-lab-test"),
+            BROKER_PROTOCOL_VERSION - 1,
+        );
+
+        if cfg!(windows) {
+            assert!(endpoint.starts_with("visible-browser-lab-v3-"));
+        } else {
+            assert_eq!(endpoint, "/tmp/visible-browser-lab-test/broker-v3.sock");
+        }
     }
 
     #[test]

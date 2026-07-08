@@ -30,7 +30,7 @@ export function extractInvocationContext(options: unknown): SurfaceRequestContex
 
   let sessionResource: string;
   try {
-    sessionResource = token.sessionResource.toString();
+    sessionResource = token.sessionResource.toString(true);
   } catch {
     return undefined;
   }

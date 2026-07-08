@@ -8,7 +8,10 @@ function uri(value: string, fsPath: string, scheme = "file") {
     scheme,
     path: fsPath,
     fsPath,
-    toString: () => value,
+    toString: (skipEncoding?: boolean) => {
+      assert.equal(skipEncoding, true);
+      return value;
+    },
   };
 }
 

@@ -62,6 +62,7 @@ use crate::semantic::{RawAxFrame, RawAxNode};
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
+const LEGACY_BROKER_PROTOCOL_VERSION: u32 = 3;
 const TENANCY_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
@@ -1710,6 +1711,7 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
     prepare_state(config).await?;
+    retire_legacy_broker(config).await?;
 
     if let Ok(BrokerProbe::Compatible(client)) = probe_broker(config).await {
         return Ok(client);
@@ -1743,6 +1745,88 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
             );
         }
 
+        sleep(BROKER_CONNECT_RETRY).await;
+    }
+}
+
+fn legacy_broker_config(config: &RuntimeConfig) -> RuntimeConfig {
+    let mut legacy = config.clone();
+    legacy.ipc_endpoint =
+        ipc::endpoint_display_for_protocol(&config.state_dir, LEGACY_BROKER_PROTOCOL_VERSION);
+    legacy.socket_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.sock"));
+    legacy.lock_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.lock"));
+    legacy.pid_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.pid"));
+    legacy
+}
+
+/// A protocol-versioned socket prevents an old client from speaking the new
+/// wire format, but it must not leave two lease registries attached to the
+/// same visible Chrome profile. Every v4 client therefore checks the prior v3
+/// endpoint before dispatch. The v3 startup lock closes the ordinary upgrade
+/// race; repeating the check on every call also retires an old client that is
+/// launched again after the upgrade.
+async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
+    let legacy = legacy_broker_config(config);
+    let deadline = Instant::now() + BROKER_START_TIMEOUT;
+
+    loop {
+        if let Some(_lock) = BrokerStartLock::try_acquire(&legacy.lock_path)? {
+            let endpoint = broker_endpoint(&legacy)?;
+            let has_endpoint_artifact = endpoint
+                .stale_path()
+                .map_or(cfg!(windows), std::path::Path::exists);
+            let has_runtime_artifact = legacy.pid_path.exists() || has_endpoint_artifact;
+            if !has_runtime_artifact {
+                return Ok(());
+            }
+
+            match probe_broker(&legacy).await {
+                Ok(BrokerProbe::Incompatible { status, message }) => {
+                    restart_incompatible_broker(&legacy, &status, &message).await?;
+                }
+                Ok(BrokerProbe::Compatible(mut client)) => {
+                    let status = client.ping().await?;
+                    restart_incompatible_broker(
+                        &legacy,
+                        &status,
+                        "broker is listening on the retired v3 endpoint",
+                    )
+                    .await?;
+                }
+                Err(probe_error) => {
+                    if let Some(pid) = read_pid(&legacy.pid_path)?
+                        && process_is_alive(pid)
+                    {
+                        bail!(
+                            "legacy v3 broker pid {pid} is alive but unavailable at {}; refusing to start a second broker: {probe_error:#}",
+                            legacy.ipc_endpoint
+                        );
+                    }
+                    cleanup_stale_endpoint(&legacy).with_context(|| {
+                        format!(
+                            "failed to clean retired v3 broker after probe error: {probe_error:#}"
+                        )
+                    })?;
+                    if legacy.pid_path.exists() {
+                        let _ = fs::remove_file(&legacy.pid_path);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for legacy broker startup lock `{}`",
+                legacy.lock_path.display()
+            );
+        }
         sleep(BROKER_CONNECT_RETRY).await;
     }
 }
@@ -7150,6 +7234,84 @@ mod tests {
         if let Some(path) = &stale_path {
             assert!(!path.exists(), "stale socket file should be removed");
         }
+    }
+
+    #[test]
+    fn legacy_broker_config_targets_v3_runtime_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+
+        let legacy = legacy_broker_config(&config);
+
+        assert_eq!(legacy.socket_path, config.state_dir.join("broker-v3.sock"));
+        assert_eq!(legacy.lock_path, config.state_dir.join("broker-v3.lock"));
+        assert_eq!(legacy.pid_path, config.state_dir.join("broker-v3.pid"));
+        if cfg!(windows) {
+            assert!(legacy.ipc_endpoint.starts_with("visible-browser-lab-v3-"));
+        } else {
+            assert_eq!(
+                legacy.ipc_endpoint,
+                config.state_dir.join("broker-v3.sock").to_string_lossy()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_terminates_a_running_v3_daemon() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        // The fake v3 endpoint speaks just enough of the shared ping protocol
+        // to identify a separate long-lived process as the daemon to retire.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        let status = BrokerStatus {
+            protocol_version: LEGACY_BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.5".to_string(),
+            pid,
+            runtime_mode: legacy.runtime_mode,
+            cdp_endpoint: legacy.cdp_endpoint.clone().unwrap(),
+            ipc_endpoint: legacy.ipc_endpoint.clone(),
+            socket_path: legacy.socket_path.clone(),
+        };
+        let server = tokio::spawn(async move {
+            let stream = ipc::accept(&listener).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: BrokerRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "ping");
+            assert!(request.context.is_none());
+            let response = BrokerResponse::success(request.id, status).unwrap();
+            let encoded = serde_json::to_string(&response).unwrap();
+            stream
+                .get_mut()
+                .write_all(encoded.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            stream.get_mut().flush().await.unwrap();
+        });
+
+        retire_legacy_broker(&config).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!process_is_alive(pid), "v3 broker process should exit");
+        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
+        assert!(
+            !legacy.socket_path.exists(),
+            "v3 socket file should be removed"
+        );
     }
 
     #[test]
