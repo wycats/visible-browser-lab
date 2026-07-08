@@ -33,8 +33,8 @@ use crate::{
     config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
-        AgentSessionId, BrowserToolError, BrowserToolErrorCode, LeaseRegistry, LeaseState,
-        OwnedTabSummary, TabId, TabLease, TabSnapshot,
+        AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, LeaseRegistry,
+        LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
     managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
@@ -44,9 +44,10 @@ use crate::{
         FillParams, FormField, ListTabsParams, ListTabsResult, ListTabsScope, NavigationAction,
         NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionEffect,
         PageActionEvidence, PageActionResult, ReleaseTabResult, ScreenshotImage, ScreenshotParams,
-        ScreenshotResult, SnapshotMode, SnapshotParams, SnapshotResult, StartSessionParams,
-        StartSessionResult, TabActionParams, TabResult, V3EvaluateParams, V3NavigateParams,
-        V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams, WaitForResult,
+        ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams, SnapshotResult,
+        StartSessionParams, StartSessionResult, TabActionParams, TabResult, V3EvaluateParams,
+        V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams,
+        WaitForResult,
     },
     semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
@@ -2278,10 +2279,15 @@ async fn handle_connection(
 async fn dispatch_request(
     config: &RuntimeConfig,
     state: &BrokerState,
-    request: BrokerRequest,
+    mut request: BrokerRequest,
 ) -> BrokerResponse {
-    touch_request_session(state, &request);
-    let session_id = request_session_id(&request);
+    let (session_id, start_mode) = match resolve_request_session(state, &mut request) {
+        Ok(resolution) => resolution,
+        Err(error) => return BrokerResponse::error(request.id, error),
+    };
+    if let Some(session_id) = &session_id {
+        state.registry().lock().unwrap().touch(session_id);
+    }
     // Mark the session in flight for the duration of this request so the
     // expiry sweep cannot remove it mid-request; the guard un-marks on drop,
     // including on panic unwind.
@@ -2293,7 +2299,15 @@ async fn dispatch_request(
         "ping" => broker_response(request.id, broker_status(config, state).await),
         "start_session" => broker_response(
             request.id,
-            broker_start_session(state, parse_params(request.params)).await,
+            broker_start_session_with_mode(
+                state,
+                parse_params(request.params),
+                (start_mode == Some(SessionGovernanceMode::Ambient))
+                    .then_some(session_id.clone())
+                    .flatten(),
+                start_mode.unwrap_or(SessionGovernanceMode::Explicit),
+            )
+            .await,
         ),
         "list_tabs" => broker_response(
             request.id,
@@ -2410,16 +2424,166 @@ async fn dispatch_request(
     response
 }
 
-/// Refresh the requesting session's last-touch time before dispatch. Any
-/// request that names a session counts as using it, which is what keeps the
-/// idle-exit veto (and, once it ships, session expiry) honest for sessions
-/// that interact without changing tab ownership.
-fn touch_request_session(state: &BrokerState, request: &BrokerRequest) {
-    let Some(session_id) = request_session_id(request) else {
-        return;
+fn resolve_request_session(
+    state: &BrokerState,
+    request: &mut BrokerRequest,
+) -> Result<(Option<AgentSessionId>, Option<SessionGovernanceMode>), BrowserToolError> {
+    if request.method == "ping" || !known_broker_method(&request.method) {
+        return Ok((None, None));
+    }
+
+    let context = request.context.clone().unwrap_or_default();
+    if request.method == "start_session" {
+        if let Some(identity) = context.conversation_identity {
+            let session = resolve_ambient_session(state, identity, context.workspace_root)?;
+            return Ok((
+                Some(session.agent_session_id),
+                Some(SessionGovernanceMode::Ambient),
+            ));
+        }
+
+        if let Some(workspace_root) = context.workspace_root {
+            request_params_object_mut(request)?.insert(
+                "workspace_root".to_string(),
+                Value::String(workspace_root.to_string_lossy().into_owned()),
+            );
+        }
+        return Ok((None, Some(SessionGovernanceMode::Explicit)));
+    }
+
+    let session_id = match request.params.get("agent_session_id") {
+        Some(Value::String(session_id)) if session_id.is_empty() => {
+            return Err(BrowserToolError::invalid_input(
+                "agent_session_id must be a non-empty string",
+            ));
+        }
+        Some(Value::String(session_id)) => AgentSessionId(session_id.clone()),
+        Some(_) => {
+            return Err(BrowserToolError::invalid_input(
+                "agent_session_id must be a non-empty string",
+            ));
+        }
+        None => {
+            let identity = context
+                .conversation_identity
+                .ok_or_else(BrowserToolError::session_required)?;
+            let session = resolve_ambient_session(state, identity, context.workspace_root.clone())?;
+            request_params_object_mut(request)?.insert(
+                "agent_session_id".to_string(),
+                Value::String(session.agent_session_id.0.clone()),
+            );
+            session.agent_session_id
+        }
     };
 
-    state.registry().lock().unwrap().touch(&session_id);
+    validate_workspace_context(state, &session_id, request, context.workspace_root.as_ref())?;
+    Ok((Some(session_id), None))
+}
+
+fn resolve_ambient_session(
+    state: &BrokerState,
+    identity: crate::conversation_identity::ConversationIdentity,
+    observed_workspace: Option<PathBuf>,
+) -> Result<BrowserSession, BrowserToolError> {
+    if let Some(session) = state
+        .registry()
+        .lock()
+        .unwrap()
+        .touch_session_for_identity(&identity)
+    {
+        return Ok(session);
+    }
+
+    let workspace_root = observed_workspace
+        .map(canonical_workspace_root)
+        .transpose()?;
+    Ok(state
+        .registry()
+        .lock()
+        .unwrap()
+        .ambient_session(identity, workspace_root))
+}
+
+fn request_params_object_mut(
+    request: &mut BrokerRequest,
+) -> Result<&mut serde_json::Map<String, Value>, BrowserToolError> {
+    request
+        .params
+        .as_object_mut()
+        .ok_or_else(|| BrowserToolError::invalid_input("broker params must be an object"))
+}
+
+fn known_broker_method(method: &str) -> bool {
+    matches!(
+        method,
+        "start_session"
+            | "list_tabs"
+            | "new_tab"
+            | "claim_tab"
+            | "release_tab"
+            | "focus_tab"
+            | "navigate"
+            | "wait_for"
+            | "screenshot"
+            | "evaluate"
+            | "snapshot"
+            | "click"
+            | "fill"
+            | "fill_form"
+            | "type_text"
+            | "press_key"
+            | "interact"
+            | "console"
+            | "network"
+            | "emulation"
+            | "performance"
+            | "audit"
+            | "memory"
+            | "screencast"
+            | "artifacts"
+            | "close_tab"
+    )
+}
+
+fn validate_workspace_context(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    request: &BrokerRequest,
+    observed_workspace: Option<&PathBuf>,
+) -> Result<(), BrowserToolError> {
+    if !workspace_sensitive_request(request) {
+        return Ok(());
+    }
+    let Some(observed_workspace) = observed_workspace else {
+        return Ok(());
+    };
+    let observed_workspace = canonical_workspace_root(observed_workspace.clone())?;
+    let registry = state.registry().lock().unwrap();
+    let bound_workspace = registry
+        .session(session_id)
+        .ok_or_else(|| BrowserToolError::unknown_session(session_id))?
+        .workspace_root
+        .as_ref();
+    if bound_workspace.is_some_and(|bound| bound != &observed_workspace) {
+        return Err(BrowserToolError::workspace_context_conflict());
+    }
+    Ok(())
+}
+
+fn workspace_sensitive_request(request: &BrokerRequest) -> bool {
+    match request.method.as_str() {
+        "artifacts" => request.params.get("operation").and_then(Value::as_str) == Some("export"),
+        "interact" => match request.params.get("operation").and_then(Value::as_str) {
+            Some("upload_files") => true,
+            Some("drop") => request
+                .params
+                .get("paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| !paths.is_empty()),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Marks a session as having a request in flight; the expiry sweep skips
@@ -2455,14 +2619,6 @@ impl Drop for InFlightGuard {
             }
         }
     }
-}
-
-fn request_session_id(request: &BrokerRequest) -> Option<AgentSessionId> {
-    request
-        .params
-        .get("agent_session_id")
-        .and_then(Value::as_str)
-        .map(|id| AgentSessionId(id.to_string()))
 }
 
 fn parse_params<T>(params: serde_json::Value) -> Result<T, BrowserToolError>
@@ -2518,18 +2674,40 @@ fn strip_null_fields(value: &mut Value) {
     }
 }
 
+#[cfg(test)]
 async fn broker_start_session(
     state: &BrokerState,
     params: Result<StartSessionParams, BrowserToolError>,
 ) -> Result<StartSessionResult, BrowserToolError> {
+    broker_start_session_with_mode(state, params, None, SessionGovernanceMode::Explicit).await
+}
+
+async fn broker_start_session_with_mode(
+    state: &BrokerState,
+    params: Result<StartSessionParams, BrowserToolError>,
+    ambient_session_id: Option<AgentSessionId>,
+    mode: SessionGovernanceMode,
+) -> Result<StartSessionResult, BrowserToolError> {
     let params = params?;
-    let workspace_root = params
-        .workspace_root
-        .map(canonical_workspace_root)
-        .transpose()?;
-    let session = {
-        let mut registry = state.registry().lock().unwrap();
-        registry.start_session_with_workspace(params.label, workspace_root)
+    let session = match ambient_session_id {
+        Some(session_id) => state
+            .registry()
+            .lock()
+            .unwrap()
+            .session(&session_id)
+            .cloned()
+            .ok_or_else(|| BrowserToolError::unknown_session(&session_id))?,
+        None => {
+            let workspace_root = params
+                .workspace_root
+                .map(canonical_workspace_root)
+                .transpose()?;
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .start_session_with_workspace(params.label, workspace_root)
+        }
     };
 
     let tab = match params.start_url {
@@ -2541,6 +2719,7 @@ async fn broker_start_session(
 
     Ok(StartSessionResult {
         agent_session_id: session.agent_session_id,
+        mode,
         tab,
     })
 }
@@ -6413,6 +6592,7 @@ mod tests {
                 "agent_session_id": session.agent_session_id.0,
                 "tab_id": "tab-nonexistent",
             }),
+            context: None,
         };
         dispatch_request(&config, &state, request).await;
 
@@ -6426,6 +6606,306 @@ mod tests {
         assert!(
             expired.is_empty(),
             "an interaction-shaped request should refresh its session even when it fails"
+        );
+    }
+
+    fn ambient_identity(id: &str) -> crate::conversation_identity::ConversationIdentity {
+        crate::conversation_identity::ConversationIdentity::new(1, "com.example.host", id).unwrap()
+    }
+
+    fn ambient_context(
+        id: &str,
+        workspace_root: Option<PathBuf>,
+    ) -> crate::protocol::BrokerRequestContext {
+        crate::protocol::BrokerRequestContext {
+            conversation_identity: Some(ambient_identity(id)),
+            workspace_root,
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_identity_reuses_one_session_and_isolates_conversations() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+
+        for (request_id, identity) in [("1", "first"), ("2", "first"), ("3", "second")] {
+            let response = dispatch_request(
+                &config,
+                &state,
+                BrokerRequest {
+                    id: request_id.to_string(),
+                    method: "list_tabs".to_string(),
+                    params: json!({}),
+                    context: Some(ambient_context(identity, None)),
+                },
+            )
+            .await;
+            assert!(
+                response.ok,
+                "ambient list_tabs failed: {:?}",
+                response.error
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains(identity));
+            assert!(!encoded.contains("agent_session_id"));
+        }
+
+        let registry = state.registry().lock().unwrap();
+        let first = registry
+            .session_for_identity(&ambient_identity("first"))
+            .unwrap();
+        let second = registry
+            .session_for_identity(&ambient_identity("second"))
+            .unwrap();
+        assert_ne!(first.agent_session_id, second.agent_session_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ambient_conversations_mint_disjoint_sessions() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let first = BrokerRequest {
+            id: "1".to_string(),
+            method: "list_tabs".to_string(),
+            params: json!({}),
+            context: Some(ambient_context("first", None)),
+        };
+        let second = BrokerRequest {
+            id: "2".to_string(),
+            method: "list_tabs".to_string(),
+            params: json!({}),
+            context: Some(ambient_context("second", None)),
+        };
+        let (first_response, second_response) = tokio::join!(
+            dispatch_request(&config, &state, first),
+            dispatch_request(&config, &state, second),
+        );
+        assert!(first_response.ok);
+        assert!(second_response.ok);
+
+        let registry = state.registry().lock().unwrap();
+        assert_ne!(
+            registry
+                .session_for_identity(&ambient_identity("first"))
+                .unwrap()
+                .agent_session_id,
+            registry
+                .session_for_identity(&ambient_identity("second"))
+                .unwrap()
+                .agent_session_id,
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_precedes_ambient_identity() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let explicit = state.registry().lock().unwrap().start_session(None);
+        let identity = ambient_identity("ignored");
+
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({"agent_session_id":explicit.agent_session_id}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: Some(identity.clone()),
+                    workspace_root: None,
+                }),
+            },
+        )
+        .await;
+        assert!(response.ok);
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&identity)
+                .is_none()
+        );
+
+        let malformed = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({"agent_session_id":42}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: Some(identity.clone()),
+                    workspace_root: None,
+                }),
+            },
+        )
+        .await;
+        assert_eq!(
+            malformed.error.unwrap().code,
+            BrowserToolErrorCode::InvalidInput
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&identity)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_identity_requires_the_explicit_session_workflow() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let workspace = tempfile::tempdir().unwrap();
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: None,
+                    workspace_root: Some(workspace.path().to_path_buf()),
+                }),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.unwrap().code,
+            BrowserToolErrorCode::SessionRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_start_session_reuses_the_binding_and_retains_the_legacy_handle() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let mut handles = Vec::new();
+        for request_id in ["1", "2"] {
+            let response = dispatch_request(
+                &config,
+                &state,
+                BrokerRequest {
+                    id: request_id.to_string(),
+                    method: "start_session".to_string(),
+                    params: json!({}),
+                    context: Some(ambient_context("conversation", None)),
+                },
+            )
+            .await;
+            assert!(response.ok);
+            let result = response.result.unwrap();
+            assert_eq!(result["mode"], "ambient");
+            handles.push(result["agent_session_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(handles[0], handles[1]);
+    }
+
+    #[tokio::test]
+    async fn explicit_start_session_stays_available_without_ambient_identity() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "start_session".to_string(),
+                params: json!({}),
+                context: None,
+            },
+        )
+        .await;
+        assert!(response.ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["mode"], "explicit");
+        assert!(result["agent_session_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_conflicts_only_block_workspace_sensitive_operations() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let initial = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(first.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_ne!(
+            initial.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
+        );
+
+        let ordinary = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_ne!(
+            ordinary.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
+        );
+
+        let unavailable_observation = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2b".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().join("missing-directory")),
+                )),
+            },
+        )
+        .await;
+        let error = unavailable_observation.error.unwrap();
+        assert_ne!(error.code, BrowserToolErrorCode::WorkspaceContextConflict);
+        assert_ne!(error.code, BrowserToolErrorCode::WorkspaceUnavailable);
+
+        let sensitive = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "3".to_string(),
+                method: "artifacts".to_string(),
+                params: json!({"operation":"export","artifact_id":"missing","path":"out"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_eq!(
+            sensitive.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
         );
     }
 

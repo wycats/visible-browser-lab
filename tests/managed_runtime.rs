@@ -365,7 +365,7 @@ mod macos {
     }
 
     fn terminate_broker(state_dir: &Path) -> Result<()> {
-        let pid = fs::read_to_string(state_dir.join("broker-v3.pid"))?
+        let pid = fs::read_to_string(state_dir.join("broker-v4.pid"))?
             .trim()
             .parse::<i32>()?;
         unsafe {

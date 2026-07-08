@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "../dist-unit",
+    "rootDir": "..",
+    "strict": true,
+    "moduleResolution": "node",
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["../src/invocation_context.ts", "**/*.ts"]
+}

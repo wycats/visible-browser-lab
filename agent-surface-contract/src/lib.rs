@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::o200k_base_singleton;
 
-pub const SERVER_INSTRUCTIONS: &str = "Start each browser task with start_session and retain its agent_session_id. Use only tab_id values owned by that session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
+pub const SERVER_INSTRUCTIONS: &str = "Call browser operations directly. Conversation-aware hosts select the browser session automatically. If a call returns session_required, call start_session once and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
 
 pub const DOMAIN_OPERATIONS: &[(&str, &[&str])] = &[
     (
@@ -482,13 +482,19 @@ fn tool(
     name: &str,
     title: &str,
     description: &str,
-    input_schema: Value,
+    mut input_schema: Value,
     output_schema: Value,
     read_only: bool,
     destructive: bool,
     idempotent: bool,
     open_world: bool,
 ) -> ToolDefinition {
+    if let Some(required) = input_schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+    {
+        required.retain(|field| field.as_str() != Some("agent_session_id"));
+    }
     ToolDefinition {
         name: name.to_string(),
         title: title.to_string(),
@@ -1622,9 +1628,10 @@ fn session_result() -> Value {
     object_schema(
         vec![
             ("agent_session_id", string_schema()),
+            ("mode", enum_schema(&["ambient", "explicit"])),
             ("tab", owned_tab_schema()),
         ],
-        &["agent_session_id"],
+        &["agent_session_id", "mode"],
     )
 }
 fn tab_result() -> Value {
@@ -2183,6 +2190,36 @@ mod tests {
             assert!(tool.output_schema.is_object());
             assert!(tool.annotations.is_object());
         }
+    }
+
+    #[test]
+    fn explicit_session_handle_remains_declared_but_is_optional() {
+        let catalog = hybrid_catalog();
+        let mut tools_with_session = 0;
+        for tool in &catalog {
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            if properties.contains_key("agent_session_id") {
+                tools_with_session += 1;
+                let required = tool.input_schema["required"].as_array().unwrap();
+                assert!(
+                    required
+                        .iter()
+                        .all(|field| field.as_str() != Some("agent_session_id")),
+                    "{} still requires agent_session_id",
+                    tool.name
+                );
+            }
+        }
+        assert!(tools_with_session > 20);
+
+        let start = catalog
+            .iter()
+            .find(|tool| tool.name == "start_session")
+            .unwrap();
+        assert_eq!(
+            start.output_schema["properties"]["mode"]["enum"],
+            json!(["ambient", "explicit"])
+        );
     }
 
     #[test]

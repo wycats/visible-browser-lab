@@ -19,7 +19,7 @@ An explicit `VISIBLE_BROWSER_CDP_ENDPOINT`, `VISIBLE_BROWSER_CDP_PORT`, or `--cd
 
 ## Session Workflow
 
-Start every browser workflow with `start_session`. Keep the returned `agent_session_id` for the full task and pass it on every later tool call.
+Call browser operations directly. Conversation-aware hosts select the session automatically. If a call returns `session_required`, call `start_session`, keep the returned `agent_session_id` for the full task, and pass it on every later tool call.
 
 Use leased `tab_id` values as the only browser-action handles. Browser actions require both `agent_session_id` and a tab owned by that session.
 

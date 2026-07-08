@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 
+import { extractInvocationContext, type SurfaceRequestContext } from "./invocation_context";
+
 interface ToolContribution {
   name: string;
   displayName?: string;
@@ -54,7 +56,13 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
     token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelToolResult> {
     const method = browserMethod(this.contribution.name);
-    const output = await invokeSurfaceCall(this.context, method, options.input ?? {}, token);
+    const output = await invokeSurfaceCall(
+      this.context,
+      method,
+      options.input ?? {},
+      extractInvocationContext(options),
+      token,
+    );
     if (!output.ok) {
       throw new Error(formatToolError(method, output.error));
     }
@@ -165,17 +173,20 @@ async function invokeSurfaceCall(
   context: vscode.ExtensionContext,
   method: string,
   input: Record<string, unknown>,
+  invocationContext: SurfaceRequestContext | undefined,
   token: vscode.CancellationToken,
 ): Promise<BrowserToolResult> {
   const binary = resolveBinary(context);
-  const workspaceRoot = activeWorkspaceRoot();
-  const args = ["surface", "call", method];
+  const workspaceRoot = invocationContext?.workspace_root ?? activeWorkspaceRoot();
+  const args = ["surface", "call", method, "--request-envelope-version", "1"];
+  const requestContext: SurfaceRequestContext = { ...invocationContext };
   if (workspaceRoot) {
-    args.push("--workspace-root", workspaceRoot);
+    requestContext.workspace_root = workspaceRoot;
   }
+  const envelope = { arguments: input, context: requestContext };
 
   const env = runtimeEnvironment();
-  const stdout = await runProcess(binary, args, JSON.stringify(input), env, token);
+  const stdout = await runProcess(binary, args, JSON.stringify(envelope), env, token);
   return browserToolResult(JSON.parse(stdout));
 }
 

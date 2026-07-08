@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     artifacts::ArtifactSummary,
     config::RuntimeMode,
+    conversation_identity::ConversationIdentity,
     ipc::{BrokerEndpoint, BrokerStream},
     leases::{
         AgentSessionId, BrowserToolError, BrowserToolErrorCode, GlobalTabGroup, OwnedTabSummary,
@@ -18,7 +19,7 @@ use crate::{
     },
 };
 
-pub const BROKER_PROTOCOL_VERSION: u32 = 3;
+pub const BROKER_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerStatus {
@@ -49,8 +50,16 @@ pub struct StartSessionParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartSessionResult {
     pub agent_session_id: AgentSessionId,
+    pub mode: SessionGovernanceMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab: Option<OwnedTabSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionGovernanceMode {
+    Explicit,
+    Ambient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -571,6 +580,17 @@ pub struct BrokerRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<BrokerRequestContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRequestContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_identity: Option<ConversationIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -631,11 +651,25 @@ impl BrokerClient {
     where
         P: Serialize,
     {
+        self.request_response_with_context(method, params, None)
+            .await
+    }
+
+    pub async fn request_response_with_context<P>(
+        &mut self,
+        method: &str,
+        params: P,
+        context: Option<BrokerRequestContext>,
+    ) -> Result<BrokerResponse>
+    where
+        P: Serialize,
+    {
         let request_id = Uuid::new_v4().to_string();
         let request = BrokerRequest {
             id: request_id.clone(),
             method: method.to_string(),
             params: serde_json::to_value(params)?,
+            context,
         };
         let encoded = serde_json::to_string(&request)?;
 

@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
         command,
         cdp_endpoint,
         state_dir,
+        conversation_identity_compatibility,
     } = Cli::parse();
 
     let config = RuntimeOptions {
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
     match command {
         Some(Command::Broker(args)) => broker::run(args.apply(config)).await,
         Some(Command::Surface(args)) => surface_cli::run(config, args).await,
-        None => mcp::run(config).await,
+        None => mcp::run(config, conversation_identity_compatibility).await,
     }
 }
 

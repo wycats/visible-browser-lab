@@ -6,7 +6,12 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::{broker, config::RuntimeConfig, leases::BrowserToolError, protocol::BrokerResponse};
+use crate::{
+    broker,
+    config::RuntimeConfig,
+    leases::BrowserToolError,
+    protocol::{BrokerRequestContext, BrokerResponse},
+};
 
 #[derive(Clone)]
 pub struct VisibleBrowserLabSurface {
@@ -72,8 +77,8 @@ impl VisibleBrowserLabSurface {
     pub async fn call_tool(
         &self,
         name: &str,
-        mut arguments: Map<String, Value>,
-        workspace_root: Option<String>,
+        arguments: Map<String, Value>,
+        context: BrokerRequestContext,
     ) -> SurfaceToolResult {
         if self.get_tool(name).is_none() {
             return SurfaceToolResult::structured_error(json!({
@@ -86,13 +91,9 @@ impl VisibleBrowserLabSurface {
         if name == "help" {
             return Self::help(&arguments);
         }
-        if name == "start_session"
-            && let Some(workspace_root) = workspace_root
-        {
-            arguments.insert("workspace_root".to_string(), Value::String(workspace_root));
-        }
 
-        self.call_broker(name, Value::Object(arguments)).await
+        self.call_broker(name, Value::Object(arguments), context)
+            .await
     }
 
     pub fn help(arguments: &Map<String, Value>) -> SurfaceToolResult {
@@ -135,11 +136,16 @@ impl VisibleBrowserLabSurface {
         SurfaceToolResult::structured(response)
     }
 
-    async fn call_broker<P>(&self, method: &str, params: P) -> SurfaceToolResult
+    async fn call_broker<P>(
+        &self,
+        method: &str,
+        params: P,
+        context: BrokerRequestContext,
+    ) -> SurfaceToolResult
     where
         P: Serialize,
     {
-        let response = match self.call_broker_response(method, params).await {
+        let response = match self.call_broker_response(method, params, context).await {
             Ok(response) => response,
             Err(error) => return structured_browser_error(error),
         };
@@ -157,6 +163,7 @@ impl VisibleBrowserLabSurface {
         &self,
         method: &str,
         params: P,
+        context: BrokerRequestContext,
     ) -> Result<BrokerResponse, BrowserToolError>
     where
         P: Serialize,
@@ -170,7 +177,7 @@ impl VisibleBrowserLabSurface {
             })?;
 
         client
-            .request_response(method, params)
+            .request_response_with_context(method, params, Some(context))
             .await
             .map_err(|error| {
                 BrowserToolError::chrome_unavailable(format!(
@@ -193,8 +200,8 @@ fn structured_browser_error(error: BrowserToolError) -> SurfaceToolResult {
 fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, String) {
     let (tools, guidance) = match topic {
         "tabs" => (
-            vec!["start_session", "list_tabs", "new_tab", "claim_tab"],
-            "Start one session, use its owned tab handles, and inspect global_readonly only when choosing a target to claim.",
+            vec!["list_tabs", "new_tab", "claim_tab", "start_session"],
+            "Use the conversation-selected session and its owned tab handles. Call start_session only after session_required, and inspect global_readonly only when choosing a target to claim.",
         ),
         "snapshot" => (
             vec!["snapshot"],
@@ -241,8 +248,8 @@ fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, Str
             "Follow the structured recovery field, refreshing snapshots after stale references and listings after lease changes.",
         ),
         _ => (
-            vec!["start_session", "snapshot", "help"],
-            "Start a session, inspect the page semantically, choose the narrowest action tool, and close or release each owned tab.",
+            vec!["snapshot", "help", "start_session"],
+            "Call browser operations directly, inspect the page semantically, choose the narrowest action tool, and close or release each owned tab. Call start_session only after session_required.",
         ),
     };
     let suffix = operation

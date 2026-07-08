@@ -2,7 +2,10 @@
   "mcpServers": {
     "visible-browser-lab": {
       "command": "./scripts/visible-browser-lab-mcp.sh",
-      "args": [],
+      "args": [
+        "--conversation-identity-compatibility",
+        "trusted-codex-thread-id"
+      ],
       "cwd": ".",
       "env_vars": [
         "VISIBLE_BROWSER_LAB_STATE_DIR",
