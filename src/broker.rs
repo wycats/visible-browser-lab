@@ -743,6 +743,15 @@ impl ManagedBrowserBackend {
             .1
             .clone())
     }
+
+    async fn status_endpoint(&self) -> String {
+        self.client
+            .lock()
+            .await
+            .as_ref()
+            .map(|(endpoint, _)| endpoint.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl BrowserBackend {
@@ -770,15 +779,15 @@ impl BrowserBackend {
         }
     }
 
-    async fn resolved_endpoint(&self) -> Result<String, BrowserToolError> {
+    async fn status_endpoint(&self) -> String {
         match self {
-            Self::External(_) => Ok(normalized_endpoint(&self.cdp_client().await?)),
-            Self::Managed(browser) => browser
-                .client()
-                .await
-                .map(|client| normalized_endpoint(&client)),
+            Self::External(client) => normalized_endpoint(client),
+            // Broker compatibility probes must not launch Chrome. The endpoint
+            // is populated after the first browser operation starts or adopts
+            // the managed browser; an empty value means it is still lazy.
+            Self::Managed(browser) => browser.status_endpoint().await,
             #[cfg(test)]
-            Self::Fake(_) => Ok("fake://browser".to_string()),
+            Self::Fake(_) => "fake://browser".to_string(),
         }
     }
 
@@ -6276,7 +6285,7 @@ async fn broker_status(
         package_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         runtime_mode: config.runtime_mode,
-        cdp_endpoint: state.browser.resolved_endpoint().await?,
+        cdp_endpoint: state.browser.status_endpoint().await,
         ipc_endpoint: config.ipc_endpoint.clone(),
         socket_path: config.socket_path.clone(),
     })
@@ -6523,6 +6532,23 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_broker_status_does_not_resolve_or_launch_chrome() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(
+            tempdir.path().join("state"),
+            Some(tempdir.path().join("missing-chrome")),
+        );
+        prepare_state(&config).await.unwrap();
+        let state = BrokerState::new(&config).unwrap();
+
+        let status = broker_status(&config, &state).await.unwrap();
+
+        assert_eq!(status.runtime_mode, RuntimeMode::Managed);
+        assert!(status.cdp_endpoint.is_empty());
+        assert!(!config.devtools_active_port_path.exists());
     }
 
     #[test]
