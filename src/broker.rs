@@ -1778,10 +1778,24 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
     loop {
         if let Some(_lock) = BrokerStartLock::try_acquire(&legacy.lock_path)? {
             let endpoint = broker_endpoint(&legacy)?;
-            let has_endpoint_artifact = endpoint
-                .stale_path()
-                .map_or(cfg!(windows), std::path::Path::exists);
-            let has_runtime_artifact = legacy.pid_path.exists() || has_endpoint_artifact;
+            let filesystem_endpoint = endpoint.stale_path();
+            let has_endpoint_artifact = filesystem_endpoint.is_some_and(std::path::Path::exists);
+            // A pid file without its Unix socket is not proof of a live v3
+            // broker: the process may have crashed and the PID may now name
+            // an unrelated process. Remove that stale claim without touching
+            // the named process. Windows has no filesystem endpoint, so the
+            // named-pipe probe below is the authority there.
+            if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
+                fs::remove_file(&legacy.pid_path).with_context(|| {
+                    format!(
+                        "failed to remove stale legacy broker pid file `{}`",
+                        legacy.pid_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            let has_runtime_artifact =
+                legacy.pid_path.exists() || has_endpoint_artifact || filesystem_endpoint.is_none();
             if !has_runtime_artifact {
                 return Ok(());
             }
@@ -1800,6 +1814,17 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                     .await?;
                 }
                 Err(probe_error) => {
+                    if filesystem_endpoint.is_none() {
+                        if legacy.pid_path.exists() {
+                            fs::remove_file(&legacy.pid_path).with_context(|| {
+                                format!(
+                                    "failed to remove unreachable legacy broker pid file `{}`",
+                                    legacy.pid_path.display()
+                                )
+                            })?;
+                        }
+                        return Ok(());
+                    }
                     if let Some(pid) = read_pid(&legacy.pid_path)?
                         && process_is_alive(pid)
                     {
@@ -2519,7 +2544,14 @@ fn resolve_request_session(
     let context = request.context.clone().unwrap_or_default();
     if request.method == "start_session" {
         if let Some(identity) = context.conversation_identity {
-            let session = resolve_ambient_session(state, identity, context.workspace_root)?;
+            let params: StartSessionParams = parse_params(request.params.clone())?;
+            let session = resolve_ambient_session(
+                state,
+                identity,
+                params.label,
+                context.workspace_root,
+                false,
+            )?;
             return Ok((
                 Some(session.agent_session_id),
                 Some(SessionGovernanceMode::Ambient),
@@ -2551,7 +2583,13 @@ fn resolve_request_session(
             let identity = context
                 .conversation_identity
                 .ok_or_else(BrowserToolError::session_required)?;
-            let session = resolve_ambient_session(state, identity, context.workspace_root.clone())?;
+            let session = resolve_ambient_session(
+                state,
+                identity,
+                None,
+                context.workspace_root.clone(),
+                workspace_sensitive_request(request),
+            )?;
             request_params_object_mut(request)?.insert(
                 "agent_session_id".to_string(),
                 Value::String(session.agent_session_id.0.clone()),
@@ -2567,7 +2605,9 @@ fn resolve_request_session(
 fn resolve_ambient_session(
     state: &BrokerState,
     identity: crate::conversation_identity::ConversationIdentity,
+    label: Option<String>,
     observed_workspace: Option<PathBuf>,
+    workspace_required: bool,
 ) -> Result<BrowserSession, BrowserToolError> {
     if let Some(session) = state
         .registry()
@@ -2578,14 +2618,18 @@ fn resolve_ambient_session(
         return Ok(session);
     }
 
-    let workspace_root = observed_workspace
-        .map(canonical_workspace_root)
-        .transpose()?;
+    let workspace_root = match observed_workspace {
+        Some(workspace_root) if workspace_required => {
+            Some(canonical_workspace_root(workspace_root)?)
+        }
+        Some(workspace_root) => canonical_workspace_root(workspace_root).ok(),
+        None => None,
+    };
     Ok(state
         .registry()
         .lock()
         .unwrap()
-        .ambient_session(identity, workspace_root))
+        .ambient_session(identity, label, workspace_root))
 }
 
 fn request_params_object_mut(
@@ -2642,16 +2686,11 @@ fn validate_workspace_context(
         return Ok(());
     };
     let observed_workspace = canonical_workspace_root(observed_workspace.clone())?;
-    let registry = state.registry().lock().unwrap();
-    let bound_workspace = registry
-        .session(session_id)
-        .ok_or_else(|| BrowserToolError::unknown_session(session_id))?
-        .workspace_root
-        .as_ref();
-    if bound_workspace.is_some_and(|bound| bound != &observed_workspace) {
-        return Err(BrowserToolError::workspace_context_conflict());
-    }
-    Ok(())
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .bind_workspace_root(session_id, observed_workspace)
 }
 
 fn workspace_sensitive_request(request: &BrokerRequest) -> bool {
@@ -6869,14 +6908,14 @@ mod tests {
         let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
         let state = fake_state(Vec::new());
         let mut handles = Vec::new();
-        for request_id in ["1", "2"] {
+        for (request_id, label) in [("1", "first label"), ("2", "ignored label")] {
             let response = dispatch_request(
                 &config,
                 &state,
                 BrokerRequest {
                     id: request_id.to_string(),
                     method: "start_session".to_string(),
-                    params: json!({}),
+                    params: json!({"label":label}),
                     context: Some(ambient_context("conversation", None)),
                 },
             )
@@ -6887,6 +6926,17 @@ mod tests {
             handles.push(result["agent_session_id"].as_str().unwrap().to_string());
         }
         assert_eq!(handles[0], handles[1]);
+        assert_eq!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("first label")
+        );
     }
 
     #[tokio::test]
@@ -6990,6 +7040,76 @@ mod tests {
         assert_eq!(
             sensitive.error.unwrap().code,
             BrowserToolErrorCode::WorkspaceContextConflict
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ambient_non_file_call_ignores_unavailable_workspace_and_binds_later() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let unavailable_root = tempfile::tempdir().unwrap().path().join("missing");
+
+        let ordinary = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({}),
+                context: Some(ambient_context("conversation", Some(unavailable_root))),
+            },
+        )
+        .await;
+        assert!(
+            ordinary.ok,
+            "ordinary ambient call failed: {:?}",
+            ordinary.error
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .workspace_root
+                .is_none()
+        );
+
+        let available_root = tempfile::tempdir().unwrap();
+        let canonical_root = available_root.path().canonicalize().unwrap();
+        let sensitive = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "artifacts".to_string(),
+                params: json!({
+                    "operation":"export",
+                    "artifact_id":"missing",
+                    "path":"out"
+                }),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(available_root.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_eq!(
+            sensitive.error.unwrap().code,
+            BrowserToolErrorCode::ArtifactNotFound
+        );
+        assert_eq!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .workspace_root
+                .as_deref(),
+            Some(canonical_root.as_path())
         );
     }
 
@@ -7311,6 +7431,23 @@ mod tests {
         assert!(
             !legacy.socket_path.exists(),
             "v3 socket file should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_legacy_broker_cleans_pid_only_state_without_killing_the_named_process() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        fs::write(&legacy.pid_path, std::process::id().to_string()).unwrap();
+
+        retire_legacy_broker(&config).await.unwrap();
+
+        assert!(process_is_alive(std::process::id()));
+        assert!(
+            !legacy.pid_path.exists(),
+            "pid-only v3 state should be removed without trusting the reused pid"
         );
     }
 

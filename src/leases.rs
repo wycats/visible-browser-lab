@@ -447,6 +447,7 @@ impl LeaseRegistry {
     pub fn ambient_session(
         &mut self,
         identity: ConversationIdentity,
+        label: Option<String>,
         workspace_root: Option<PathBuf>,
     ) -> BrowserSession {
         if let Some(session_id) = self.ambient_sessions.get(&identity)
@@ -456,7 +457,7 @@ impl LeaseRegistry {
             return session.clone();
         }
 
-        let session = self.start_session_with_workspace(None, workspace_root);
+        let session = self.start_session_with_workspace(label, workspace_root);
         self.ambient_sessions
             .insert(identity.clone(), session.agent_session_id.clone());
         self.ambient_identities
@@ -481,6 +482,28 @@ impl LeaseRegistry {
 
     pub fn session(&self, session_id: &AgentSessionId) -> Option<&BrowserSession> {
         self.sessions.get(session_id)
+    }
+
+    pub fn bind_workspace_root(
+        &mut self,
+        session_id: &AgentSessionId,
+        workspace_root: PathBuf,
+    ) -> Result<(), BrowserToolError> {
+        self.require_session(session_id)?;
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .expect("live session was just verified");
+        match session.workspace_root.as_ref() {
+            Some(bound) if bound != &workspace_root => {
+                Err(BrowserToolError::workspace_context_conflict())
+            }
+            Some(_) => Ok(()),
+            None => {
+                session.workspace_root = Some(workspace_root);
+                Ok(())
+            }
+        }
     }
 
     /// Test support: rewind a session's last-activity timestamp so tests can
@@ -1105,14 +1128,14 @@ mod tests {
     fn expiry_removes_the_ambient_identity_binding() {
         let mut registry = LeaseRegistry::new();
         let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
-        let first = registry.ambient_session(identity.clone(), None);
+        let first = registry.ambient_session(identity.clone(), None, None);
         registry.backdate_session(&first.agent_session_id, 2 * 3_600_000);
         let expired =
             registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
         assert_eq!(expired.len(), 1);
         assert!(registry.session_for_identity(&identity).is_none());
 
-        let second = registry.ambient_session(identity.clone(), None);
+        let second = registry.ambient_session(identity.clone(), None, None);
         assert_ne!(first.agent_session_id, second.agent_session_id);
         assert_eq!(
             registry
