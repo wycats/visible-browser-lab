@@ -62,7 +62,7 @@ Its value is:
 }
 ```
 
-`version` is the schema version. Version 1 is the only accepted value in this RFC. `issuer` is a non-empty stable reverse-DNS identifier for the host identity authority. `id` is a non-empty opaque string; consumers do not require a UUID or URI shape.
+`version` is the schema version. Version 1 is the only accepted value in this RFC. `issuer` is a lowercase reverse-DNS name with at least two labels. Each label contains ASCII lowercase letters, digits, or internal hyphens and starts and ends with a letter or digit. `id` is a non-empty opaque string; consumers do not require a UUID or URI shape.
 
 The complete `(version, issuer, id)` tuple is the identity. IDs from different issuers never alias. Raw identity values are correlation data and must not appear in model-facing responses, previews, help, events, telemetry, or ordinary logs.
 
@@ -235,7 +235,7 @@ Language servers and IDE chat systems similarly attach workspace and session con
 
 # Acceptance Tests
 
-- Canonical metadata parses to the exact version/issuer/id tuple.
+- Canonical metadata parses to the exact version/issuer/id tuple; invalid versions, unknown fields, malformed lowercase reverse-DNS issuers, and empty ids fail before dispatch.
 - Codex `threadId` normalizes to issuer `com.openai.codex`.
 - Matching canonical and Codex observations succeed; conflicting or malformed observations fail before dispatch.
 - Raw identities do not serialize through plans, responses, help, previews, events, or logs.
