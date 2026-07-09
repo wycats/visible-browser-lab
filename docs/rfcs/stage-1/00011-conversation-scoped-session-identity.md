@@ -8,7 +8,7 @@ RFC 00010 established that session handles belong below the agent's context wind
 
 A host adapter supplies an ambient `ConversationIdentity` for each tool call. Codex already sends its persisted thread identifier in MCP request metadata. VS Code already associates language-model tool calls with a persisted chat-session resource inside its host-created invocation token. The VBL adapters normalize those host facts into one versioned identity and forward it to the broker outside model-visible tool arguments.
 
-The broker maps the identity to its internal browser session on first use. Calls in that conversation reuse the same session without `start_session` or `agent_session_id`; different conversations remain isolated. An explicitly supplied `agent_session_id` still takes precedence, and clients without ambient identity retain the explicit protocol. RFC 00009's sixty-minute TTL remains the cleanup governor for every session in this release.
+The broker maps the identity to its internal browser session on first use. Calls in that conversation reuse the same session without `start_session` or `agent_session_id`; different conversations remain isolated. An explicitly supplied `agent_session_id` still takes precedence, and clients without ambient identity retain the explicit protocol. RFC 00009's sixty-minute TTL remains the cleanup governor for every session in this release. When that TTL expires an ambient session, VBL closes only targets it created for that session and still owns; claimed human targets and every explicit-session target remain open and become claimable.
 
 mcp-twill owns the reusable conversation-identity contract: metadata schema, authority, validation, framework declaration, handler context, fingerprint binding, and non-disclosure rules. VBL mirrors that contract while it remains a native-rmcp server and owns only the browser-specific mapping from conversation identity to sessions and leases.
 
@@ -42,7 +42,7 @@ The identity is infrastructure metadata. It never appears in the tool's input sc
 
 If the host does not provide a usable identity, VBL behaves like the explicit protocol. A stateful call without `agent_session_id` returns `session_required`; the agent calls `start_session` and passes the returned handle thereafter. Global VS Code tool invocations, older host versions, and bare MCP clients therefore degrade to an existing supported mode rather than failing unpredictably.
 
-A persisted host identity does not make broker state persistent. Reopening a chat or resuming a Codex thread reuses the session while the broker and its TTL binding remain live. If the broker restarts or the session expires, the next ambient call creates a new session. RFC 00009 leaves the old tabs open and claimable, so the failure is recoverable without destroying browser state.
+A persisted host identity does not make broker state persistent. Reopening a chat or resuming a Codex thread reuses the session while the broker and its TTL binding remain live. If the broker restarts or the session expires, the next ambient call creates a new session. Claimed human tabs remain open and claimable. Windows VBL created for the expired ambient conversation are closed if the conversation still owns them, preventing abandoned conversations from accumulating windows indefinitely.
 
 # Reference-level explanation
 
@@ -161,7 +161,7 @@ Broker protocol version 4 adds an optional request context:
 
 The context is a sibling of `params`, never part of operation parameters. Old callers may omit it. Existing broker compatibility checks replace a running broker whose protocol or package version does not match the invoking binary.
 
-The broker maintains an in-memory map from `ConversationIdentity` to `agent_session_id`. Browser sessions record whether they were created explicitly or ambiently.
+The broker maintains an in-memory map from `ConversationIdentity` to `agent_session_id`. Browser sessions record whether they were created explicitly or ambiently. Each active lease also retains private acquisition provenance: a lease created together with a new target for an ambient session is eligible for expiry closure; a lease obtained by claiming an existing target is not.
 
 Before dispatching a stateful operation, the broker resolves the session:
 
@@ -173,7 +173,7 @@ Before dispatching a stateful operation, the broker resolves the session:
 
 An ambient `start_session` call resolves or creates the ambient session rather than creating a second session. Its result reports `mode: "ambient"` and retains `agent_session_id` for backward compatibility with the documented explicit workflow. An explicit `start_session` reports `mode: "explicit"` and the same handle shape as today. An optional `start_url` still creates and leases a tab in the selected session. New ambient guidance does not require the agent to call `start_session` or carry the returned handle.
 
-When the TTL sweep expires a session, it removes the identity binding as part of the same critical section that removes the session and releases its leases. The next call for that host identity can therefore mint a new ambient session. Conversation identity does not weaken RFC 00009's release-not-close behavior or in-flight expiry protection.
+When the TTL sweep expires a session, it removes the identity binding as part of the same critical section that removes the session and reclaims its leases. The next call for that host identity can therefore mint a new ambient session. Claimed targets and every explicit-session target follow RFC 00009's release-not-close behavior. A target VBL created for an ambient session is closed only when its lease is still active at expiry; explicitly releasing it first removes the closure disposition. Targets selected for async closure remain reserved until the browser reports them closed or the close fails, so a concurrent caller cannot claim a target the sweep is about to close. A failed close releases the reservation and leaves the surviving target claimable. In-flight expiry protection is unchanged.
 
 ## Workspace Binding
 
@@ -197,7 +197,14 @@ Server instructions and generated VS Code descriptions teach one workflow:
 
 ## Lifecycle
 
-The sixty-minute session TTL from RFC 00009 is the sole teardown governor in v0.4.6. Every resolved ambient request touches the internal session through the same dispatch-time path as explicit calls.
+The sixty-minute session TTL from RFC 00009 is the sole teardown governor in v0.4.6. Every resolved ambient request touches the internal session through the same dispatch-time path as explicit calls. On expiry, governance and acquisition provenance determine target disposition:
+
+- an active target VBL created for an ambient session is closed;
+- a target the ambient session claimed is released and remains open;
+- every explicit-session target is released and remains open; and
+- a target explicitly released before expiry remains open.
+
+This asymmetry is the ownership boundary. Ambient browser windows exist on behalf of one host conversation and otherwise accumulate without a natural owner. Claimed targets and explicit sessions may represent durable human work, so a conversation deadline is not authority to close them.
 
 This RFC does not interpret process exit, MCP disconnect, VS Code provider changes, chat idleness, or extension shutdown as conversation end. Provider changes preserve the same VS Code session resource and require no demotion or adoption flow.
 
@@ -209,7 +216,9 @@ The VS Code token bridge reads a field from an opaque public token. The implemen
 
 Making `agent_session_id` optional in model-facing schemas moves one validation rule from JSON Schema to broker resolution. Calls without either authority fail at runtime with a precise recovery rather than at schema validation.
 
-Conversation identity survives model context changes, but browser-session state remains in memory. Broker restart and TTL expiry still require recovery through the claimable global inventory.
+Conversation identity survives model context changes, but browser-session state remains in memory. Broker restart and TTL expiry still require recovery. Claimed targets remain available through the global inventory; an ambient-created target that expired with its conversation must be recreated.
+
+An ambient-created window handed to a human through `focus_tab` still belongs to the ambient session and may close after sixty minutes without another request. The bounded cleanup is intentional, but integrations should claim existing human tabs when durability matters or explicitly release a VBL-created tab before a long handoff.
 
 VBL temporarily mirrors a type and normalization rule that Twill ultimately owns. The duplication is bounded to the native-rmcp transition and must be removed when VBL ports.
 
@@ -222,6 +231,10 @@ VBL temporarily mirrors a type and normalization rule that Twill ultimately owns
 **Extension-host identity.** Rejected. Concurrent VS Code chats share an extension host and must not share browser leases.
 
 **Workspace-composite identity.** Rejected. The host identifiers are already globally scoped by issuer. Workspace remains session context so multi-root focus changes do not fork a conversation.
+
+**Release every target on ambient expiry.** Rejected after dogfood. VBL creates one Chrome window per broker-created target to preserve capture reliability. Releasing those targets without closing them makes abandoned conversations accumulate visible windows and shifts cleanup to the user.
+
+**Close every target on ambient expiry.** Rejected. A target claimed from the global inventory may be human-created durable state. Acquisition provenance gives VBL authority over the windows it created without extending that authority to tabs it merely borrowed.
 
 **Waiting for stable VS Code APIs.** Rejected as the only path. The guarded bridge provides current value and degrades to the explicit protocol. The canonical boundary is designed so stabilization changes only the adapter source.
 
@@ -243,7 +256,9 @@ Language servers and IDE chat systems similarly attach workspace and session con
 - An explicit `agent_session_id` takes precedence over ambient identity.
 - A stateful call with neither source returns `session_required`; the explicit workflow remains functional.
 - Ambient and explicit `start_session` both retain the legacy handle shape; ordinary ambient browser operations expose no handle.
-- Expiry removes the identity binding and releases rather than closes tabs.
+- Expiry removes the identity binding, closes active targets VBL created for the ambient session, and releases claimed targets without closing them.
+- Explicit-session expiry remains release-only, and explicitly releasing an ambient-created target before expiry keeps it open.
+- A target reserved for ambient-expiry closure cannot be claimed concurrently; a failed close removes the reservation and leaves the target claimable.
 - Workspace changes do not block ordinary browser operations; equal observations are accepted for workspace-sensitive operations, and conflicting observations fail only those operations without changing the binding.
 - Codex installed-artifact testing proves direct operation, thread isolation, and resume/compaction continuity while the TTL binding remains live.
 - VS Code 1.128 installed-artifact testing proves direct operation, simultaneous-chat isolation, history restoration, provider-independent continuity, and explicit fallback for a global invocation.
