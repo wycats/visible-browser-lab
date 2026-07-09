@@ -1791,14 +1791,18 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
             let has_endpoint_artifact = filesystem_endpoint.is_some_and(std::path::Path::exists);
             let claimed_pid = read_pid(&legacy.pid_path)?;
             // A pid file without the default Unix socket can be either stale
-            // or a live v3 broker launched with --socket. Only terminate the
-            // process when its command line proves that it is a VBL broker for
-            // this state directory; a reused unrelated PID remains untouched.
+            // or a live broker launched with --socket. Without an endpoint
+            // handshake, the command line cannot prove whether that process
+            // speaks v3 or v4. Refuse a second broker when the live process is
+            // VBL-owned; remove only claims whose PID is dead or unrelated.
             if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
                 if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid))
-                    && process_looks_like_legacy_broker(pid, &legacy.state_dir)
+                    && process_looks_like_broker_for_state(pid, &legacy.state_dir)
                 {
-                    terminate_broker_claim(&legacy, pid).await?;
+                    bail!(
+                        "legacy v3 pid file names live VBL broker pid {pid}, but the default retired endpoint {} is absent; refusing to kill an endpoint-unverified process or start a second broker",
+                        legacy.ipc_endpoint
+                    );
                 } else {
                     fs::remove_file(&legacy.pid_path).with_context(|| {
                         format!(
@@ -1832,6 +1836,16 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                                 legacy.ipc_endpoint
                             );
                         };
+                        if !process_matches_broker_endpoint(
+                            pid,
+                            &legacy.state_dir,
+                            &legacy.ipc_endpoint,
+                        ) {
+                            bail!(
+                                "legacy v3 endpoint {} accepted a connection but ping failed and claimed pid {pid} does not name that retired endpoint; refusing to kill an unverified process or start a second broker: {ping_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        }
                         tracing::warn!(
                             pid,
                             endpoint = %legacy.ipc_endpoint,
@@ -1843,13 +1857,19 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                 },
                 Err(connect_error) => {
                     if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) {
-                        if process_looks_like_legacy_broker(pid, &legacy.state_dir) {
+                        if process_matches_broker_endpoint(
+                            pid,
+                            &legacy.state_dir,
+                            &legacy.ipc_endpoint,
+                        ) {
                             terminate_broker_claim(&legacy, pid).await?;
                             return Ok(());
                         }
-                        if has_endpoint_artifact {
+                        if has_endpoint_artifact
+                            || process_looks_like_broker_for_state(pid, &legacy.state_dir)
+                        {
                             bail!(
-                                "legacy v3 broker pid {pid} is alive but unavailable at {}; refusing to start a second broker: {connect_error:#}",
+                                "legacy v3 pid file names live process {pid}, but it could not be verified at {}; refusing to kill it or start a second broker: {connect_error:#}",
                                 legacy.ipc_endpoint
                             );
                         }
@@ -1878,10 +1898,14 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
     }
 }
 
-fn process_looks_like_legacy_broker(pid: u32, state_dir: &Path) -> bool {
+fn process_looks_like_broker_for_state(pid: u32, state_dir: &Path) -> bool {
     let Some(command_line) = process_command_line(pid) else {
         return false;
     };
+    command_line_looks_like_broker_for_state(&command_line, state_dir)
+}
+
+fn command_line_looks_like_broker_for_state(command_line: &str, state_dir: &Path) -> bool {
     let command_line = command_line.to_ascii_lowercase();
     let state_dir = state_dir.to_string_lossy().to_ascii_lowercase();
     command_line.contains("visible-browser-lab-mcp")
@@ -1890,6 +1914,17 @@ fn process_looks_like_legacy_broker(pid: u32, state_dir: &Path) -> bool {
             .any(|argument| argument.trim_matches(|c| c == '\'' || c == '"') == "broker")
         && command_line.contains("--state-dir")
         && command_line.contains(&state_dir)
+}
+
+fn process_matches_broker_endpoint(pid: u32, state_dir: &Path, endpoint: &str) -> bool {
+    let Some(command_line) = process_command_line(pid) else {
+        return false;
+    };
+    command_line_looks_like_broker_for_state(&command_line, state_dir)
+        && command_line.to_ascii_lowercase().contains("--socket")
+        && command_line
+            .to_ascii_lowercase()
+            .contains(&endpoint.to_ascii_lowercase())
 }
 
 #[cfg(unix)]
@@ -2704,6 +2739,9 @@ fn resolve_ambient_session(
 fn request_params_object_mut(
     request: &mut BrokerRequest,
 ) -> Result<&mut serde_json::Map<String, Value>, BrowserToolError> {
+    if request.params.is_null() {
+        request.params = Value::Object(serde_json::Map::new());
+    }
     request
         .params
         .as_object_mut()
@@ -6870,6 +6908,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambient_identity_accepts_omitted_params_as_an_empty_object() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let request: BrokerRequest = serde_json::from_value(json!({
+            "id": "1",
+            "method": "list_tabs",
+            "context": ambient_context("conversation", None)
+        }))
+        .unwrap();
+        assert!(request.params.is_null());
+
+        let response = dispatch_request(&config, &state, request).await;
+
+        assert!(
+            response.ok,
+            "ambient list_tabs failed: {:?}",
+            response.error
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_ambient_conversations_mint_disjoint_sessions() {
         let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
         let state = fake_state(Vec::new());
@@ -7530,7 +7597,15 @@ mod tests {
         let endpoint = broker_endpoint(&legacy).unwrap();
         let listener = endpoint.listen().unwrap();
 
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let marker = format!(
+            "visible-browser-lab-mcp broker --socket {} --state-dir {}",
+            legacy.ipc_endpoint,
+            config.state_dir.display()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", &marker])
+            .spawn()
+            .unwrap();
         let pid = child.id();
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -7571,15 +7646,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn retire_legacy_broker_terminates_a_verified_custom_socket_daemon() {
+    async fn retire_legacy_broker_refuses_to_kill_v4_from_a_stale_v3_pid() {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
         let legacy = legacy_broker_config(&config);
-        let custom_socket = config.state_dir.join("custom-v3.sock");
         let marker = format!(
             "visible-browser-lab-mcp broker --socket {} --state-dir {}",
-            custom_socket.display(),
+            config.ipc_endpoint,
             config.state_dir.display()
         );
         let mut child = Command::new("sh")
@@ -7593,7 +7667,7 @@ mod tests {
         fs::write(&legacy.pid_path, pid.to_string()).unwrap();
 
         assert!(
-            process_looks_like_legacy_broker(pid, &config.state_dir),
+            process_looks_like_broker_for_state(pid, &config.state_dir),
             "test daemon command line was not recognized"
         );
         assert!(
@@ -7601,13 +7675,23 @@ mod tests {
             "the default v3 socket must be absent in this regression"
         );
 
-        retire_legacy_broker(&config).await.unwrap();
+        let error = retire_legacy_broker(&config).await.unwrap_err();
 
         assert!(
-            !process_is_alive(pid),
-            "verified custom-socket v3 broker should exit"
+            error.to_string().contains("endpoint-unverified process"),
+            "unexpected v4-process refusal: {error:#}"
         );
-        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
+        assert!(
+            process_is_alive(pid),
+            "v4 process named by a stale v3 pid file must not be killed"
+        );
+        assert!(
+            legacy.pid_path.exists(),
+            "ambiguous live pid claim must remain for diagnosis"
+        );
+
+        terminate_process(pid).await.unwrap();
+        fs::remove_file(&legacy.pid_path).unwrap();
     }
 
     #[tokio::test]

@@ -2,7 +2,11 @@ import * as vscode from "vscode";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 
-import { extractInvocationContext, type SurfaceRequestContext } from "./invocation_context";
+import {
+  extractInvocationContext,
+  withWorkspaceFallback,
+  type SurfaceRequestContext,
+} from "./invocation_context";
 
 interface ToolContribution {
   name: string;
@@ -177,12 +181,11 @@ async function invokeSurfaceCall(
   token: vscode.CancellationToken,
 ): Promise<BrowserToolResult> {
   const binary = resolveBinary(context);
-  const workspaceRoot = invocationContext?.workspace_root ?? activeWorkspaceRoot();
   const args = ["surface", "call", method, "--request-envelope-version", "1"];
-  const requestContext: SurfaceRequestContext = invocationContext ? { ...invocationContext } : {};
-  if (workspaceRoot) {
-    requestContext.workspace_root = workspaceRoot;
-  }
+  const requestContext = withWorkspaceFallback(
+    invocationContext,
+    invocationContext ? undefined : activeWorkspaceRoot(),
+  );
   const envelope = { arguments: input, context: requestContext };
 
   const env = runtimeEnvironment();

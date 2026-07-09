@@ -9,6 +9,16 @@ export interface SurfaceRequestContext {
   workspace_root?: string;
 }
 
+export function withWorkspaceFallback(
+  context: SurfaceRequestContext | undefined,
+  fallbackWorkspaceRoot: string | undefined,
+): SurfaceRequestContext {
+  if (context) {
+    return { ...context };
+  }
+  return fallbackWorkspaceRoot ? { workspace_root: fallbackWorkspaceRoot } : {};
+}
+
 interface UriLike {
   scheme: string;
   path: string;

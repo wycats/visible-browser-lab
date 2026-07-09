@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
-import { extractInvocationContext } from "../src/invocation_context";
+import { extractInvocationContext, withWorkspaceFallback } from "../src/invocation_context";
 
 function uri(value: string, fsPath: string, scheme = "file") {
   return {
@@ -60,4 +60,19 @@ test("rejects missing or changed token shapes", () => {
     }),
     undefined,
   );
+});
+
+test("uses the active workspace fallback only without token-derived context", () => {
+  const identityOnly = {
+    conversation_identity: {
+      version: 1 as const,
+      issuer: "com.microsoft.vscode" as const,
+      id: "vscode-chat-session://authority/path",
+    },
+  };
+  assert.deepEqual(withWorkspaceFallback(identityOnly, "/active/workspace"), identityOnly);
+  assert.deepEqual(withWorkspaceFallback(undefined, "/active/workspace"), {
+    workspace_root: "/active/workspace",
+  });
+  assert.deepEqual(withWorkspaceFallback(undefined, undefined), {});
 });
