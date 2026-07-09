@@ -1796,7 +1796,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
             // speaks v3 or v4. Refuse a second broker when the live process is
             // VBL-owned; remove only claims whose PID is dead or unrelated.
             if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
-                if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid))
+                if let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid))
                     && process_looks_like_broker_for_state(pid, &legacy.state_dir)
                 {
                     bail!(
@@ -1830,7 +1830,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                         .await?;
                     }
                     Err(ping_error) => {
-                        let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) else {
+                        let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid)) else {
                             bail!(
                                 "legacy v3 endpoint {} accepted a connection but ping failed and no live broker pid is available; refusing to start a second broker: {ping_error:#}",
                                 legacy.ipc_endpoint
@@ -1856,7 +1856,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                     }
                 },
                 Err(connect_error) => {
-                    if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) {
+                    if let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid)) {
                         if process_matches_broker_endpoint(
                             pid,
                             &legacy.state_dir,
@@ -1973,7 +1973,7 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
     }
 
     match read_pid(&config.pid_path)? {
-        Some(pid) if process_is_alive(pid) => bail!(
+        Some(pid) if process_is_running(pid) => bail!(
             "broker IPC `{}` is unavailable but pid `{pid}` is still alive",
             endpoint.display()
         ),
@@ -2155,6 +2155,7 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
     if let Some(chrome_path) = &config.chrome_path {
         command.env(CHROME_PATH_ENV, chrome_path);
     }
+    detach_broker_from_host_lifecycle(&mut command);
     let child = command
         .spawn()
         .context("failed to spawn visible browser broker")?;
@@ -2167,6 +2168,27 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(unix)]
+fn detach_broker_from_host_lifecycle(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // MCP hosts such as Codex place the stdio server in a dedicated process
+    // group and terminate that group when the invocation ends. The broker is
+    // intentionally longer-lived than the stdio facade, so start it in a new
+    // session before exec to keep host cleanup from erasing ambient bindings.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_broker_from_host_lifecycle(_command: &mut Command) {}
 
 fn append_log_file(path: &Path) -> Result<File> {
     Ok(OpenOptions::new().create(true).append(true).open(path)?)
@@ -6513,6 +6535,44 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        process_is_alive(pid) && !process_is_zombie(pid)
+    }
+
+    #[cfg(windows)]
+    {
+        process_is_alive(pid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.chars().next())
+        == Some('Z')
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .is_some_and(|status| status.starts_with('Z'))
+}
+
 async fn terminate_process(pid: u32) -> Result<()> {
     if pid == 0 {
         return Ok(());
@@ -6531,7 +6591,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
             }
         }
         wait_for_process_exit(pid, Duration::from_secs(2)).await;
-        if process_is_alive(pid) {
+        if process_is_running(pid) {
             let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();
@@ -6549,7 +6609,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()
             .with_context(|| format!("failed to invoke taskkill for broker pid {pid}"))?;
-        if !output.status.success() && process_is_alive(pid) {
+        if !output.status.success() && process_is_running(pid) {
             bail!(
                 "failed to terminate broker pid {pid}: {}{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -6559,15 +6619,34 @@ async fn terminate_process(pid: u32) -> Result<()> {
         wait_for_process_exit(pid, Duration::from_secs(2)).await;
     }
 
-    if process_is_alive(pid) {
+    if process_is_running(pid) {
         bail!("broker pid {pid} did not exit after termination");
     }
     Ok(())
 }
 
 async fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    #[cfg(unix)]
+    const ZOMBIE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
     let deadline = Instant::now() + timeout;
-    while process_is_alive(pid) && Instant::now() < deadline {
+    #[cfg(unix)]
+    let mut next_zombie_poll = Instant::now();
+
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let now = Instant::now();
+            if now >= next_zombie_poll {
+                if process_is_zombie(pid) {
+                    return;
+                }
+                next_zombie_poll = now + ZOMBIE_POLL_INTERVAL;
+            }
+        }
         sleep(Duration::from_millis(50)).await;
     }
 }
@@ -7866,12 +7945,84 @@ mod tests {
         retire_legacy_broker(&config).await.unwrap();
         server.await.unwrap();
 
-        assert!(!process_is_alive(pid), "unhealthy v3 broker should exit");
+        assert!(!process_is_running(pid), "unhealthy v3 broker should exit");
         assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
         assert!(
             !legacy.socket_path.exists(),
             "v3 socket file should be removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_cleans_an_unreaped_zombie_claim() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+        drop(listener);
+
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        for _ in 0..100 {
+            if process_is_zombie(pid) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(process_is_zombie(pid), "test child should be a zombie");
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        retire_legacy_broker(&config).await.unwrap();
+
+        assert!(
+            !legacy.pid_path.exists(),
+            "zombie pid claim should be removed"
+        );
+        assert!(
+            !legacy.socket_path.exists(),
+            "stale v3 socket should be removed"
+        );
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_treats_an_unreaped_zombie_as_exited() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        terminate_process(pid).await.unwrap();
+
+        assert!(!process_is_running(pid));
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_broker_process_isolated_from_the_host_process_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_broker_from_host_lifecycle(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let process_group = unsafe { libc::getpgid(pid) };
+        let session = unsafe { libc::getsid(pid) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(process_group, pid, "broker should lead its process group");
+        assert_eq!(session, pid, "broker should lead an independent session");
     }
 
     #[cfg(unix)]
