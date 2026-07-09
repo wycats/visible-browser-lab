@@ -33,8 +33,8 @@ use crate::{
     config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
-        AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, LeaseRegistry,
-        LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
+        AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, ExpiredLease,
+        LeaseRegistry, LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
     managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
@@ -2343,9 +2343,10 @@ fn idle_exit_permitted(state: &BrokerState, open_connections: &AtomicUsize) -> b
 /// the session-private state that lives outside the registry: artifact
 /// records with their on-disk files, element references for the session's
 /// tabs, and target-side emulation overrides (so a later claim does not
-/// inherit a stale viewport or user agent). Target-keyed diagnostics and
-/// screencasts are shared across sessions and stay. Sessions with a request
-/// in flight are skipped.
+/// inherit a stale viewport or user agent). Claimed targets and targets made
+/// by explicit sessions remain open. Targets created for an ambient session
+/// are closed if their lease is still active at expiry. Sessions with a
+/// request in flight are skipped.
 async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
     let Some(ttl) = ttl else {
         return;
@@ -2370,7 +2371,8 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
             session = %session.session_id.0,
             idle_secs = session.idle.as_secs(),
             released_tabs = session.released.len(),
-            "session expired; leases released"
+            closed_tabs = session.closed.len(),
+            "session expired; leases reclaimed"
         );
         state
             .artifacts()
@@ -2379,7 +2381,7 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
             .remove_session(&session.session_id);
         {
             let mut references = state.references().lock().unwrap();
-            for lease in &session.released {
+            for lease in session.released.iter().chain(&session.closed) {
                 references.reset_tab(&lease.tab_id);
             }
         }
@@ -2406,7 +2408,84 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
                 .unwrap()
                 .remove(&lease.target_id);
         }
+        for lease in &session.closed {
+            close_expired_ambient_target(state, &session.session_id, lease).await;
+        }
     }
+}
+
+/// Close a target created for an ambient session after the registry has
+/// reserved it against concurrent claims. This is best-effort maintenance:
+/// the session is already expired, and a close failure must leave the target
+/// claimable rather than permanently reserved.
+async fn close_expired_ambient_target(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    lease: &ExpiredLease,
+) {
+    if let Some(capture) = state.traces.lock().await.remove(&lease.target_id) {
+        let _ = BrowserBackend::stop_trace(capture).await;
+    }
+    if let Some(active) = state.screencasts.lock().await.remove(&lease.target_id) {
+        let _ = BrowserBackend::stop_screencast(active.capture).await;
+    }
+
+    let closed = match target_by_id(state, &lease.target_id).await {
+        Ok(target) => {
+            if let Err(error) = state
+                .browser
+                .emulate(&target, "reset", &serde_json::Map::new())
+                .await
+            {
+                tracing::warn!(
+                    target = %lease.target_id,
+                    error = %error.message,
+                    "failed to reset emulation before ambient expiry close"
+                );
+            }
+            match state.browser.close_target(&lease.target_id).await {
+                Ok(()) => true,
+                Err(error) if error.code == BrowserToolErrorCode::TargetMissing => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target = %lease.target_id,
+                        error = %error.message,
+                        "failed to close ambient-created target on session expiry"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) if error.code == BrowserToolErrorCode::TargetMissing => true,
+        Err(error) => {
+            tracing::warn!(
+                target = %lease.target_id,
+                error = %error.message,
+                "failed to inspect ambient-created target on session expiry"
+            );
+            false
+        }
+    };
+
+    state.clear_focused_target(&lease.target_id);
+    state
+        .viewport_overrides
+        .lock()
+        .unwrap()
+        .remove(&lease.target_id);
+    let old_monitor = state
+        .diagnostics()
+        .lock()
+        .unwrap()
+        .reset_target(&lease.target_id);
+    if let Some(monitor) = old_monitor {
+        monitor.shutdown().await;
+    }
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .finish_expired_target_close(session_id, &lease.target_id, &lease.tab_id, closed);
 }
 
 /// Re-verify the broker's claim to exist. Returns the violation when the
@@ -6811,6 +6890,157 @@ mod tests {
             "expired lease {} left viewport overrides behind",
             summary.tab_id.0
         );
+    }
+
+    #[tokio::test]
+    async fn ambient_expiry_closes_a_still_owned_vbl_created_target() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "new_tab".to_string(),
+                params: json!({"url":"https://example.com"}),
+                context: Some(ambient_context("conversation", None)),
+            },
+        )
+        .await;
+        assert!(response.ok, "ambient new_tab failed: {:?}", response.error);
+        let ambient = state
+            .registry
+            .lock()
+            .unwrap()
+            .session_for_identity(&ambient_identity("conversation"))
+            .unwrap()
+            .clone();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&ambient.agent_session_id, 3_600_000 * 2);
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert!(
+            state.browser.page_targets().await.unwrap().is_empty(),
+            "ambient expiry should close a target VBL created for that session"
+        );
+        let expired_error = state
+            .registry
+            .lock()
+            .unwrap()
+            .ensure_session(&ambient.agent_session_id)
+            .unwrap_err();
+        assert!(
+            expired_error
+                .message
+                .contains("1 ambient-created browser target closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_expiry_releases_a_claimed_human_target_without_closing_it() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let ambient = state.registry.lock().unwrap().ambient_session(
+            ambient_identity("conversation"),
+            None,
+            None,
+        );
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .claim_tab(
+                &ambient.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+                false,
+                None,
+            )
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&ambient.agent_session_id, 3_600_000 * 2);
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+        let successor = state.registry.lock().unwrap().start_session(None);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .claim_tab(
+                    &successor.agent_session_id,
+                    TabSnapshot::new("target-a", "Title", "https://example.com", false),
+                    false,
+                    None,
+                )
+                .is_ok(),
+            "claimed human targets should be released and immediately claimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_expiry_keeps_vbl_created_targets_open() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let explicit = state.registry.lock().unwrap().start_session(None);
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &explicit.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&explicit.agent_session_id, 3_600_000 * 2);
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ambient_expiry_keeps_an_explicitly_released_created_target_open() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let ambient = state.registry.lock().unwrap().ambient_session(
+            ambient_identity("conversation"),
+            None,
+            None,
+        );
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &ambient.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .release_tab(&ambient.agent_session_id, &tab.tab_id)
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&ambient.agent_session_id, 3_600_000 * 2);
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

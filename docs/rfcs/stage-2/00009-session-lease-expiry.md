@@ -1,10 +1,12 @@
 <!-- exo:9 ulid:01kwwjym2ehpd629ammmxdhxn4 -->
 
-# RFC 9: Session Lease Expiry
+# RFC 00009: Session Lease Expiry
 
 # Summary
 
-Agent sessions gain a bounded lifetime. A session that no request has touched for a configurable window (sixty minutes by default) expires: its tab leases are released back to the pool, its private resources are reclaimed, and the next call that names it receives a precise error telling the agent to start a new session. Today a session lives until the broker exits, however long that is, and everything it owns lives with it. After this RFC, ownership is something a session keeps by using it, and an abandoned session returns what it borrowed.
+Agent sessions gain a bounded lifetime. A session that no request has touched for a configurable window (sixty minutes by default) expires: its tab leases are reclaimed according to their governance and acquisition provenance, its private resources are removed, and the next call that names it receives a precise error telling the agent to start a new session. Today a session lives until the broker exits, however long that is, and everything it owns lives with it. After this RFC, ownership is something a session keeps by using it, and an abandoned session returns what it borrowed.
+
+RFC 00011 later refines the target disposition for conversation-scoped ambient sessions. A target VBL created for an ambient session is closed when that session expires while still owning it. Targets the ambient session claimed, targets it explicitly released, and every explicit-session target retain this RFC's release-not-close behavior. The refinement uses acquisition provenance: VBL may reclaim a window it created for an abandoned conversation, but it may not close durable human state it merely borrowed.
 
 This is the companion piece to RFC 00007. That RFC gave the broker process a bounded lifetime; this one does the same for the sessions inside it. The two together close a gap RFC 00007 deliberately left open: its idle exit is vetoed by live sessions, so a single abandoned session could still pin a broker indefinitely. Session expiry removes the pin.
 
@@ -18,7 +20,7 @@ The cost has been invisible for the same reason the orphaned-broker cost was inv
 
 There is also housekeeping that never happens. Sessions accumulate artifacts, screenshots, exported files, page captures, stored under a per-session directory on disk and indexed in a per-session registry. The artifact store has a `remove_session` method that removes a session's records and files. It has zero callers. Someone built the cleanup half of the lifecycle and nothing ever drives it, because nothing ever decides a session is over.
 
-What acceptable looks like, concretely: a session that an agent is actively using, in any way, should never expire out from under it. A session whose client vanished should return its tabs to the claimable pool within a bounded window, without destroying anything a human can see. An agent that comes back to an expired session should get one crisp error that tells it exactly how to recover, and recovery should be cheap because expiry destroyed nothing it needs. And the broker's idle exit should stop being vetoable by ghosts.
+What acceptable looks like, concretely: a session that an agent is actively using, in any way, should never expire out from under it. A session whose client vanished should return borrowed tabs to the claimable pool within a bounded window. Conversation-scoped sessions should also remove the windows VBL created for them, without treating claimed human tabs as disposable. An agent that comes back to an expired session should get one crisp error that tells it exactly how to recover. And the broker's idle exit should stop being vetoable by ghosts.
 
 # Guide-level explanation
 
@@ -26,15 +28,15 @@ What acceptable looks like, concretely: a session that an agent is actively usin
 
 In an active conversation, nothing changes. Every tool call an agent makes on its session, clicking, filling, taking snapshots, navigating, listing tabs, counts as using it, and a session in use does not expire. The expiry window only starts running when the agent stops calling entirely.
 
-If an agent returns after a long silence, its first call fails with a `session_expired` error that names the session, says how long it sat idle, and carries the same recovery guidance as an unknown session: start a new session. The agent starts one, lists tabs, and re-claims the tab it was working in. The tab is still there, still showing whatever page it showed, because expiry released the agent's claim on the tab without touching the tab itself. The recovery is three calls and no lost browser state.
+If an agent returns after a long silence, its first call fails with a `session_expired` error that names the session, says how long it sat idle, and carries the same recovery guidance as an unknown session: start a new session. An explicit session, or an ambient session that claimed an existing tab, can start again, list tabs, and re-claim the preserved target. An ambient session whose target was created by VBL starts again and opens a new target because the abandoned conversation's window was reclaimed with the session.
 
 What an expired session does lose is its private, session-scoped material: artifacts it had captured but not exported, and the element references from its last snapshots. Both are reconstructible (take a new snapshot, capture a new screenshot), and neither is visible to the human, so reclaiming them destroys nothing a person was relying on. An agent that wants an artifact to survive its own absence should export it while it is still around; that was already true across broker restarts, and this RFC makes it true across long silences too.
 
 ## What humans see
 
-Nothing, in the common case, and that is the design's central constraint. The tabs in the managed Chrome window are the user's visible workspace. Expiry releases the *lease* on a tab, the bookkeeping that says which agent may drive it, and deliberately never closes the tab, navigates it, or otherwise disturbs what is on screen. A user who walks away from a machine with agent-driven tabs open comes back to exactly those tabs, whether or not the sessions that opened them survived.
+Borrowed tabs remain untouched, and that is the design's central constraint. Expiry releases the *lease* on a claimed tab, the bookkeeping that says which agent may drive it, and deliberately never closes, navigates, or otherwise disturbs that target. RFC 00011 adds a narrower rule for ambient sessions: a window VBL itself created for one conversation closes when that abandoned conversation expires. The user keeps durable human tabs without inheriting an ever-growing collection of agent-created windows.
 
-The one human-visible improvement is negative space: tabs stop being mysteriously locked. Today, when an agent's client dies, its tabs stay owned and a new agent needs a human-authorized takeover to reclaim them. After expiry, the dead session's tabs return to the pool on their own, and the new agent claims them without ceremony.
+The other human-visible improvement is negative space: borrowed tabs stop being mysteriously locked. Today, when an agent's client dies, its tabs stay owned and a new agent needs a human-authorized takeover to reclaim them. After expiry, the dead session's claimed tabs return to the pool on their own, and the new agent claims them without ceremony.
 
 ## How contributors should think about it
 
@@ -62,7 +64,9 @@ The TTL defaults to **sixty minutes**, configurable through `VISIBLE_BROWSER_LAB
 
 Expiry distinguishes shared state from private state, and the distinction determines the verb.
 
-**Tab leases are released, never closed.** Each of the expired session's active leases transitions to `Released`, the same state an explicit `release_tab` produces, and the tab's entry leaves the active-target index. The Chrome tab itself is untouched. This is the same principle RFC 00007 applied to managed Chrome at broker shutdown: the browser is the user's visible state, and no bookkeeping deadline is ever grounds for destroying it. A released tab is immediately claimable by any session without takeover ceremony.
+**Borrowed and explicit-session leases are released, never closed.** Each such active lease transitions to `Released`, the same state an explicit `release_tab` produces, and the tab's entry leaves the active-target index. The Chrome target itself is untouched and immediately claimable without takeover ceremony.
+
+**Ambient-created targets are closed while still owned.** RFC 00011 records private acquisition provenance when VBL creates a target for an ambient session. At expiry, that lease transitions to `Closed` and reserves the target until the async browser close finishes. Claims fail while reserved, preventing a claim/close race. If the close fails, the reservation is removed and the surviving target becomes claimable. Explicitly releasing the lease before expiry discards the close disposition and keeps the target open.
 
 **Session-private resources are removed.** The session's artifact records and their on-disk files go through the existing (and currently orphaned) `remove_session` path; artifacts are session-scoped, unreachable from any other session, so retaining them after the session is unrecoverable would be a pure leak. Element references for the session's tabs are dropped the same way; they are meaningless outside the session that captured them.
 
@@ -80,7 +84,7 @@ The MCP layer needs no new machinery: `BrowserToolError` already flows structure
 
 The recon that preceded this RFC flagged handoff as the open question: `focus_tab` brings a tab forward precisely so a human can use it, the human's browsing generates no agent requests, and so handoff time looks like abandonment to any activity clock.
 
-This RFC's answer is that handoff needs no special case, because expiry was designed so that being wrong is cheap. If a human inspects a handed-off tab for ninety minutes and the agent's session expires meanwhile, the recovery is the standard one: `session_expired`, start a new session, re-claim the tab, which is guaranteed still to be there because expiry never closes tabs. Nothing the human did is lost; nothing the agent needs is unrecoverable except un-exported artifacts, and an agent handing a tab to a human for indefinite inspection should export anything it means to keep regardless, since the human might equally close the client.
+This RFC's original answer was that handoff needs no special case because every target survived expiry. RFC 00011 narrows that guarantee: claimed human targets still survive, while ambient-created targets remain owned by the conversation and may close after sixty minutes without another request. An agent handing an ambient-created target to a human for indefinite inspection should explicitly release it first; that discards the close disposition and preserves the target. No suspension marker or second clock is required.
 
 The alternative, a handoff marker that suspends expiry until the agent's next call, was considered and rejected because it recreates the immortal-session problem through the front door: an agent that hands off and never returns pins its leases forever, and handoff (the case where a human is *most* likely to walk away) becomes the case expiry cannot reach. A suspension with its own timeout is just a second, longer TTL with extra state to explain. One clock, cheap recovery, no suspension.
 
@@ -102,7 +106,7 @@ The tombstone set that distinguishes `session_expired` from `unknown_session` is
 
 **Expire leases but keep the session.** A lighter design would release an idle session's tabs but leave the session itself valid, so a returning agent resumes without an error. Rejected because it makes the system quieter but less honest: the agent's next act would operate on a session whose world changed underneath it (tabs gone, references stale) with no signal that anything happened. The explicit error is one call of overhead and removes a whole class of silent confusion. It also would leave artifacts and the session record leaking, which is half the problem this RFC exists to fix.
 
-**Close tabs on expiry.** Symmetric cleanup would close the expired session's tabs too. Rejected for the same reason RFC 00007's shutdown never touches Chrome: tabs are human-visible state, and no timer should destroy what a person can see. The asymmetry (private state removed, shared state released) is deliberate and is the load-bearing safety property of the whole design.
+**Close every tab on expiry.** Symmetric cleanup would close claimed and explicit-session tabs too. Rejected for the same reason RFC 00007's shutdown never touches Chrome: VBL has no authority to destroy durable human state it merely borrowed. RFC 00011's selective ambient cleanup is deliberately narrower: create provenance supplies authority over VBL-created conversation windows without extending it to claimed targets.
 
 **Tie session lifetime to connection lifetime.** LSP-style: session dies when its client's connection closes. Rejected because the MCP facade reconnects per request by design; there is no persistent connection whose closure means anything. The activity clock is the connection-free generalization, which is the same move the broker's idle exit made.
 
@@ -126,7 +130,7 @@ Stage 3 requires all of the following, with evidence:
 2. **Expiry releases and removes the right things.** After a session expires: its tabs are claimable by a new session without takeover; the Chrome targets still exist; its artifact directory is gone; target-keyed diagnostics for its tabs are intact.
 3. **The error contract is exact.** A call on an expired session yields `session_expired` (not `unknown_session`) with the idle duration and `StartSession` recovery; a call on a never-existent session still yields `unknown_session`.
 4. **The veto simplification holds.** With expiry enabled, a broker whose only session is abandoned exits on its own within TTL plus idle window (compressed to seconds in the test configuration), demonstrating the two clocks compose.
-5. **Dogfooded.** A release carrying expiry has been driven live through a real multi-session working day, including at least one deliberate long pause and recovery, without a session expiring mid-work or a tab being lost.
+5. **Dogfooded.** A release carrying expiry has been driven live through a real multi-session working day, including at least one deliberate long pause and recovery, without a session expiring mid-work, a claimed tab being lost, or an ambient-created window surviving its expired owner.
 
 # Implementation plan
 
