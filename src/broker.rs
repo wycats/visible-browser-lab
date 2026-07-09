@@ -6488,11 +6488,9 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if result == 0 {
-            return true;
-        }
-
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists = result == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists && !process_is_zombie(pid)
     }
 
     #[cfg(windows)]
@@ -6511,6 +6509,52 @@ fn process_is_alive(pid: u32) -> bool {
 
         String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_zombie(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if read != size as libc::c_int {
+        return false;
+    }
+
+    unsafe { info.assume_init().pbi_status == libc::SZOMB }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.chars().next())
+        == Some('Z')
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .is_some_and(|status| status.starts_with('Z'))
 }
 
 async fn terminate_process(pid: u32) -> Result<()> {
@@ -7872,6 +7916,56 @@ mod tests {
             !legacy.socket_path.exists(),
             "v3 socket file should be removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_cleans_an_unreaped_zombie_claim() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+        drop(listener);
+
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        for _ in 0..100 {
+            if process_is_zombie(pid) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(process_is_zombie(pid), "test child should be a zombie");
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        retire_legacy_broker(&config).await.unwrap();
+
+        assert!(!legacy.pid_path.exists(), "zombie pid claim should be removed");
+        assert!(
+            !legacy.socket_path.exists(),
+            "stale v3 socket should be removed"
+        );
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_treats_an_unreaped_zombie_as_exited() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        terminate_process(pid).await.unwrap();
+
+        assert!(!process_is_alive(pid));
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
