@@ -6488,8 +6488,8 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        let exists = result == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let exists =
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         exists && !process_is_zombie(pid)
     }
 
@@ -7929,10 +7929,7 @@ mod tests {
         let listener = endpoint.listen().unwrap();
         drop(listener);
 
-        let mut child = Command::new("sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
         let pid = child.id();
         for _ in 0..100 {
             if process_is_zombie(pid) {
@@ -7945,7 +7942,10 @@ mod tests {
 
         retire_legacy_broker(&config).await.unwrap();
 
-        assert!(!legacy.pid_path.exists(), "zombie pid claim should be removed");
+        assert!(
+            !legacy.pid_path.exists(),
+            "zombie pid claim should be removed"
+        );
         assert!(
             !legacy.socket_path.exists(),
             "stale v3 socket should be removed"
