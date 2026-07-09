@@ -2155,6 +2155,7 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
     if let Some(chrome_path) = &config.chrome_path {
         command.env(CHROME_PATH_ENV, chrome_path);
     }
+    detach_broker_from_host_lifecycle(&mut command);
     let child = command
         .spawn()
         .context("failed to spawn visible browser broker")?;
@@ -2167,6 +2168,27 @@ fn spawn_broker(config: &RuntimeConfig) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(unix)]
+fn detach_broker_from_host_lifecycle(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // MCP hosts such as Codex place the stdio server in a dedicated process
+    // group and terminate that group when the invocation ends. The broker is
+    // intentionally longer-lived than the stdio facade, so start it in a new
+    // session before exec to keep host cleanup from erasing ambient bindings.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_broker_from_host_lifecycle(_command: &mut Command) {}
 
 fn append_log_file(path: &Path) -> Result<File> {
     Ok(OpenOptions::new().create(true).append(true).open(path)?)
@@ -7960,6 +7982,28 @@ mod tests {
 
         assert!(!process_is_running(pid));
         child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_broker_process_isolated_from_the_host_process_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_broker_from_host_lifecycle(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let process_group = unsafe { libc::getpgid(pid) };
+        let session = unsafe { libc::getsid(pid) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(process_group, pid, "broker should lead its process group");
+        assert_eq!(session, pid, "broker should lead an independent session");
     }
 
     #[cfg(unix)]
