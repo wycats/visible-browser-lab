@@ -7926,7 +7926,7 @@ mod tests {
         retire_legacy_broker(&config).await.unwrap();
         server.await.unwrap();
 
-        assert!(!process_is_alive(pid), "unhealthy v3 broker should exit");
+        assert!(!process_is_running(pid), "unhealthy v3 broker should exit");
         assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
         assert!(
             !legacy.socket_path.exists(),
