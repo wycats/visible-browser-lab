@@ -33,8 +33,8 @@ use crate::{
     config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
     leases::{
-        AgentSessionId, BrowserToolError, BrowserToolErrorCode, LeaseRegistry, LeaseState,
-        OwnedTabSummary, TabId, TabLease, TabSnapshot,
+        AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, LeaseRegistry,
+        LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
     managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
     protocol::{
@@ -44,9 +44,10 @@ use crate::{
         FillParams, FormField, ListTabsParams, ListTabsResult, ListTabsScope, NavigationAction,
         NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionEffect,
         PageActionEvidence, PageActionResult, ReleaseTabResult, ScreenshotImage, ScreenshotParams,
-        ScreenshotResult, SnapshotMode, SnapshotParams, SnapshotResult, StartSessionParams,
-        StartSessionResult, TabActionParams, TabResult, V3EvaluateParams, V3NavigateParams,
-        V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams, WaitForResult,
+        ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams, SnapshotResult,
+        StartSessionParams, StartSessionResult, TabActionParams, TabResult, V3EvaluateParams,
+        V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams,
+        WaitForResult,
     },
     semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
@@ -61,6 +62,7 @@ use crate::semantic::{RawAxFrame, RawAxNode};
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
+const LEGACY_BROKER_PROTOCOL_VERSION: u32 = 3;
 const TENANCY_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 15_000;
@@ -741,6 +743,15 @@ impl ManagedBrowserBackend {
             .1
             .clone())
     }
+
+    async fn status_endpoint(&self) -> String {
+        self.client
+            .lock()
+            .await
+            .as_ref()
+            .map(|(endpoint, _)| endpoint.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl BrowserBackend {
@@ -768,15 +779,15 @@ impl BrowserBackend {
         }
     }
 
-    async fn resolved_endpoint(&self) -> Result<String, BrowserToolError> {
+    async fn status_endpoint(&self) -> String {
         match self {
-            Self::External(_) => Ok(normalized_endpoint(&self.cdp_client().await?)),
-            Self::Managed(browser) => browser
-                .client()
-                .await
-                .map(|client| normalized_endpoint(&client)),
+            Self::External(client) => normalized_endpoint(client),
+            // Broker compatibility probes must not launch Chrome. The endpoint
+            // is populated after the first browser operation starts or adopts
+            // the managed browser; an empty value means it is still lazy.
+            Self::Managed(browser) => browser.status_endpoint().await,
             #[cfg(test)]
-            Self::Fake(_) => Ok("fake://browser".to_string()),
+            Self::Fake(_) => "fake://browser".to_string(),
         }
     }
 
@@ -1709,6 +1720,7 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
     prepare_state(config).await?;
+    retire_legacy_broker(config).await?;
 
     if let Ok(BrokerProbe::Compatible(client)) = probe_broker(config).await {
         return Ok(client);
@@ -1744,6 +1756,204 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
 
         sleep(BROKER_CONNECT_RETRY).await;
     }
+}
+
+fn legacy_broker_config(config: &RuntimeConfig) -> RuntimeConfig {
+    let mut legacy = config.clone();
+    legacy.ipc_endpoint =
+        ipc::endpoint_display_for_protocol(&config.state_dir, LEGACY_BROKER_PROTOCOL_VERSION);
+    legacy.socket_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.sock"));
+    legacy.lock_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.lock"));
+    legacy.pid_path = config
+        .state_dir
+        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.pid"));
+    legacy
+}
+
+/// A protocol-versioned socket prevents an old client from speaking the new
+/// wire format, but it must not leave two lease registries attached to the
+/// same visible Chrome profile. Every v4 client therefore checks the prior v3
+/// endpoint before dispatch. The v3 startup lock closes the ordinary upgrade
+/// race; repeating the check on every call also retires an old client that is
+/// launched again after the upgrade.
+async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
+    let legacy = legacy_broker_config(config);
+    let deadline = Instant::now() + BROKER_START_TIMEOUT;
+
+    loop {
+        if let Some(_lock) = BrokerStartLock::try_acquire(&legacy.lock_path)? {
+            let endpoint = broker_endpoint(&legacy)?;
+            let filesystem_endpoint = endpoint.stale_path();
+            let has_endpoint_artifact = filesystem_endpoint.is_some_and(std::path::Path::exists);
+            let claimed_pid = read_pid(&legacy.pid_path)?;
+            // A pid file without the default Unix socket can be either stale
+            // or a live broker launched with --socket. Without an endpoint
+            // handshake, the command line cannot prove whether that process
+            // speaks v3 or v4. Refuse a second broker when the live process is
+            // VBL-owned; remove only claims whose PID is dead or unrelated.
+            if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
+                if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid))
+                    && process_looks_like_broker_for_state(pid, &legacy.state_dir)
+                {
+                    bail!(
+                        "legacy v3 pid file names live VBL broker pid {pid}, but the default retired endpoint {} is absent; refusing to kill an endpoint-unverified process or start a second broker",
+                        legacy.ipc_endpoint
+                    );
+                } else {
+                    fs::remove_file(&legacy.pid_path).with_context(|| {
+                        format!(
+                            "failed to remove stale legacy broker pid file `{}`",
+                            legacy.pid_path.display()
+                        )
+                    })?;
+                }
+                return Ok(());
+            }
+            let has_runtime_artifact =
+                legacy.pid_path.exists() || has_endpoint_artifact || filesystem_endpoint.is_none();
+            if !has_runtime_artifact {
+                return Ok(());
+            }
+
+            match BrokerClient::connect(&endpoint).await {
+                Ok(mut client) => match client.ping().await {
+                    Ok(status) => {
+                        restart_incompatible_broker(
+                            &legacy,
+                            &status,
+                            "broker is listening on the retired v3 endpoint",
+                        )
+                        .await?;
+                    }
+                    Err(ping_error) => {
+                        let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) else {
+                            bail!(
+                                "legacy v3 endpoint {} accepted a connection but ping failed and no live broker pid is available; refusing to start a second broker: {ping_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        };
+                        if !process_matches_broker_endpoint(
+                            pid,
+                            &legacy.state_dir,
+                            &legacy.ipc_endpoint,
+                        ) {
+                            bail!(
+                                "legacy v3 endpoint {} accepted a connection but ping failed and claimed pid {pid} does not name that retired endpoint; refusing to kill an unverified process or start a second broker: {ping_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        }
+                        tracing::warn!(
+                            pid,
+                            endpoint = %legacy.ipc_endpoint,
+                            error = %ping_error,
+                            "retiring live legacy broker whose ping failed"
+                        );
+                        terminate_broker_claim(&legacy, pid).await?;
+                    }
+                },
+                Err(connect_error) => {
+                    if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) {
+                        if process_matches_broker_endpoint(
+                            pid,
+                            &legacy.state_dir,
+                            &legacy.ipc_endpoint,
+                        ) {
+                            terminate_broker_claim(&legacy, pid).await?;
+                            return Ok(());
+                        }
+                        if has_endpoint_artifact
+                            || process_looks_like_broker_for_state(pid, &legacy.state_dir)
+                        {
+                            bail!(
+                                "legacy v3 pid file names live process {pid}, but it could not be verified at {}; refusing to kill it or start a second broker: {connect_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        }
+                    }
+
+                    cleanup_stale_endpoint(&legacy).with_context(|| {
+                        format!(
+                            "failed to clean retired v3 broker after connection error: {connect_error:#}"
+                        )
+                    })?;
+                    if legacy.pid_path.exists() {
+                        let _ = fs::remove_file(&legacy.pid_path);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for legacy broker startup lock `{}`",
+                legacy.lock_path.display()
+            );
+        }
+        sleep(BROKER_CONNECT_RETRY).await;
+    }
+}
+
+fn process_looks_like_broker_for_state(pid: u32, state_dir: &Path) -> bool {
+    let Some(command_line) = process_command_line(pid) else {
+        return false;
+    };
+    command_line_looks_like_broker_for_state(&command_line, state_dir)
+}
+
+fn command_line_looks_like_broker_for_state(command_line: &str, state_dir: &Path) -> bool {
+    let command_line = command_line.to_ascii_lowercase();
+    let state_dir = state_dir.to_string_lossy().to_ascii_lowercase();
+    command_line.contains("visible-browser-lab-mcp")
+        && command_line
+            .split_whitespace()
+            .any(|argument| argument.trim_matches(|c| c == '\'' || c == '"') == "broker")
+        && command_line.contains("--state-dir")
+        && command_line.contains(&state_dir)
+}
+
+fn process_matches_broker_endpoint(pid: u32, state_dir: &Path, endpoint: &str) -> bool {
+    let Some(command_line) = process_command_line(pid) else {
+        return false;
+    };
+    command_line_looks_like_broker_for_state(&command_line, state_dir)
+        && command_line.to_ascii_lowercase().contains("--socket")
+        && command_line
+            .to_ascii_lowercase()
+            .contains(&endpoint.to_ascii_lowercase())
+}
+
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
+}
+
+#[cfg(windows)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let query = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; if ($null -ne $p) {{ $p.CommandLine }}"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
 }
 
 pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
@@ -1866,7 +2076,11 @@ async fn restart_incompatible_broker(
         reason = %message,
         "restarting incompatible visible browser broker"
     );
-    terminate_process(status.pid).await?;
+    terminate_broker_claim(config, status.pid).await
+}
+
+async fn terminate_broker_claim(config: &RuntimeConfig, pid: u32) -> Result<()> {
+    terminate_process(pid).await?;
     let endpoint = broker_endpoint(config)?;
     if let Some(stale_path) = endpoint.stale_path() {
         let _ = fs::remove_file(stale_path);
@@ -2278,10 +2492,15 @@ async fn handle_connection(
 async fn dispatch_request(
     config: &RuntimeConfig,
     state: &BrokerState,
-    request: BrokerRequest,
+    mut request: BrokerRequest,
 ) -> BrokerResponse {
-    touch_request_session(state, &request);
-    let session_id = request_session_id(&request);
+    let (session_id, start_mode) = match resolve_request_session(state, &mut request) {
+        Ok(resolution) => resolution,
+        Err(error) => return BrokerResponse::error(request.id, error),
+    };
+    if let Some(session_id) = &session_id {
+        state.registry().lock().unwrap().touch(session_id);
+    }
     // Mark the session in flight for the duration of this request so the
     // expiry sweep cannot remove it mid-request; the guard un-marks on drop,
     // including on panic unwind.
@@ -2293,7 +2512,15 @@ async fn dispatch_request(
         "ping" => broker_response(request.id, broker_status(config, state).await),
         "start_session" => broker_response(
             request.id,
-            broker_start_session(state, parse_params(request.params)).await,
+            broker_start_session_with_mode(
+                state,
+                parse_params(request.params),
+                (start_mode == Some(SessionGovernanceMode::Ambient))
+                    .then_some(session_id.clone())
+                    .flatten(),
+                start_mode.unwrap_or(SessionGovernanceMode::Explicit),
+            )
+            .await,
         ),
         "list_tabs" => broker_response(
             request.id,
@@ -2410,16 +2637,183 @@ async fn dispatch_request(
     response
 }
 
-/// Refresh the requesting session's last-touch time before dispatch. Any
-/// request that names a session counts as using it, which is what keeps the
-/// idle-exit veto (and, once it ships, session expiry) honest for sessions
-/// that interact without changing tab ownership.
-fn touch_request_session(state: &BrokerState, request: &BrokerRequest) {
-    let Some(session_id) = request_session_id(request) else {
-        return;
+fn resolve_request_session(
+    state: &BrokerState,
+    request: &mut BrokerRequest,
+) -> Result<(Option<AgentSessionId>, Option<SessionGovernanceMode>), BrowserToolError> {
+    if request.method == "ping" || !known_broker_method(&request.method) {
+        return Ok((None, None));
+    }
+
+    let context = request.context.clone().unwrap_or_default();
+    if request.method == "start_session" {
+        if let Some(identity) = context.conversation_identity {
+            let params: StartSessionParams = parse_params(request.params.clone())?;
+            let session = resolve_ambient_session(
+                state,
+                identity,
+                params.label,
+                context.workspace_root,
+                false,
+            )?;
+            return Ok((
+                Some(session.agent_session_id),
+                Some(SessionGovernanceMode::Ambient),
+            ));
+        }
+
+        if let Some(workspace_root) = context.workspace_root {
+            request_params_object_mut(request)?.insert(
+                "workspace_root".to_string(),
+                Value::String(workspace_root.to_string_lossy().into_owned()),
+            );
+        }
+        return Ok((None, Some(SessionGovernanceMode::Explicit)));
+    }
+
+    let session_id = match request.params.get("agent_session_id") {
+        Some(Value::String(session_id)) if session_id.is_empty() => {
+            return Err(BrowserToolError::invalid_input(
+                "agent_session_id must be a non-empty string",
+            ));
+        }
+        Some(Value::String(session_id)) => AgentSessionId(session_id.clone()),
+        Some(_) => {
+            return Err(BrowserToolError::invalid_input(
+                "agent_session_id must be a non-empty string",
+            ));
+        }
+        None => {
+            let identity = context
+                .conversation_identity
+                .ok_or_else(BrowserToolError::session_required)?;
+            let session = resolve_ambient_session(
+                state,
+                identity,
+                None,
+                context.workspace_root.clone(),
+                workspace_sensitive_request(request),
+            )?;
+            request_params_object_mut(request)?.insert(
+                "agent_session_id".to_string(),
+                Value::String(session.agent_session_id.0.clone()),
+            );
+            session.agent_session_id
+        }
     };
 
-    state.registry().lock().unwrap().touch(&session_id);
+    validate_workspace_context(state, &session_id, request, context.workspace_root.as_ref())?;
+    Ok((Some(session_id), None))
+}
+
+fn resolve_ambient_session(
+    state: &BrokerState,
+    identity: crate::conversation_identity::ConversationIdentity,
+    label: Option<String>,
+    observed_workspace: Option<PathBuf>,
+    workspace_required: bool,
+) -> Result<BrowserSession, BrowserToolError> {
+    if let Some(session) = state
+        .registry()
+        .lock()
+        .unwrap()
+        .touch_session_for_identity(&identity)
+    {
+        return Ok(session);
+    }
+
+    let workspace_root = match observed_workspace {
+        Some(workspace_root) if workspace_required => {
+            Some(canonical_workspace_root(workspace_root)?)
+        }
+        Some(workspace_root) => canonical_workspace_root(workspace_root).ok(),
+        None => None,
+    };
+    Ok(state
+        .registry()
+        .lock()
+        .unwrap()
+        .ambient_session(identity, label, workspace_root))
+}
+
+fn request_params_object_mut(
+    request: &mut BrokerRequest,
+) -> Result<&mut serde_json::Map<String, Value>, BrowserToolError> {
+    if request.params.is_null() {
+        request.params = Value::Object(serde_json::Map::new());
+    }
+    request
+        .params
+        .as_object_mut()
+        .ok_or_else(|| BrowserToolError::invalid_input("broker params must be an object"))
+}
+
+fn known_broker_method(method: &str) -> bool {
+    matches!(
+        method,
+        "start_session"
+            | "list_tabs"
+            | "new_tab"
+            | "claim_tab"
+            | "release_tab"
+            | "focus_tab"
+            | "navigate"
+            | "wait_for"
+            | "screenshot"
+            | "evaluate"
+            | "snapshot"
+            | "click"
+            | "fill"
+            | "fill_form"
+            | "type_text"
+            | "press_key"
+            | "interact"
+            | "console"
+            | "network"
+            | "emulation"
+            | "performance"
+            | "audit"
+            | "memory"
+            | "screencast"
+            | "artifacts"
+            | "close_tab"
+    )
+}
+
+fn validate_workspace_context(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    request: &BrokerRequest,
+    observed_workspace: Option<&PathBuf>,
+) -> Result<(), BrowserToolError> {
+    if !workspace_sensitive_request(request) {
+        return Ok(());
+    }
+    let Some(observed_workspace) = observed_workspace else {
+        return Ok(());
+    };
+    let observed_workspace = canonical_workspace_root(observed_workspace.clone())?;
+    state
+        .registry()
+        .lock()
+        .unwrap()
+        .bind_workspace_root(session_id, observed_workspace)
+}
+
+fn workspace_sensitive_request(request: &BrokerRequest) -> bool {
+    match request.method.as_str() {
+        "artifacts" => request.params.get("operation").and_then(Value::as_str) == Some("export"),
+        "interact" => match request.params.get("operation").and_then(Value::as_str) {
+            Some("upload_files") => true,
+            Some("drop") => request
+                .params
+                .get("paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| !paths.is_empty()),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Marks a session as having a request in flight; the expiry sweep skips
@@ -2455,14 +2849,6 @@ impl Drop for InFlightGuard {
             }
         }
     }
-}
-
-fn request_session_id(request: &BrokerRequest) -> Option<AgentSessionId> {
-    request
-        .params
-        .get("agent_session_id")
-        .and_then(Value::as_str)
-        .map(|id| AgentSessionId(id.to_string()))
 }
 
 fn parse_params<T>(params: serde_json::Value) -> Result<T, BrowserToolError>
@@ -2518,18 +2904,40 @@ fn strip_null_fields(value: &mut Value) {
     }
 }
 
+#[cfg(test)]
 async fn broker_start_session(
     state: &BrokerState,
     params: Result<StartSessionParams, BrowserToolError>,
 ) -> Result<StartSessionResult, BrowserToolError> {
+    broker_start_session_with_mode(state, params, None, SessionGovernanceMode::Explicit).await
+}
+
+async fn broker_start_session_with_mode(
+    state: &BrokerState,
+    params: Result<StartSessionParams, BrowserToolError>,
+    ambient_session_id: Option<AgentSessionId>,
+    mode: SessionGovernanceMode,
+) -> Result<StartSessionResult, BrowserToolError> {
     let params = params?;
-    let workspace_root = params
-        .workspace_root
-        .map(canonical_workspace_root)
-        .transpose()?;
-    let session = {
-        let mut registry = state.registry().lock().unwrap();
-        registry.start_session_with_workspace(params.label, workspace_root)
+    let session = match ambient_session_id {
+        Some(session_id) => state
+            .registry()
+            .lock()
+            .unwrap()
+            .session(&session_id)
+            .cloned()
+            .ok_or_else(|| BrowserToolError::unknown_session(&session_id))?,
+        None => {
+            let workspace_root = params
+                .workspace_root
+                .map(canonical_workspace_root)
+                .transpose()?;
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .start_session_with_workspace(params.label, workspace_root)
+        }
     };
 
     let tab = match params.start_url {
@@ -2541,6 +2949,7 @@ async fn broker_start_session(
 
     Ok(StartSessionResult {
         agent_session_id: session.agent_session_id,
+        mode,
         tab,
     })
 }
@@ -5974,7 +6383,7 @@ async fn broker_status(
         package_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         runtime_mode: config.runtime_mode,
-        cdp_endpoint: state.browser.resolved_endpoint().await?,
+        cdp_endpoint: state.browser.status_endpoint().await,
         ipc_endpoint: config.ipc_endpoint.clone(),
         socket_path: config.socket_path.clone(),
     })
@@ -6223,6 +6632,23 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn managed_broker_status_does_not_resolve_or_launch_chrome() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(
+            tempdir.path().join("state"),
+            Some(tempdir.path().join("missing-chrome")),
+        );
+        prepare_state(&config).await.unwrap();
+        let state = BrokerState::new(&config).unwrap();
+
+        let status = broker_status(&config, &state).await.unwrap();
+
+        assert_eq!(status.runtime_mode, RuntimeMode::Managed);
+        assert!(status.cdp_endpoint.is_empty());
+        assert!(!config.devtools_active_port_path.exists());
+    }
+
     #[test]
     fn tenancy_holds_while_claim_is_intact() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -6413,6 +6839,7 @@ mod tests {
                 "agent_session_id": session.agent_session_id.0,
                 "tab_id": "tab-nonexistent",
             }),
+            context: None,
         };
         dispatch_request(&config, &state, request).await;
 
@@ -6426,6 +6853,416 @@ mod tests {
         assert!(
             expired.is_empty(),
             "an interaction-shaped request should refresh its session even when it fails"
+        );
+    }
+
+    fn ambient_identity(id: &str) -> crate::conversation_identity::ConversationIdentity {
+        crate::conversation_identity::ConversationIdentity::new(1, "com.example.host", id).unwrap()
+    }
+
+    fn ambient_context(
+        id: &str,
+        workspace_root: Option<PathBuf>,
+    ) -> crate::protocol::BrokerRequestContext {
+        crate::protocol::BrokerRequestContext {
+            conversation_identity: Some(ambient_identity(id)),
+            workspace_root,
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_identity_reuses_one_session_and_isolates_conversations() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+
+        for (request_id, identity) in [("1", "first"), ("2", "first"), ("3", "second")] {
+            let response = dispatch_request(
+                &config,
+                &state,
+                BrokerRequest {
+                    id: request_id.to_string(),
+                    method: "list_tabs".to_string(),
+                    params: json!({}),
+                    context: Some(ambient_context(identity, None)),
+                },
+            )
+            .await;
+            assert!(
+                response.ok,
+                "ambient list_tabs failed: {:?}",
+                response.error
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains(identity));
+            assert!(!encoded.contains("agent_session_id"));
+        }
+
+        let registry = state.registry().lock().unwrap();
+        let first = registry
+            .session_for_identity(&ambient_identity("first"))
+            .unwrap();
+        let second = registry
+            .session_for_identity(&ambient_identity("second"))
+            .unwrap();
+        assert_ne!(first.agent_session_id, second.agent_session_id);
+    }
+
+    #[tokio::test]
+    async fn ambient_identity_accepts_omitted_params_as_an_empty_object() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let request: BrokerRequest = serde_json::from_value(json!({
+            "id": "1",
+            "method": "list_tabs",
+            "context": ambient_context("conversation", None)
+        }))
+        .unwrap();
+        assert!(request.params.is_null());
+
+        let response = dispatch_request(&config, &state, request).await;
+
+        assert!(
+            response.ok,
+            "ambient list_tabs failed: {:?}",
+            response.error
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ambient_conversations_mint_disjoint_sessions() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let first = BrokerRequest {
+            id: "1".to_string(),
+            method: "list_tabs".to_string(),
+            params: json!({}),
+            context: Some(ambient_context("first", None)),
+        };
+        let second = BrokerRequest {
+            id: "2".to_string(),
+            method: "list_tabs".to_string(),
+            params: json!({}),
+            context: Some(ambient_context("second", None)),
+        };
+        let (first_response, second_response) = tokio::join!(
+            dispatch_request(&config, &state, first),
+            dispatch_request(&config, &state, second),
+        );
+        assert!(first_response.ok);
+        assert!(second_response.ok);
+
+        let registry = state.registry().lock().unwrap();
+        assert_ne!(
+            registry
+                .session_for_identity(&ambient_identity("first"))
+                .unwrap()
+                .agent_session_id,
+            registry
+                .session_for_identity(&ambient_identity("second"))
+                .unwrap()
+                .agent_session_id,
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_precedes_ambient_identity() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let explicit = state.registry().lock().unwrap().start_session(None);
+        let identity = ambient_identity("ignored");
+
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({"agent_session_id":explicit.agent_session_id}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: Some(identity.clone()),
+                    workspace_root: None,
+                }),
+            },
+        )
+        .await;
+        assert!(response.ok);
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&identity)
+                .is_none()
+        );
+
+        let malformed = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({"agent_session_id":42}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: Some(identity.clone()),
+                    workspace_root: None,
+                }),
+            },
+        )
+        .await;
+        assert_eq!(
+            malformed.error.unwrap().code,
+            BrowserToolErrorCode::InvalidInput
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&identity)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_identity_requires_the_explicit_session_workflow() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let workspace = tempfile::tempdir().unwrap();
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({}),
+                context: Some(crate::protocol::BrokerRequestContext {
+                    conversation_identity: None,
+                    workspace_root: Some(workspace.path().to_path_buf()),
+                }),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.unwrap().code,
+            BrowserToolErrorCode::SessionRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_start_session_reuses_the_binding_and_retains_the_legacy_handle() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let mut handles = Vec::new();
+        for (request_id, label) in [("1", "first label"), ("2", "ignored label")] {
+            let response = dispatch_request(
+                &config,
+                &state,
+                BrokerRequest {
+                    id: request_id.to_string(),
+                    method: "start_session".to_string(),
+                    params: json!({"label":label}),
+                    context: Some(ambient_context("conversation", None)),
+                },
+            )
+            .await;
+            assert!(response.ok);
+            let result = response.result.unwrap();
+            assert_eq!(result["mode"], "ambient");
+            handles.push(result["agent_session_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(handles[0], handles[1]);
+        assert_eq!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("first label")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_start_session_stays_available_without_ambient_identity() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let response = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "start_session".to_string(),
+                params: json!({}),
+                context: None,
+            },
+        )
+        .await;
+        assert!(response.ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["mode"], "explicit");
+        assert!(result["agent_session_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_conflicts_only_block_workspace_sensitive_operations() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let initial = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(first.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_ne!(
+            initial.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
+        );
+
+        let ordinary = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_ne!(
+            ordinary.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
+        );
+
+        let unavailable_observation = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2b".to_string(),
+                method: "snapshot".to_string(),
+                params: json!({"tab_id":"missing"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().join("missing-directory")),
+                )),
+            },
+        )
+        .await;
+        let error = unavailable_observation.error.unwrap();
+        assert_ne!(error.code, BrowserToolErrorCode::WorkspaceContextConflict);
+        assert_ne!(error.code, BrowserToolErrorCode::WorkspaceUnavailable);
+
+        let sensitive = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "3".to_string(),
+                method: "artifacts".to_string(),
+                params: json!({"operation":"export","artifact_id":"missing","path":"out"}),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(second.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_eq!(
+            sensitive.error.unwrap().code,
+            BrowserToolErrorCode::WorkspaceContextConflict
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ambient_non_file_call_ignores_unavailable_workspace_and_binds_later() {
+        let config = test_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        let state = fake_state(Vec::new());
+        let unavailable_root = tempfile::tempdir().unwrap().path().join("missing");
+
+        let ordinary = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "1".to_string(),
+                method: "list_tabs".to_string(),
+                params: json!({}),
+                context: Some(ambient_context("conversation", Some(unavailable_root))),
+            },
+        )
+        .await;
+        assert!(
+            ordinary.ok,
+            "ordinary ambient call failed: {:?}",
+            ordinary.error
+        );
+        assert!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .workspace_root
+                .is_none()
+        );
+
+        let available_root = tempfile::tempdir().unwrap();
+        let canonical_root = available_root.path().canonicalize().unwrap();
+        let sensitive = dispatch_request(
+            &config,
+            &state,
+            BrokerRequest {
+                id: "2".to_string(),
+                method: "artifacts".to_string(),
+                params: json!({
+                    "operation":"export",
+                    "artifact_id":"missing",
+                    "path":"out"
+                }),
+                context: Some(ambient_context(
+                    "conversation",
+                    Some(available_root.path().to_path_buf()),
+                )),
+            },
+        )
+        .await;
+        assert_eq!(
+            sensitive.error.unwrap().code,
+            BrowserToolErrorCode::ArtifactNotFound
+        );
+        assert_eq!(
+            state
+                .registry()
+                .lock()
+                .unwrap()
+                .session_for_identity(&ambient_identity("conversation"))
+                .unwrap()
+                .workspace_root
+                .as_deref(),
+            Some(canonical_root.as_path())
         );
     }
 
@@ -6670,6 +7507,208 @@ mod tests {
         if let Some(path) = &stale_path {
             assert!(!path.exists(), "stale socket file should be removed");
         }
+    }
+
+    #[test]
+    fn legacy_broker_config_targets_v3_runtime_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+
+        let legacy = legacy_broker_config(&config);
+
+        assert_eq!(legacy.socket_path, config.state_dir.join("broker-v3.sock"));
+        assert_eq!(legacy.lock_path, config.state_dir.join("broker-v3.lock"));
+        assert_eq!(legacy.pid_path, config.state_dir.join("broker-v3.pid"));
+        if cfg!(windows) {
+            assert!(legacy.ipc_endpoint.starts_with("visible-browser-lab-v3-"));
+        } else {
+            assert_eq!(
+                legacy.ipc_endpoint,
+                config.state_dir.join("broker-v3.sock").to_string_lossy()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_terminates_a_running_v3_daemon() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        // The fake v3 endpoint speaks just enough of the shared ping protocol
+        // to identify a separate long-lived process as the daemon to retire.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        let status = BrokerStatus {
+            protocol_version: LEGACY_BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.5".to_string(),
+            pid,
+            runtime_mode: legacy.runtime_mode,
+            cdp_endpoint: legacy.cdp_endpoint.clone().unwrap(),
+            ipc_endpoint: legacy.ipc_endpoint.clone(),
+            socket_path: legacy.socket_path.clone(),
+        };
+        let server = tokio::spawn(async move {
+            let stream = ipc::accept(&listener).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: BrokerRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "ping");
+            assert!(request.context.is_none());
+            let response = BrokerResponse::success(request.id, status).unwrap();
+            let encoded = serde_json::to_string(&response).unwrap();
+            stream
+                .get_mut()
+                .write_all(encoded.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            stream.get_mut().flush().await.unwrap();
+        });
+
+        retire_legacy_broker(&config).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!process_is_alive(pid), "v3 broker process should exit");
+        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
+        assert!(
+            !legacy.socket_path.exists(),
+            "v3 socket file should be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_terminates_a_live_daemon_when_ping_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        let marker = format!(
+            "visible-browser-lab-mcp broker --socket {} --state-dir {}",
+            legacy.ipc_endpoint,
+            config.state_dir.display()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", &marker])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let stream = ipc::accept(&listener).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: BrokerRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "ping");
+            let response = BrokerResponse::error(
+                request.id,
+                BrowserToolError::chrome_unavailable("legacy managed Chrome is unavailable"),
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            stream
+                .get_mut()
+                .write_all(encoded.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            stream.get_mut().flush().await.unwrap();
+        });
+
+        retire_legacy_broker(&config).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!process_is_alive(pid), "unhealthy v3 broker should exit");
+        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
+        assert!(
+            !legacy.socket_path.exists(),
+            "v3 socket file should be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_refuses_to_kill_v4_from_a_stale_v3_pid() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let marker = format!(
+            "visible-browser-lab-mcp broker --socket {} --state-dir {}",
+            config.ipc_endpoint,
+            config.state_dir.display()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", &marker])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        assert!(
+            process_looks_like_broker_for_state(pid, &config.state_dir),
+            "test daemon command line was not recognized"
+        );
+        assert!(
+            !legacy.socket_path.exists(),
+            "the default v3 socket must be absent in this regression"
+        );
+
+        let error = retire_legacy_broker(&config).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("endpoint-unverified process"),
+            "unexpected v4-process refusal: {error:#}"
+        );
+        assert!(
+            process_is_alive(pid),
+            "v4 process named by a stale v3 pid file must not be killed"
+        );
+        assert!(
+            legacy.pid_path.exists(),
+            "ambiguous live pid claim must remain for diagnosis"
+        );
+
+        terminate_process(pid).await.unwrap();
+        fs::remove_file(&legacy.pid_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retire_legacy_broker_cleans_pid_only_state_without_killing_the_named_process() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        fs::write(&legacy.pid_path, std::process::id().to_string()).unwrap();
+
+        retire_legacy_broker(&config).await.unwrap();
+
+        assert!(process_is_alive(std::process::id()));
+        assert!(
+            !legacy.pid_path.exists(),
+            "pid-only v3 state should be removed without trusting the reused pid"
+        );
     }
 
     #[test]

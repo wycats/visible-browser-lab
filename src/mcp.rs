@@ -2,6 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     config::RuntimeConfig,
+    conversation_identity::{ConversationIdentityCompatibility, normalize_metadata},
+    leases::BrowserToolError,
+    protocol::BrokerRequestContext,
     surface::{SurfaceToolResult, VisibleBrowserLabSurface},
 };
 use agent_surface_contract::SERVER_INSTRUCTIONS;
@@ -22,10 +25,14 @@ const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 struct VisibleBrowserLab {
     surface: VisibleBrowserLabSurface,
     tools: Arc<Vec<Tool>>,
+    conversation_identity_compatibility: ConversationIdentityCompatibility,
 }
 
 impl VisibleBrowserLab {
-    fn new(config: RuntimeConfig) -> Result<Self> {
+    fn new(
+        config: RuntimeConfig,
+        conversation_identity_compatibility: ConversationIdentityCompatibility,
+    ) -> Result<Self> {
         let surface = VisibleBrowserLabSurface::new(config)?;
         let tools = surface
             .tools()
@@ -38,6 +45,7 @@ impl VisibleBrowserLab {
         Ok(Self {
             surface,
             tools: Arc::new(tools),
+            conversation_identity_compatibility,
         })
     }
 }
@@ -71,17 +79,34 @@ impl ServerHandler for VisibleBrowserLab {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
+        let request_context =
+            match broker_request_context(&context.meta, self.conversation_identity_compatibility) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(call_tool_result(SurfaceToolResult::structured_error(
+                        serde_json::to_value(error).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "code":"invalid_request_context",
+                                "message":"invalid conversation identity metadata"
+                            })
+                        }),
+                    )));
+                }
+            };
         let result = self
             .surface
-            .call_tool(name, arguments, workspace_root(&context.meta))
+            .call_tool(name, arguments, request_context)
             .await;
 
         Ok(call_tool_result(result))
     }
 }
 
-pub async fn run(config: RuntimeConfig) -> Result<()> {
-    let server = VisibleBrowserLab::new(config)?;
+pub async fn run(
+    config: RuntimeConfig,
+    conversation_identity_compatibility: ConversationIdentityCompatibility,
+) -> Result<()> {
+    let server = VisibleBrowserLab::new(config, conversation_identity_compatibility)?;
     server.serve(stdio()).await?.waiting().await?;
     Ok(())
 }
@@ -93,11 +118,25 @@ fn call_tool_result(result: SurfaceToolResult) -> CallToolResult {
     }
 }
 
-fn workspace_root(meta: &Meta) -> Option<String> {
+fn workspace_root(meta: &Meta) -> Option<std::path::PathBuf> {
     codex_workspace_cwd(meta)
-        .map(ToOwned::to_owned)
-        .or_else(|| non_empty_env("CLAUDE_PROJECT_DIR"))
-        .or_else(|| non_empty_env("VISIBLE_BROWSER_LAB_WORKSPACE_ROOT"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| non_empty_env("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from))
+        .or_else(|| {
+            non_empty_env("VISIBLE_BROWSER_LAB_WORKSPACE_ROOT").map(std::path::PathBuf::from)
+        })
+}
+
+fn broker_request_context(
+    meta: &Meta,
+    compatibility: ConversationIdentityCompatibility,
+) -> Result<BrokerRequestContext, BrowserToolError> {
+    let conversation_identity = normalize_metadata(&meta.0, compatibility)
+        .map_err(|error| BrowserToolError::invalid_request_context(error.to_string()))?;
+    Ok(BrokerRequestContext {
+        conversation_identity,
+        workspace_root: workspace_root(meta),
+    })
 }
 
 fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
@@ -121,7 +160,11 @@ mod tests {
     #[test]
     fn advertises_core_contract_and_reads_codex_workspace_metadata() {
         let config = RuntimeConfig::managed(std::path::PathBuf::from("/tmp/vbl-mcp"), None);
-        let server = VisibleBrowserLab::new(config).unwrap();
+        let server = VisibleBrowserLab::new(
+            config,
+            ConversationIdentityCompatibility::TrustedCodexThreadId,
+        )
+        .unwrap();
         let info = server.get_info();
         assert_eq!(server.tools.len(), PRODUCTION_TOOLS.len());
         assert!(
@@ -140,5 +183,42 @@ mod tests {
             serde_json::json!({ "sandboxCwd": "/workspace/project" }),
         )]));
         assert_eq!(codex_workspace_cwd(&meta), Some("/workspace/project"));
+    }
+
+    #[test]
+    fn extracts_canonical_and_guarded_codex_conversation_identity() {
+        let canonical = Meta(serde_json::Map::from_iter([(
+            crate::conversation_identity::CONVERSATION_IDENTITY_META_KEY.to_string(),
+            serde_json::json!({"version":1,"issuer":"com.example.host","id":"conversation"}),
+        )]));
+        let context =
+            broker_request_context(&canonical, ConversationIdentityCompatibility::Disabled)
+                .unwrap();
+        assert_eq!(
+            context.conversation_identity.as_ref().unwrap().issuer(),
+            "com.example.host"
+        );
+
+        let codex = Meta(serde_json::Map::from_iter([(
+            "threadId".to_string(),
+            serde_json::json!("thread"),
+        )]));
+        assert!(
+            broker_request_context(&codex, ConversationIdentityCompatibility::Disabled)
+                .unwrap()
+                .conversation_identity
+                .is_none()
+        );
+        assert_eq!(
+            broker_request_context(
+                &codex,
+                ConversationIdentityCompatibility::TrustedCodexThreadId,
+            )
+            .unwrap()
+            .conversation_identity
+            .unwrap()
+            .issuer(),
+            "com.openai.codex"
+        );
     }
 }

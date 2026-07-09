@@ -6,6 +6,8 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::conversation_identity::ConversationIdentityCompatibility;
+
 pub const DEFAULT_CDP_ORIGIN: &str = "http://127.0.0.1";
 pub const RELEASE_VERSION: &str = match option_env!("VISIBLE_BROWSER_LAB_RELEASE_VERSION") {
     Some(version) => version,
@@ -41,6 +43,14 @@ pub struct Cli {
 
     #[arg(long, global = true, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ConversationIdentityCompatibility::Disabled
+    )]
+    pub conversation_identity_compatibility: ConversationIdentityCompatibility,
 }
 
 #[derive(Debug, Subcommand)]
@@ -100,6 +110,9 @@ pub struct SurfaceCallArgs {
 
     #[arg(long, value_name = "DIR")]
     pub workspace_root: Option<PathBuf>,
+
+    #[arg(long, value_name = "VERSION")]
+    pub request_envelope_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,9 +195,9 @@ impl RuntimeConfig {
             runtime_mode: RuntimeMode::External,
             cdp_endpoint: Some(cdp_endpoint),
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
-            socket_path: state_dir.join("broker-v3.sock"),
-            lock_path: state_dir.join("broker-v3.lock"),
-            pid_path: state_dir.join("broker-v3.pid"),
+            socket_path: state_dir.join("broker-v4.sock"),
+            lock_path: state_dir.join("broker-v4.lock"),
+            pid_path: state_dir.join("broker-v4.pid"),
             log_dir: state_dir.join("logs"),
             devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
             chrome_lock_path: state_dir.join("chrome-launch.lock"),
@@ -202,9 +215,9 @@ impl RuntimeConfig {
             runtime_mode: RuntimeMode::Managed,
             cdp_endpoint: None,
             ipc_endpoint: derive_ipc_endpoint(&state_dir),
-            socket_path: state_dir.join("broker-v3.sock"),
-            lock_path: state_dir.join("broker-v3.lock"),
-            pid_path: state_dir.join("broker-v3.pid"),
+            socket_path: state_dir.join("broker-v4.sock"),
+            lock_path: state_dir.join("broker-v4.lock"),
+            pid_path: state_dir.join("broker-v4.pid"),
             log_dir: state_dir.join("logs"),
             devtools_active_port_path: chrome_profile_dir.join("DevToolsActivePort"),
             chrome_lock_path: state_dir.join("chrome-launch.lock"),
@@ -370,7 +383,7 @@ mod tests {
 
         assert_eq!(
             config.socket_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.sock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v4.sock")
         );
         if cfg!(windows) {
             assert!(config.ipc_endpoint.starts_with("visible-browser-lab-"));
@@ -378,16 +391,16 @@ mod tests {
         } else {
             assert_eq!(
                 config.ipc_endpoint,
-                "/tmp/visible-browser-lab-test/broker-v3.sock"
+                "/tmp/visible-browser-lab-test/broker-v4.sock"
             );
         }
         assert_eq!(
             config.lock_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.lock")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v4.lock")
         );
         assert_eq!(
             config.pid_path,
-            PathBuf::from("/tmp/visible-browser-lab-test/broker-v3.pid")
+            PathBuf::from("/tmp/visible-browser-lab-test/broker-v4.pid")
         );
         assert_eq!(
             config.log_dir,
@@ -438,6 +451,26 @@ mod tests {
         };
 
         assert_eq!(args.socket.as_deref(), Some("/tmp/lab.sock"));
+    }
+
+    #[test]
+    fn trusted_codex_compatibility_is_an_explicit_global_option() {
+        let default = Cli::try_parse_from(["visible-browser-lab-mcp"]).unwrap();
+        assert_eq!(
+            default.conversation_identity_compatibility,
+            ConversationIdentityCompatibility::Disabled
+        );
+
+        let trusted = Cli::try_parse_from([
+            "visible-browser-lab-mcp",
+            "--conversation-identity-compatibility",
+            "trusted-codex-thread-id",
+        ])
+        .unwrap();
+        assert_eq!(
+            trusted.conversation_identity_compatibility,
+            ConversationIdentityCompatibility::TrustedCodexThreadId
+        );
     }
 
     #[test]

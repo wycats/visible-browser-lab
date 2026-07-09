@@ -40,7 +40,20 @@ export async function run(): Promise<void> {
     throw new Error(`help returned an unexpected payload: ${text.slice(0, 200)}`);
   }
 
+  let explicitFallbackObserved = false;
+  try {
+    await vscode.lm.invokeTool("visible_browser_lab_list_tabs", {
+      input: {},
+      toolInvocationToken: undefined,
+    });
+  } catch (error) {
+    explicitFallbackObserved = String(error).includes("session_required");
+  }
+  if (!explicitFallbackObserved) {
+    throw new Error("global tool invocation did not fall back to session_required");
+  }
+
   console.log(
-    `extension-host smoke: ${contributed.length} tools registered; help preferred ${payload.preferred.tool}`,
+    `extension-host smoke: ${contributed.length} tools registered; help preferred ${payload.preferred.tool}; global fallback session_required`,
   );
 }

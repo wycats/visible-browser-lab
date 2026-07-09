@@ -125,7 +125,7 @@ impl EvaluationServer {
         }
         if name != "start_session" && name != "help" {
             let session = arguments.get("agent_session_id").and_then(Value::as_str);
-            if session != Some("session_eval") {
+            if session.is_some_and(|session| session != "session_eval") {
                 return CallToolResult::structured_error(
                     json!({"code":"unknown_session","message":"Use the agent_session_id returned by start_session."}),
                 );
@@ -181,6 +181,7 @@ fn tool_response(
     match name {
         "start_session" => json!({
             "agent_session_id": "session_eval",
+            "mode": "explicit",
             "tab": tab_summary()
         }),
         "list_tabs"

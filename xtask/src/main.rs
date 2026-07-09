@@ -22,6 +22,10 @@ mod agent_eval;
 const BINARY_NAME: &str = "visible-browser-lab-mcp";
 const DEFAULT_OUT_DIR: &str = "out/packages";
 const RELEASE_VERSION_ENV: &str = "VISIBLE_BROWSER_LAB_RELEASE_VERSION";
+const CODEX_MCP_ARGS: &[&str] = &[
+    "--conversation-identity-compatibility",
+    "trusted-codex-thread-id",
+];
 const RUNTIME_ENV_VARS: &[&str] = &[
     "VISIBLE_BROWSER_LAB_STATE_DIR",
     "VISIBLE_BROWSER_LAB_CHROME_PATH",
@@ -886,7 +890,7 @@ fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
     format!(
-        "{} Backed by Visible Browser Lab's shared broker surface. Use start_session first and pass only tab_id values owned by that session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "{} Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         tool.description
     )
 }
@@ -1223,7 +1227,7 @@ fn install_smoke(args: InstallSmokeArgs) -> Result<()> {
                 active_port.display()
             );
         }
-        if !state_dir.join("broker-v3.pid").is_file() {
+        if !state_dir.join("broker-v4.pid").is_file() {
             bail!(
                 "broker did not use the disposable state directory `{}`",
                 state_dir.display()
@@ -1447,6 +1451,9 @@ fn validate_installed_codex_package(
     if Path::new(command).is_absolute() || Path::new(cwd).is_absolute() {
         bail!("installed Codex MCP config must resolve from the plugin root");
     }
+    if server["args"] != json!(CODEX_MCP_ARGS) {
+        bail!("installed Codex MCP config omitted trusted Codex compatibility policy");
+    }
     if server["env_vars"] != json!(RUNTIME_ENV_VARS) {
         bail!("installed Codex MCP config omitted runtime environment overrides");
     }
@@ -1486,6 +1493,9 @@ fn run_installed_facade_lifecycle(
         Duration::from_secs(45),
         false,
     )?;
+    if session["mode"].as_str() != Some("explicit") {
+        bail!("installed explicit start_session did not report explicit mode");
+    }
     let session_id = field_str(&session, "agent_session_id")?;
     let tab = OpenTab::from_summary(
         &session_id,
@@ -1553,7 +1563,7 @@ fn run_model_invocation(
     state_dir: &Path,
     chrome_path: &Path,
 ) -> Result<()> {
-    let prompt = "Use only the visible-browser-lab MCP tools. Call start_session with focus false and a data: page whose title is Visible Browser Lab Codex Smoke. Call default list_tabs with the returned agent_session_id, evaluate document.title with the returned tab_id, then close_tab. Return the observed title and confirm the tab was closed. Do not use shell commands or browser fallbacks.";
+    let prompt = "Use only the visible-browser-lab MCP tools. Do not call start_session and do not supply agent_session_id. Call new_tab with focus false and a data: page whose title is Visible Browser Lab Codex Smoke. Call default list_tabs, evaluate document.title with the returned tab_id, then close_tab with that tab_id. Return the observed title and confirm the tab was closed. Do not use shell commands or browser fallbacks.";
     let mut command = isolated_codex_command(
         codex,
         [
@@ -1603,6 +1613,9 @@ fn validate_codex_invocation_events(events: &str) -> Result<()> {
         if !item["error"].is_null() || item["status"].as_str() != Some("completed") {
             bail!("Codex facade tool call did not complete: {item}");
         }
+        if item.to_string().contains("agent_session_id") {
+            bail!("Codex ambient tool call exposed agent_session_id: {item}");
+        }
         completed_tools.push(
             item["tool"]
                 .as_str()
@@ -1611,7 +1624,7 @@ fn validate_codex_invocation_events(events: &str) -> Result<()> {
         );
     }
 
-    let expected = ["start_session", "list_tabs", "evaluate", "close_tab"];
+    let expected = ["new_tab", "list_tabs", "evaluate", "close_tab"];
     if completed_tools != expected {
         bail!("Codex completed facade tool sequence {completed_tools:?}; expected {expected:?}");
     }
@@ -1762,6 +1775,12 @@ fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBu
             dist.join("extension.js").display()
         );
     }
+    if !dist.join("invocation_context.js").is_file() {
+        bail!(
+            "extension invocation-context module not found at `{}`. Run `pnpm build` first.",
+            dist.join("invocation_context.js").display()
+        );
+    }
     Ok(dist)
 }
 
@@ -1883,6 +1902,12 @@ fn write_vsix_archive(
     )?;
     add_file(
         &mut zip,
+        "extension/dist/invocation_context.js",
+        &extension_dist.join("invocation_context.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
         &format!("extension/bin/{binary_name}"),
         binary,
         executable_mode(target),
@@ -1939,6 +1964,7 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension.vsixmanifest",
         "extension/package.json",
         "extension/dist/extension.js",
+        "extension/dist/invocation_context.js",
         "extension/skills/visible-browser-lab/SKILL.md",
     ] {
         if !names.iter().any(|name| name == required) {
@@ -2210,9 +2236,14 @@ fn mcp_config_bytes(host: &AgentHost, binary_name: &str) -> Result<Vec<u8>> {
             "${CLAUDE_PLUGIN_ROOT}".to_string(),
         ),
     };
+    let args: &[&str] = if host.plugin_format == PluginFormat::Codex {
+        CODEX_MCP_ARGS
+    } else {
+        &[]
+    };
     let mut server = json!({
         "command": command,
-        "args": [],
+        "args": args,
         "cwd": cwd,
     });
     if host.plugin_format == PluginFormat::Codex {
@@ -2276,6 +2307,7 @@ fn validate_source_package_contract(root: &Path) -> Result<()> {
     let server = &mcp["mcpServers"]["visible-browser-lab"];
     if server["command"].as_str() != Some("./scripts/visible-browser-lab-mcp.sh")
         || server["cwd"].as_str() != Some(".")
+        || server["args"] != json!(CODEX_MCP_ARGS)
         || server["env_vars"] != json!(RUNTIME_ENV_VARS)
     {
         bail!("source MCP config must preserve plugin-root and runtime environment contracts");
@@ -2450,11 +2482,14 @@ fn validate_plugin_archive(path: &Path) -> Result<()> {
             "${CLAUDE_PLUGIN_ROOT}".to_string(),
         ),
     };
+    let expected_args: &[&str] = if host.plugin_format == PluginFormat::Codex {
+        CODEX_MCP_ARGS
+    } else {
+        &[]
+    };
     if server["command"].as_str() != Some(&expected_command)
         || server["cwd"].as_str() != Some(&expected_cwd)
-        || server["args"]
-            .as_array()
-            .is_none_or(|args| !args.is_empty())
+        || server["args"] != json!(expected_args)
     {
         bail!(
             "archive `{}` does not resolve its MCP binary from the installed plugin root",
@@ -2811,7 +2846,7 @@ mod tests {
             &["target/"]
         ));
         assert!(is_temp_broker_line(
-            "123 visible-browser-lab-mcp broker --socket /tmp/x/broker-v3.sock --state-dir /tmp/x",
+            "123 visible-browser-lab-mcp broker --socket /tmp/x/broker-v4.sock --state-dir /tmp/x",
             &markers
         ));
         // A path component containing "broker" is not the broker subcommand.
@@ -2860,6 +2895,7 @@ mod tests {
         let codex_server = &codex["mcpServers"]["visible-browser-lab"];
         assert_eq!(codex_server["command"], "./bin/visible-browser-lab-mcp");
         assert_eq!(codex_server["cwd"], ".");
+        assert_eq!(codex_server["args"], json!(CODEX_MCP_ARGS));
         assert_eq!(codex_server["env_vars"], json!(RUNTIME_ENV_VARS));
 
         for host in &AGENT_HOSTS[1..] {
@@ -2872,6 +2908,7 @@ mod tests {
                 "${CLAUDE_PLUGIN_ROOT}/bin/visible-browser-lab-mcp"
             );
             assert_eq!(server["cwd"], "${CLAUDE_PLUGIN_ROOT}");
+            assert_eq!(server["args"], json!([]));
         }
     }
 
@@ -2895,6 +2932,7 @@ mod tests {
         let dist = output.path().join("dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(dist.join("extension.js"), b"// bundle").unwrap();
+        fs::write(dist.join("invocation_context.js"), b"// context module").unwrap();
         let vsix = output.path().join(format!(
             "visible-browser-lab-vscode-{version}-{target}.vsix"
         ));
@@ -2938,7 +2976,7 @@ mod tests {
 
     #[test]
     fn codex_invocation_requires_only_the_expected_facade_sequence() {
-        let events = ["start_session", "list_tabs", "evaluate", "close_tab"]
+        let events = ["new_tab", "list_tabs", "evaluate", "close_tab"]
             .map(|tool| {
                 json!({
                     "type": "item.completed",

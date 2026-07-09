@@ -1,3 +1,43 @@
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::Result;
+use serde_json::json;
+use visible_browser_lab_test_support::McpClient;
+
+#[test]
+fn identity_free_managed_call_requires_a_session_without_launching_chrome() -> Result<()> {
+    let state = tempfile::tempdir()?;
+    let missing_chrome = state.path().join("missing-chrome");
+    let mut client =
+        McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &missing_chrome)?;
+    client.initialize("visible-browser-lab-managed-fallback")?;
+
+    let error = client.call_tool("list_tabs", json!({}), Duration::from_secs(20), true)?;
+
+    assert_eq!(
+        error.get("code").and_then(|value| value.as_str()),
+        Some("session_required"),
+        "identity-free managed call returned an unexpected error: {error}"
+    );
+    assert!(
+        !state
+            .path()
+            .join("chrome-profile/DevToolsActivePort")
+            .exists(),
+        "identity fallback must not launch managed Chrome"
+    );
+    client.shutdown();
+    Ok(())
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn test_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_visible-browser-lab-mcp"))
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{
@@ -365,7 +405,7 @@ mod macos {
     }
 
     fn terminate_broker(state_dir: &Path) -> Result<()> {
-        let pid = fs::read_to_string(state_dir.join("broker-v3.pid"))?
+        let pid = fs::read_to_string(state_dir.join("broker-v4.pid"))?
             .trim()
             .parse::<i32>()?;
         unsafe {

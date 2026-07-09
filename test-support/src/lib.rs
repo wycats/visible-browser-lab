@@ -1743,13 +1743,18 @@ where
 }
 
 pub fn stop_broker(state_dir: &Path) {
-    let pid = ["broker-v3.pid", "broker-v2.pid", "broker.pid"]
-        .into_iter()
-        .find_map(|name| {
-            fs::read_to_string(state_dir.join(name))
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok())
-        });
+    let pid = [
+        "broker-v4.pid",
+        "broker-v3.pid",
+        "broker-v2.pid",
+        "broker.pid",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        fs::read_to_string(state_dir.join(name))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+    });
     let Some(pid) = pid else {
         return;
     };

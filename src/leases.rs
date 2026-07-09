@@ -8,6 +8,8 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::conversation_identity::ConversationIdentity;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AgentSessionId(pub String);
@@ -158,12 +160,40 @@ impl BrowserToolError {
             recovery: Some(RecoveryAction::StartChrome),
         }
     }
+
+    pub fn invalid_request_context(message: impl Into<String>) -> Self {
+        Self {
+            code: BrowserToolErrorCode::InvalidRequestContext,
+            message: message.into(),
+            recovery: None,
+        }
+    }
+
+    pub fn session_required() -> Self {
+        Self {
+            code: BrowserToolErrorCode::SessionRequired,
+            message: "this host supplied no conversation identity; call start_session and pass its agent_session_id"
+                .to_string(),
+            recovery: Some(RecoveryAction::StartSession),
+        }
+    }
+
+    pub fn workspace_context_conflict() -> Self {
+        Self {
+            code: BrowserToolErrorCode::WorkspaceContextConflict,
+            message: "the current host workspace conflicts with the workspace bound to this browser session"
+                .to_string(),
+            recovery: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserToolErrorCode {
     ChromeUnavailable,
+    InvalidRequestContext,
+    SessionRequired,
     UnknownSession,
     SessionExpired,
     UnknownTab,
@@ -181,6 +211,7 @@ pub enum BrowserToolErrorCode {
     ArtifactNotFound,
     ArtifactError,
     WorkspaceUnavailable,
+    WorkspaceContextConflict,
     PathOutsideWorkspace,
 }
 
@@ -353,6 +384,8 @@ const EXPIRED_SESSION_TOMBSTONE_CAP: usize = 1024;
 #[derive(Debug, Default)]
 pub struct LeaseRegistry {
     sessions: HashMap<AgentSessionId, BrowserSession>,
+    ambient_sessions: HashMap<ConversationIdentity, AgentSessionId>,
+    ambient_identities: HashMap<AgentSessionId, ConversationIdentity>,
     leases: HashMap<TabId, TabLease>,
     active_target_owners: HashMap<String, TabId>,
     /// Sessions removed by the expiry sweep, with how long each sat idle.
@@ -411,8 +444,66 @@ impl LeaseRegistry {
         session
     }
 
+    pub fn ambient_session(
+        &mut self,
+        identity: ConversationIdentity,
+        label: Option<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> BrowserSession {
+        if let Some(session_id) = self.ambient_sessions.get(&identity)
+            && let Some(session) = self.sessions.get_mut(session_id)
+        {
+            session.updated_at_ms = now_ms();
+            return session.clone();
+        }
+
+        let session = self.start_session_with_workspace(label, workspace_root);
+        self.ambient_sessions
+            .insert(identity.clone(), session.agent_session_id.clone());
+        self.ambient_identities
+            .insert(session.agent_session_id.clone(), identity);
+        session
+    }
+
+    pub fn session_for_identity(&self, identity: &ConversationIdentity) -> Option<&BrowserSession> {
+        let session_id = self.ambient_sessions.get(identity)?;
+        self.sessions.get(session_id)
+    }
+
+    pub fn touch_session_for_identity(
+        &mut self,
+        identity: &ConversationIdentity,
+    ) -> Option<BrowserSession> {
+        let session_id = self.ambient_sessions.get(identity)?;
+        let session = self.sessions.get_mut(session_id)?;
+        session.updated_at_ms = now_ms();
+        Some(session.clone())
+    }
+
     pub fn session(&self, session_id: &AgentSessionId) -> Option<&BrowserSession> {
         self.sessions.get(session_id)
+    }
+
+    pub fn bind_workspace_root(
+        &mut self,
+        session_id: &AgentSessionId,
+        workspace_root: PathBuf,
+    ) -> Result<(), BrowserToolError> {
+        self.require_session(session_id)?;
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .expect("live session was just verified");
+        match session.workspace_root.as_ref() {
+            Some(bound) if bound != &workspace_root => {
+                Err(BrowserToolError::workspace_context_conflict())
+            }
+            Some(_) => Ok(()),
+            None => {
+                session.workspace_root = Some(workspace_root);
+                Ok(())
+            }
+        }
     }
 
     /// Test support: rewind a session's last-activity timestamp so tests can
@@ -466,6 +557,9 @@ impl LeaseRegistry {
                     .sessions
                     .remove(&session_id)
                     .expect("expired session id was just collected from the table");
+                if let Some(identity) = self.ambient_identities.remove(&session_id) {
+                    self.ambient_sessions.remove(&identity);
+                }
                 let idle_ms = now_ms.saturating_sub(session.updated_at_ms);
 
                 let mut released = Vec::new();
@@ -1028,6 +1122,28 @@ mod tests {
             .ensure_session(&session.agent_session_id)
             .unwrap_err();
         assert!(matches!(error.code, BrowserToolErrorCode::SessionExpired));
+    }
+
+    #[test]
+    fn expiry_removes_the_ambient_identity_binding() {
+        let mut registry = LeaseRegistry::new();
+        let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
+        let first = registry.ambient_session(identity.clone(), None, None);
+        registry.backdate_session(&first.agent_session_id, 2 * 3_600_000);
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(expired.len(), 1);
+        assert!(registry.session_for_identity(&identity).is_none());
+
+        let second = registry.ambient_session(identity.clone(), None, None);
+        assert_ne!(first.agent_session_id, second.agent_session_id);
+        assert_eq!(
+            registry
+                .session_for_identity(&identity)
+                .unwrap()
+                .agent_session_id,
+            second.agent_session_id
+        );
     }
 
     #[test]

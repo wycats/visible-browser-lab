@@ -19,9 +19,9 @@ An explicit `VISIBLE_BROWSER_CDP_ENDPOINT`, `VISIBLE_BROWSER_CDP_PORT`, or `--cd
 
 ## Session Workflow
 
-Start every browser workflow with `start_session`. Keep the returned `agent_session_id` for the full task and pass it on every later tool call.
+Call browser operations directly. Conversation-aware hosts select the session automatically. If a call returns `session_required`, call `start_session`, keep the returned `agent_session_id` for the full task, and pass it on every later tool call.
 
-Use leased `tab_id` values as the only browser-action handles. Browser actions require both `agent_session_id` and a tab owned by that session.
+Use leased `tab_id` values as the browser-action handles. Conversation-aware hosts supply the ambient session out of band; include `agent_session_id` only when recovering through the explicit fallback workflow.
 
 Use `list_tabs` with its default scope for normal work. The default list shows the caller's active and missing leases and hides released or closed leases. Use `global_readonly` only to understand the shared visible browser inventory; it groups foreign tabs by `owner_display_id` and withholds foreign `agent_session_id` and `tab_id` values.
 
@@ -52,7 +52,7 @@ When one appears:
 ## Interaction Rules
 
 - Use the `visible-browser-lab` MCP server for tab lifecycle, semantic snapshots, navigation, page actions, diagnostics, emulation, analysis, capture, and artifacts.
-- Treat `agent_session_id` and `tab_id` as bearer handles. Record them in task notes when the workflow spans multiple steps.
+- Treat leased `tab_id` values as bearer handles. In the explicit fallback workflow, treat `agent_session_id` as a bearer handle too and retain both for later calls; in ambient mode, never invent or request a session handle.
 - Use `target_id`, title, URL, and owner display information for diagnosis and handoff, not as substitutes for an owned `tab_id`.
 - Use `help` to inspect a domain operation before constructing specialized arguments.
 - Use key-by-key entry for rich text editors when normal typing is unreliable.
