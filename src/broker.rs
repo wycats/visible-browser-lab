@@ -1789,18 +1789,24 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
             let endpoint = broker_endpoint(&legacy)?;
             let filesystem_endpoint = endpoint.stale_path();
             let has_endpoint_artifact = filesystem_endpoint.is_some_and(std::path::Path::exists);
-            // A pid file without its Unix socket is not proof of a live v3
-            // broker: the process may have crashed and the PID may now name
-            // an unrelated process. Remove that stale claim without touching
-            // the named process. Windows has no filesystem endpoint, so the
-            // named-pipe probe below is the authority there.
+            let claimed_pid = read_pid(&legacy.pid_path)?;
+            // A pid file without the default Unix socket can be either stale
+            // or a live v3 broker launched with --socket. Only terminate the
+            // process when its command line proves that it is a VBL broker for
+            // this state directory; a reused unrelated PID remains untouched.
             if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
-                fs::remove_file(&legacy.pid_path).with_context(|| {
-                    format!(
-                        "failed to remove stale legacy broker pid file `{}`",
-                        legacy.pid_path.display()
-                    )
-                })?;
+                if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid))
+                    && process_looks_like_legacy_broker(pid, &legacy.state_dir)
+                {
+                    terminate_broker_claim(&legacy, pid).await?;
+                } else {
+                    fs::remove_file(&legacy.pid_path).with_context(|| {
+                        format!(
+                            "failed to remove stale legacy broker pid file `{}`",
+                            legacy.pid_path.display()
+                        )
+                    })?;
+                }
                 return Ok(());
             }
             let has_runtime_artifact =
@@ -1809,42 +1815,49 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                 return Ok(());
             }
 
-            match probe_broker(&legacy).await {
-                Ok(BrokerProbe::Incompatible { status, message }) => {
-                    restart_incompatible_broker(&legacy, &status, &message).await?;
-                }
-                Ok(BrokerProbe::Compatible(mut client)) => {
-                    let status = client.ping().await?;
-                    restart_incompatible_broker(
-                        &legacy,
-                        &status,
-                        "broker is listening on the retired v3 endpoint",
-                    )
-                    .await?;
-                }
-                Err(probe_error) => {
-                    if filesystem_endpoint.is_none() {
-                        if legacy.pid_path.exists() {
-                            fs::remove_file(&legacy.pid_path).with_context(|| {
-                                format!(
-                                    "failed to remove unreachable legacy broker pid file `{}`",
-                                    legacy.pid_path.display()
-                                )
-                            })?;
-                        }
-                        return Ok(());
+            match BrokerClient::connect(&endpoint).await {
+                Ok(mut client) => match client.ping().await {
+                    Ok(status) => {
+                        restart_incompatible_broker(
+                            &legacy,
+                            &status,
+                            "broker is listening on the retired v3 endpoint",
+                        )
+                        .await?;
                     }
-                    if let Some(pid) = read_pid(&legacy.pid_path)?
-                        && process_is_alive(pid)
-                    {
-                        bail!(
-                            "legacy v3 broker pid {pid} is alive but unavailable at {}; refusing to start a second broker: {probe_error:#}",
-                            legacy.ipc_endpoint
+                    Err(ping_error) => {
+                        let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) else {
+                            bail!(
+                                "legacy v3 endpoint {} accepted a connection but ping failed and no live broker pid is available; refusing to start a second broker: {ping_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        };
+                        tracing::warn!(
+                            pid,
+                            endpoint = %legacy.ipc_endpoint,
+                            error = %ping_error,
+                            "retiring live legacy broker whose ping failed"
                         );
+                        terminate_broker_claim(&legacy, pid).await?;
                     }
+                },
+                Err(connect_error) => {
+                    if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) {
+                        if process_looks_like_legacy_broker(pid, &legacy.state_dir) {
+                            terminate_broker_claim(&legacy, pid).await?;
+                            return Ok(());
+                        }
+                        if has_endpoint_artifact {
+                            bail!(
+                                "legacy v3 broker pid {pid} is alive but unavailable at {}; refusing to start a second broker: {connect_error:#}",
+                                legacy.ipc_endpoint
+                            );
+                        }
+                    }
+
                     cleanup_stale_endpoint(&legacy).with_context(|| {
                         format!(
-                            "failed to clean retired v3 broker after probe error: {probe_error:#}"
+                            "failed to clean retired v3 broker after connection error: {connect_error:#}"
                         )
                     })?;
                     if legacy.pid_path.exists() {
@@ -1863,6 +1876,49 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
         }
         sleep(BROKER_CONNECT_RETRY).await;
     }
+}
+
+fn process_looks_like_legacy_broker(pid: u32, state_dir: &Path) -> bool {
+    let Some(command_line) = process_command_line(pid) else {
+        return false;
+    };
+    let command_line = command_line.to_ascii_lowercase();
+    let state_dir = state_dir.to_string_lossy().to_ascii_lowercase();
+    command_line.contains("visible-browser-lab-mcp")
+        && command_line
+            .split_whitespace()
+            .any(|argument| argument.trim_matches(|c| c == '\'' || c == '"') == "broker")
+        && command_line.contains("--state-dir")
+        && command_line.contains(&state_dir)
+}
+
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
+}
+
+#[cfg(windows)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let query = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; if ($null -ne $p) {{ $p.CommandLine }}"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
 }
 
 pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
@@ -1985,7 +2041,11 @@ async fn restart_incompatible_broker(
         reason = %message,
         "restarting incompatible visible browser broker"
     );
-    terminate_process(status.pid).await?;
+    terminate_broker_claim(config, status.pid).await
+}
+
+async fn terminate_broker_claim(config: &RuntimeConfig, pid: u32) -> Result<()> {
+    terminate_process(pid).await?;
     let endpoint = broker_endpoint(config)?;
     if let Some(stale_path) = endpoint.stale_path() {
         let _ = fs::remove_file(stale_path);
@@ -7458,6 +7518,96 @@ mod tests {
             !legacy.socket_path.exists(),
             "v3 socket file should be removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_terminates_a_live_daemon_when_ping_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let stream = ipc::accept(&listener).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: BrokerRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "ping");
+            let response = BrokerResponse::error(
+                request.id,
+                BrowserToolError::chrome_unavailable("legacy managed Chrome is unavailable"),
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            stream
+                .get_mut()
+                .write_all(encoded.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            stream.get_mut().flush().await.unwrap();
+        });
+
+        retire_legacy_broker(&config).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!process_is_alive(pid), "unhealthy v3 broker should exit");
+        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
+        assert!(
+            !legacy.socket_path.exists(),
+            "v3 socket file should be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_legacy_broker_terminates_a_verified_custom_socket_daemon() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("state"));
+        prepare_state(&config).await.unwrap();
+        let legacy = legacy_broker_config(&config);
+        let custom_socket = config.state_dir.join("custom-v3.sock");
+        let marker = format!(
+            "visible-browser-lab-mcp broker --socket {} --state-dir {}",
+            custom_socket.display(),
+            config.state_dir.display()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", &marker])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        fs::write(&legacy.pid_path, pid.to_string()).unwrap();
+
+        assert!(
+            process_looks_like_legacy_broker(pid, &config.state_dir),
+            "test daemon command line was not recognized"
+        );
+        assert!(
+            !legacy.socket_path.exists(),
+            "the default v3 socket must be absent in this regression"
+        );
+
+        retire_legacy_broker(&config).await.unwrap();
+
+        assert!(
+            !process_is_alive(pid),
+            "verified custom-socket v3 broker should exit"
+        );
+        assert!(!legacy.pid_path.exists(), "v3 pid file should be removed");
     }
 
     #[tokio::test]

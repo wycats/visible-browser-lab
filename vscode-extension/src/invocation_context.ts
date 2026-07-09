@@ -20,6 +20,11 @@ export function extractInvocationContext(options: unknown): SurfaceRequestContex
   if (!isRecord(options)) {
     return undefined;
   }
+  // ChatParticipantToolToken is intentionally opaque in the public API, but
+  // VS Code 1.128 constructs its runtime value from sessionResource and
+  // workingDirectory. This guarded compatibility bridge fails closed when
+  // that private shape is absent or changes; the stable direct API can replace
+  // it once it reaches the extension's engine floor.
   const token = options.toolInvocationToken;
   if (!isRecord(token) || !isUriLike(token.sessionResource)) {
     return undefined;
