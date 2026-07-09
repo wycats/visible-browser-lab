@@ -1796,7 +1796,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
             // speaks v3 or v4. Refuse a second broker when the live process is
             // VBL-owned; remove only claims whose PID is dead or unrelated.
             if filesystem_endpoint.is_some() && !has_endpoint_artifact && legacy.pid_path.exists() {
-                if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid))
+                if let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid))
                     && process_looks_like_broker_for_state(pid, &legacy.state_dir)
                 {
                     bail!(
@@ -1830,7 +1830,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                         .await?;
                     }
                     Err(ping_error) => {
-                        let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) else {
+                        let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid)) else {
                             bail!(
                                 "legacy v3 endpoint {} accepted a connection but ping failed and no live broker pid is available; refusing to start a second broker: {ping_error:#}",
                                 legacy.ipc_endpoint
@@ -1856,7 +1856,7 @@ async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
                     }
                 },
                 Err(connect_error) => {
-                    if let Some(pid) = claimed_pid.filter(|pid| process_is_alive(*pid)) {
+                    if let Some(pid) = claimed_pid.filter(|pid| process_is_running(*pid)) {
                         if process_matches_broker_endpoint(
                             pid,
                             &legacy.state_dir,
@@ -1973,7 +1973,7 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
     }
 
     match read_pid(&config.pid_path)? {
-        Some(pid) if process_is_alive(pid) => bail!(
+        Some(pid) if process_is_running(pid) => bail!(
             "broker IPC `{}` is unavailable but pid `{pid}` is still alive",
             endpoint.display()
         ),
@@ -6488,9 +6488,11 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        let exists =
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        exists && !process_is_zombie(pid)
+        if result == 0 {
+            return true;
+        }
+
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     #[cfg(windows)]
@@ -6511,24 +6513,16 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn process_is_zombie(pid: u32) -> bool {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size as libc::c_int,
-        )
-    };
-    if read != size as libc::c_int {
-        return false;
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        process_is_alive(pid) && !process_is_zombie(pid)
     }
 
-    unsafe { info.assume_init().pbi_status == libc::SZOMB }
+    #[cfg(windows)]
+    {
+        process_is_alive(pid)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6542,7 +6536,7 @@ fn process_is_zombie(pid: u32) -> bool {
         == Some('Z')
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn process_is_zombie(pid: u32) -> bool {
     let Ok(output) = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -6575,7 +6569,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
             }
         }
         wait_for_process_exit(pid, Duration::from_secs(2)).await;
-        if process_is_alive(pid) {
+        if process_is_running(pid) {
             let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();
@@ -6593,7 +6587,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()
             .with_context(|| format!("failed to invoke taskkill for broker pid {pid}"))?;
-        if !output.status.success() && process_is_alive(pid) {
+        if !output.status.success() && process_is_running(pid) {
             bail!(
                 "failed to terminate broker pid {pid}: {}{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -6603,7 +6597,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
         wait_for_process_exit(pid, Duration::from_secs(2)).await;
     }
 
-    if process_is_alive(pid) {
+    if process_is_running(pid) {
         bail!("broker pid {pid} did not exit after termination");
     }
     Ok(())
@@ -6611,7 +6605,7 @@ async fn terminate_process(pid: u32) -> Result<()> {
 
 async fn wait_for_process_exit(pid: u32, timeout: Duration) {
     let deadline = Instant::now() + timeout;
-    while process_is_alive(pid) && Instant::now() < deadline {
+    while process_is_running(pid) && Instant::now() < deadline {
         sleep(Duration::from_millis(50)).await;
     }
 }
@@ -7964,7 +7958,7 @@ mod tests {
 
         terminate_process(pid).await.unwrap();
 
-        assert!(!process_is_alive(pid));
+        assert!(!process_is_running(pid));
         child.wait().unwrap();
     }
 
