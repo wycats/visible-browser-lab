@@ -585,7 +585,8 @@ impl LeaseRegistry {
                             tab_id: lease.tab_id.clone(),
                             target_id: lease.target_id.clone(),
                         };
-                        if self.ambient_created_leases.remove(&lease.tab_id) {
+                        let ambient_created = self.ambient_created_leases.remove(&lease.tab_id);
+                        if lease.state == LeaseState::Active && ambient_created {
                             lease.state = LeaseState::Closed;
                             self.pending_expiry_closes
                                 .insert(lease.target_id.clone(), lease.tab_id.clone());
@@ -1200,6 +1201,41 @@ mod tests {
             registry.leases.get(&summary.tab_id).unwrap().state,
             LeaseState::Released
         ));
+    }
+
+    #[test]
+    fn missing_ambient_created_lease_cannot_close_a_successors_claim() {
+        let mut registry = LeaseRegistry::new();
+        let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
+        let ambient = registry.ambient_session(identity, None, None);
+        let old = registry
+            .lease_tab(&ambient.agent_session_id, snapshot("target-a"))
+            .unwrap();
+        registry.mark_missing(&old.tab_id).unwrap();
+
+        let successor = registry.start_session(None);
+        let current = registry
+            .claim_tab(
+                &successor.agent_session_id,
+                snapshot("target-a"),
+                false,
+                None,
+            )
+            .unwrap();
+
+        registry.backdate_session(&ambient.agent_session_id, 2 * 3_600_000);
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].released.len(), 1);
+        assert!(expired[0].closed.is_empty());
+        assert!(
+            registry
+                .require_active_owned(&successor.agent_session_id, &current.tab_id, true)
+                .is_ok(),
+            "expiring the old missing lease must preserve the successor's active claim"
+        );
     }
 
     #[test]
