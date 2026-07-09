@@ -224,11 +224,27 @@ impl BrowserToolError {
         }
     }
 
-    pub fn session_expired(session_id: &AgentSessionId, idle: Duration) -> Self {
+    pub fn session_expired(
+        session_id: &AgentSessionId,
+        idle: Duration,
+        closed_targets: usize,
+    ) -> Self {
+        let disposition = if closed_targets == 0 {
+            "its tabs were released and are claimable".to_string()
+        } else {
+            let target = if closed_targets == 1 {
+                "target"
+            } else {
+                "targets"
+            };
+            format!(
+                "{closed_targets} ambient-created browser {target} closed; any other tabs were released and are claimable"
+            )
+        };
         Self {
             code: BrowserToolErrorCode::SessionExpired,
             message: format!(
-                "agent session `{}` expired after {}s of inactivity; its tabs were released and are claimable",
+                "agent session `{}` expired after {}s of inactivity; {disposition}",
                 session_id.0,
                 idle.as_secs()
             ),
@@ -381,6 +397,12 @@ impl BrowserToolError {
 /// recovery for both errors is `start_session`.
 const EXPIRED_SESSION_TOMBSTONE_CAP: usize = 1024;
 
+#[derive(Debug, Clone, Copy)]
+struct ExpiredSessionTombstone {
+    idle_ms: u64,
+    closed_targets: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct LeaseRegistry {
     sessions: HashMap<AgentSessionId, BrowserSession>,
@@ -403,7 +425,7 @@ pub struct LeaseRegistry {
     /// had this and waited too long") instead of `unknown_session` ("you
     /// never had this"). Capped at `EXPIRED_SESSION_TOMBSTONE_CAP`; the
     /// oldest tombstones are evicted first.
-    expired_sessions: HashMap<AgentSessionId, u64>,
+    expired_sessions: HashMap<AgentSessionId, ExpiredSessionTombstone>,
     /// Tombstone insertion order, oldest first, for cap eviction.
     expired_session_order: VecDeque<AgentSessionId>,
 }
@@ -601,7 +623,13 @@ impl LeaseRegistry {
                     self.remove_active_target_if_matches(&lease.target_id, &lease.tab_id);
                 }
 
-                self.expired_sessions.insert(session_id.clone(), idle_ms);
+                self.expired_sessions.insert(
+                    session_id.clone(),
+                    ExpiredSessionTombstone {
+                        idle_ms,
+                        closed_targets: closed.len(),
+                    },
+                );
                 self.expired_session_order.push_back(session_id.clone());
                 while self.expired_session_order.len() > EXPIRED_SESSION_TOMBSTONE_CAP {
                     if let Some(evicted) = self.expired_session_order.pop_front() {
@@ -678,6 +706,7 @@ impl LeaseRegistry {
             return Err(BrowserToolError::target_owned(&target.target_id));
         }
 
+        let mut preserve_ambient_created = false;
         if let Some(existing) = self.active_lease_for_target(&target.target_id).cloned() {
             if !takeover {
                 return Err(BrowserToolError::target_owned(&target.target_id));
@@ -691,11 +720,16 @@ impl LeaseRegistry {
             }
 
             self.leases.remove(&existing.tab_id);
-            self.ambient_created_leases.remove(&existing.tab_id);
+            let existing_was_ambient_created = self.ambient_created_leases.remove(&existing.tab_id);
+            preserve_ambient_created =
+                existing.owner_session_id == *session_id && existing_was_ambient_created;
             self.remove_active_target_if_matches(&existing.target_id, &existing.tab_id);
         }
 
         let lease = self.insert_active_lease(session_id, target);
+        if preserve_ambient_created {
+            self.ambient_created_leases.insert(lease.tab_id.clone());
+        }
         Ok(owned_summary(&lease, focused))
     }
 
@@ -997,10 +1031,11 @@ impl LeaseRegistry {
         if let Some(session) = self.sessions.get(session_id) {
             return Ok(session);
         }
-        if let Some(idle_ms) = self.expired_sessions.get(session_id) {
+        if let Some(tombstone) = self.expired_sessions.get(session_id) {
             return Err(BrowserToolError::session_expired(
                 session_id,
-                Duration::from_millis(*idle_ms),
+                Duration::from_millis(tombstone.idle_ms),
+                tombstone.closed_targets,
             ));
         }
         Err(BrowserToolError::unknown_session(session_id))
@@ -1154,6 +1189,19 @@ mod tests {
             registry.leases.get(&summary.tab_id).unwrap().state,
             LeaseState::Closed
         ));
+        let expired_error = registry
+            .ensure_session(&ambient.agent_session_id)
+            .unwrap_err();
+        assert!(
+            expired_error
+                .message
+                .contains("1 ambient-created browser target closed")
+        );
+        assert!(
+            expired_error
+                .message
+                .contains("any other tabs were released and are claimable")
+        );
 
         let successor = registry.start_session(None);
         let error = registry
@@ -1204,6 +1252,34 @@ mod tests {
     }
 
     #[test]
+    fn ambient_self_takeover_preserves_created_target_provenance() {
+        let mut registry = LeaseRegistry::new();
+        let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
+        let ambient = registry.ambient_session(identity, None, None);
+        let original = registry
+            .lease_tab(&ambient.agent_session_id, snapshot("target-a"))
+            .unwrap();
+        let replacement = registry
+            .claim_tab(
+                &ambient.agent_session_id,
+                snapshot("target-a"),
+                true,
+                Some("keep using my own target"),
+            )
+            .unwrap();
+        assert_ne!(original.tab_id, replacement.tab_id);
+
+        registry.backdate_session(&ambient.agent_session_id, 2 * 3_600_000);
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].released.is_empty());
+        assert_eq!(expired[0].closed.len(), 1);
+        assert_eq!(expired[0].closed[0].tab_id, replacement.tab_id);
+    }
+
+    #[test]
     fn missing_ambient_created_lease_cannot_close_a_successors_claim() {
         let mut registry = LeaseRegistry::new();
         let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
@@ -1250,6 +1326,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error.code, BrowserToolErrorCode::SessionExpired));
         assert_eq!(error.recovery, Some(RecoveryAction::StartSession));
+        assert!(error.message.contains("released and are claimable"));
+        assert!(!error.message.contains("closed"));
 
         let never_seen = registry
             .ensure_session(&AgentSessionId("session-nonexistent".to_string()))
