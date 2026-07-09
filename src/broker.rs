@@ -6626,8 +6626,27 @@ async fn terminate_process(pid: u32) -> Result<()> {
 }
 
 async fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    #[cfg(unix)]
+    const ZOMBIE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
     let deadline = Instant::now() + timeout;
-    while process_is_running(pid) && Instant::now() < deadline {
+    #[cfg(unix)]
+    let mut next_zombie_poll = Instant::now();
+
+    while Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let now = Instant::now();
+            if now >= next_zombie_poll {
+                if process_is_zombie(pid) {
+                    return;
+                }
+                next_zombie_poll = now + ZOMBIE_POLL_INTERVAL;
+            }
+        }
         sleep(Duration::from_millis(50)).await;
     }
 }
