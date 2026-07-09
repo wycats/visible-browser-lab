@@ -2053,7 +2053,12 @@ fn vsix_smoke(args: VsixSmokeArgs) -> Result<()> {
     );
 
     if args.extension_host {
-        run_extension_host_smoke(&root, smoke_dir.path())?;
+        let state_dir = smoke_dir.path().join("state");
+        fs::create_dir_all(&state_dir)?;
+        let _cleanup = InstalledSmokeCleanup {
+            state_dirs: vec![state_dir.clone()],
+        };
+        run_extension_host_smoke(&root, smoke_dir.path(), &state_dir)?;
     }
 
     println!("vsix smoke passed");
@@ -2091,12 +2096,13 @@ fn dogfood(args: DogfoodArgs) -> Result<()> {
 /// Launches a real VS Code extension host against the extracted VSIX and runs
 /// the in-host suite: activation, tool registration, and a help invocation
 /// through the packaged binary.
-fn run_extension_host_smoke(root: &Path, smoke_dir: &Path) -> Result<()> {
+fn run_extension_host_smoke(root: &Path, smoke_dir: &Path, state_dir: &Path) -> Result<()> {
     let extension_dir = smoke_dir.join("extension");
 
     let status = Command::new("pnpm")
         .args(["--filter", "visible-browser-lab", "test:extension-host"])
         .env("VBL_EXTENSION_PATH", &extension_dir)
+        .env("VISIBLE_BROWSER_LAB_STATE_DIR", state_dir)
         .current_dir(root)
         .status()
         .context("failed to launch the VS Code extension host smoke")?;
