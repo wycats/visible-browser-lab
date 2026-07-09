@@ -2409,7 +2409,7 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
                 .remove(&lease.target_id);
         }
         for lease in &session.closed {
-            close_expired_ambient_target(state, lease).await;
+            close_expired_ambient_target(state, &session.session_id, lease).await;
         }
     }
 }
@@ -2418,7 +2418,11 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
 /// reserved it against concurrent claims. This is best-effort maintenance:
 /// the session is already expired, and a close failure must leave the target
 /// claimable rather than permanently reserved.
-async fn close_expired_ambient_target(state: &BrokerState, lease: &ExpiredLease) {
+async fn close_expired_ambient_target(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    lease: &ExpiredLease,
+) {
     if let Some(capture) = state.traces.lock().await.remove(&lease.target_id) {
         let _ = BrowserBackend::stop_trace(capture).await;
     }
@@ -2426,7 +2430,7 @@ async fn close_expired_ambient_target(state: &BrokerState, lease: &ExpiredLease)
         let _ = BrowserBackend::stop_screencast(active.capture).await;
     }
 
-    match target_by_id(state, &lease.target_id).await {
+    let closed = match target_by_id(state, &lease.target_id).await {
         Ok(target) => {
             if let Err(error) = state
                 .browser
@@ -2439,25 +2443,29 @@ async fn close_expired_ambient_target(state: &BrokerState, lease: &ExpiredLease)
                     "failed to reset emulation before ambient expiry close"
                 );
             }
-            if let Err(error) = state.browser.close_target(&lease.target_id).await
-                && error.code != BrowserToolErrorCode::TargetMissing
-            {
-                tracing::warn!(
-                    target = %lease.target_id,
-                    error = %error.message,
-                    "failed to close ambient-created target on session expiry"
-                );
+            match state.browser.close_target(&lease.target_id).await {
+                Ok(()) => true,
+                Err(error) if error.code == BrowserToolErrorCode::TargetMissing => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target = %lease.target_id,
+                        error = %error.message,
+                        "failed to close ambient-created target on session expiry"
+                    );
+                    false
+                }
             }
         }
-        Err(error) if error.code == BrowserToolErrorCode::TargetMissing => {}
+        Err(error) if error.code == BrowserToolErrorCode::TargetMissing => true,
         Err(error) => {
             tracing::warn!(
                 target = %lease.target_id,
                 error = %error.message,
                 "failed to inspect ambient-created target on session expiry"
             );
+            false
         }
-    }
+    };
 
     state.clear_focused_target(&lease.target_id);
     state
@@ -2477,7 +2485,7 @@ async fn close_expired_ambient_target(state: &BrokerState, lease: &ExpiredLease)
         .registry()
         .lock()
         .unwrap()
-        .finish_expired_target_close(&lease.target_id, &lease.tab_id);
+        .finish_expired_target_close(session_id, &lease.target_id, &lease.tab_id, closed);
 }
 
 /// Re-verify the broker's claim to exist. Returns the violation when the
@@ -6918,6 +6926,17 @@ mod tests {
         assert!(
             state.browser.page_targets().await.unwrap().is_empty(),
             "ambient expiry should close a target VBL created for that session"
+        );
+        let expired_error = state
+            .registry
+            .lock()
+            .unwrap()
+            .ensure_session(&ambient.agent_session_id)
+            .unwrap_err();
+        assert!(
+            expired_error
+                .message
+                .contains("1 ambient-created browser target closed")
         );
     }
 

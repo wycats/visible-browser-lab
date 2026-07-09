@@ -227,19 +227,25 @@ impl BrowserToolError {
     pub fn session_expired(
         session_id: &AgentSessionId,
         idle: Duration,
+        pending_close_targets: usize,
         closed_targets: usize,
     ) -> Self {
-        let disposition = if closed_targets == 0 {
-            "its tabs were released and are claimable".to_string()
-        } else {
-            let target = if closed_targets == 1 {
-                "target"
-            } else {
-                "targets"
-            };
-            format!(
-                "{closed_targets} ambient-created browser {target} closed; any other tabs were released and are claimable"
-            )
+        let target = |count| if count == 1 { "target" } else { "targets" };
+        let disposition = match (closed_targets, pending_close_targets) {
+            (0, 0) => "its tabs were released and are claimable".to_string(),
+            (closed, 0) => format!(
+                "{closed} ambient-created browser {} closed; any other tabs were released and are claimable",
+                target(closed)
+            ),
+            (0, pending) => format!(
+                "{pending} ambient-created browser {} still being closed; any other tabs were released and are claimable",
+                target(pending)
+            ),
+            (closed, pending) => format!(
+                "{closed} ambient-created browser {} closed and {pending} {} still being closed; any other tabs were released and are claimable",
+                target(closed),
+                target(pending)
+            ),
         };
         Self {
             code: BrowserToolErrorCode::SessionExpired,
@@ -400,6 +406,7 @@ const EXPIRED_SESSION_TOMBSTONE_CAP: usize = 1024;
 #[derive(Debug, Clone, Copy)]
 struct ExpiredSessionTombstone {
     idle_ms: u64,
+    pending_close_targets: usize,
     closed_targets: usize,
 }
 
@@ -420,6 +427,11 @@ pub struct LeaseRegistry {
     /// preventing a concurrent caller from adopting a target the sweep is
     /// about to close.
     pending_expiry_closes: HashMap<String, TabId>,
+    /// Target ids the expiry sweep confirmed closed or already missing.
+    /// Keeping them for the broker lifetime rejects claim requests that
+    /// captured a target snapshot before closure and reached the registry
+    /// after the async close reservation finished.
+    expired_closed_targets: HashSet<String>,
     /// Sessions removed by the expiry sweep, with how long each sat idle.
     /// Lets a call on an expired session fail with `session_expired` ("you
     /// had this and waited too long") instead of `unknown_session` ("you
@@ -627,7 +639,8 @@ impl LeaseRegistry {
                     session_id.clone(),
                     ExpiredSessionTombstone {
                         idle_ms,
-                        closed_targets: closed.len(),
+                        pending_close_targets: closed.len(),
+                        closed_targets: 0,
                     },
                 );
                 self.expired_session_order.push_back(session_id.clone());
@@ -651,9 +664,24 @@ impl LeaseRegistry {
     /// closed the target or established that it is already gone. A failed
     /// close also releases the reservation so the surviving target can be
     /// claimed rather than becoming permanently stranded.
-    pub fn finish_expired_target_close(&mut self, target_id: &str, tab_id: &TabId) {
+    pub fn finish_expired_target_close(
+        &mut self,
+        session_id: &AgentSessionId,
+        target_id: &str,
+        tab_id: &TabId,
+        closed: bool,
+    ) {
         if self.pending_expiry_closes.get(target_id) == Some(tab_id) {
             self.pending_expiry_closes.remove(target_id);
+            if let Some(tombstone) = self.expired_sessions.get_mut(session_id) {
+                tombstone.pending_close_targets = tombstone.pending_close_targets.saturating_sub(1);
+                if closed {
+                    tombstone.closed_targets = tombstone.closed_targets.saturating_add(1);
+                }
+            }
+            if closed {
+                self.expired_closed_targets.insert(target_id.to_string());
+            }
         }
     }
 
@@ -681,6 +709,7 @@ impl LeaseRegistry {
 
         if self.active_lease_for_target(&target.target_id).is_some()
             || self.pending_expiry_closes.contains_key(&target.target_id)
+            || self.expired_closed_targets.contains(&target.target_id)
         {
             return Err(BrowserToolError::target_owned(&target.target_id));
         }
@@ -702,7 +731,9 @@ impl LeaseRegistry {
         self.require_session(session_id)?;
         let focused = target.focused;
 
-        if self.pending_expiry_closes.contains_key(&target.target_id) {
+        if self.pending_expiry_closes.contains_key(&target.target_id)
+            || self.expired_closed_targets.contains(&target.target_id)
+        {
             return Err(BrowserToolError::target_owned(&target.target_id));
         }
 
@@ -920,7 +951,8 @@ impl LeaseRegistry {
             let claimable = active_lease.is_none()
                 && !self
                     .pending_expiry_closes
-                    .contains_key(&visible_tab.target_id);
+                    .contains_key(&visible_tab.target_id)
+                && !self.expired_closed_targets.contains(&visible_tab.target_id);
 
             let summary = GlobalTabSummary {
                 target_id: visible_tab.target_id,
@@ -1035,6 +1067,7 @@ impl LeaseRegistry {
             return Err(BrowserToolError::session_expired(
                 session_id,
                 Duration::from_millis(tombstone.idle_ms),
+                tombstone.pending_close_targets,
                 tombstone.closed_targets,
             ));
         }
@@ -1195,7 +1228,7 @@ mod tests {
         assert!(
             expired_error
                 .message
-                .contains("1 ambient-created browser target closed")
+                .contains("1 ambient-created browser target still being closed")
         );
         assert!(
             expired_error
@@ -1214,7 +1247,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, BrowserToolErrorCode::TargetOwned);
 
-        registry.finish_expired_target_close("target-a", &summary.tab_id);
+        registry.finish_expired_target_close(
+            &ambient.agent_session_id,
+            "target-a",
+            &summary.tab_id,
+            false,
+        );
+        let failed_close_error = registry
+            .ensure_session(&ambient.agent_session_id)
+            .unwrap_err();
+        assert!(
+            failed_close_error
+                .message
+                .contains("released and are claimable")
+        );
+        assert!(!failed_close_error.message.contains("closed"));
         assert!(
             registry
                 .claim_tab(
@@ -1226,6 +1273,46 @@ mod tests {
                 .is_ok(),
             "a failed browser close must leave the surviving target claimable"
         );
+    }
+
+    #[test]
+    fn successful_expiry_close_rejects_a_claim_from_a_stale_target_snapshot() {
+        let mut registry = LeaseRegistry::new();
+        let identity = ConversationIdentity::new(1, "com.example.host", "conversation").unwrap();
+        let ambient = registry.ambient_session(identity, None, None);
+        let summary = registry
+            .lease_tab(&ambient.agent_session_id, focused_snapshot("target-a"))
+            .unwrap();
+
+        registry.backdate_session(&ambient.agent_session_id, 2 * 3_600_000);
+        registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        registry.finish_expired_target_close(
+            &ambient.agent_session_id,
+            "target-a",
+            &summary.tab_id,
+            true,
+        );
+
+        let successor = registry.start_session(None);
+        let error = registry
+            .claim_tab(
+                &successor.agent_session_id,
+                snapshot("target-a"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::TargetOwned);
+
+        let expired_error = registry
+            .ensure_session(&ambient.agent_session_id)
+            .unwrap_err();
+        assert!(
+            expired_error
+                .message
+                .contains("1 ambient-created browser target closed")
+        );
+        assert!(!expired_error.message.contains("still being closed"));
     }
 
     #[test]
