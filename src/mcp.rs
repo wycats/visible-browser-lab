@@ -79,20 +79,22 @@ impl ServerHandler for VisibleBrowserLab {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
-        let request_context =
-            match broker_request_context(&context.meta, self.conversation_identity_compatibility) {
-                Ok(context) => context,
-                Err(error) => {
-                    return Ok(call_tool_result(SurfaceToolResult::structured_error(
-                        serde_json::to_value(error).unwrap_or_else(|_| {
-                            serde_json::json!({
-                                "code":"invalid_request_context",
-                                "message":"invalid conversation identity metadata"
-                            })
-                        }),
-                    )));
-                }
-            };
+        let request_context = match broker_request_context(
+            call_tool_meta(request.meta.as_ref(), &context.meta),
+            self.conversation_identity_compatibility,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(call_tool_result(SurfaceToolResult::structured_error(
+                    serde_json::to_value(error).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "code":"invalid_request_context",
+                            "message":"invalid conversation identity metadata"
+                        })
+                    }),
+                )));
+            }
+        };
         let result = self
             .surface
             .call_tool(name, arguments, request_context)
@@ -137,6 +139,10 @@ fn broker_request_context(
         conversation_identity,
         workspace_root: workspace_root(meta),
     })
+}
+
+fn call_tool_meta<'a>(request_meta: Option<&'a Meta>, context_meta: &'a Meta) -> &'a Meta {
+    request_meta.unwrap_or(context_meta)
 }
 
 fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
@@ -220,5 +226,41 @@ mod tests {
             .issuer(),
             "com.openai.codex"
         );
+    }
+
+    #[test]
+    fn reads_protocol_metadata_from_the_call_tool_request() {
+        let context_meta = Meta(serde_json::Map::from_iter([(
+            "threadId".to_string(),
+            serde_json::json!("context-thread"),
+        )]));
+        let mut request: CallToolRequestParams = serde_json::from_value(serde_json::json!({
+            "name": "list_tabs",
+            "_meta": { "threadId": "request-thread" }
+        }))
+        .unwrap();
+
+        let selected = call_tool_meta(request.meta.as_ref(), &context_meta);
+        assert_eq!(
+            selected.0.get("threadId"),
+            Some(&serde_json::json!("request-thread"))
+        );
+        assert_eq!(
+            broker_request_context(
+                selected,
+                ConversationIdentityCompatibility::TrustedCodexThreadId,
+            )
+            .unwrap()
+            .conversation_identity
+            .unwrap()
+            .issuer(),
+            "com.openai.codex"
+        );
+
+        request.meta = None;
+        assert!(std::ptr::eq(
+            call_tool_meta(request.meta.as_ref(), &context_meta),
+            &context_meta
+        ));
     }
 }
