@@ -79,8 +79,9 @@ impl ServerHandler for VisibleBrowserLab {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
+        let meta = call_tool_meta(request.meta.as_ref(), &context.meta);
         let request_context =
-            match broker_request_context(&context.meta, self.conversation_identity_compatibility) {
+            match broker_request_context(&meta, self.conversation_identity_compatibility) {
                 Ok(context) => context,
                 Err(error) => {
                     return Ok(call_tool_result(SurfaceToolResult::structured_error(
@@ -137,6 +138,14 @@ fn broker_request_context(
         conversation_identity,
         workspace_root: workspace_root(meta),
     })
+}
+
+fn call_tool_meta(request_meta: Option<&Meta>, context_meta: &Meta) -> Meta {
+    let mut merged = context_meta.clone();
+    if let Some(request_meta) = request_meta {
+        merged.0.extend(request_meta.0.clone());
+    }
+    merged
 }
 
 fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
@@ -212,6 +221,71 @@ mod tests {
         assert_eq!(
             broker_request_context(
                 &codex,
+                ConversationIdentityCompatibility::TrustedCodexThreadId,
+            )
+            .unwrap()
+            .conversation_identity
+            .unwrap()
+            .issuer(),
+            "com.openai.codex"
+        );
+    }
+
+    #[test]
+    fn reads_protocol_metadata_from_the_call_tool_request() {
+        let context_meta = Meta(serde_json::Map::from_iter([
+            ("threadId".to_string(), serde_json::json!("context-thread")),
+            ("contextOnly".to_string(), serde_json::json!(true)),
+        ]));
+        let mut request: CallToolRequestParams = serde_json::from_value(serde_json::json!({
+            "name": "list_tabs",
+            "_meta": {
+                "threadId": "request-thread",
+                "requestOnly": true
+            }
+        }))
+        .unwrap();
+
+        let selected = call_tool_meta(request.meta.as_ref(), &context_meta);
+        assert_eq!(
+            selected.0.get("threadId"),
+            Some(&serde_json::json!("request-thread"))
+        );
+        assert_eq!(
+            selected.0.get("contextOnly"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            selected.0.get("requestOnly"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            broker_request_context(
+                &selected,
+                ConversationIdentityCompatibility::TrustedCodexThreadId,
+            )
+            .unwrap()
+            .conversation_identity
+            .unwrap()
+            .issuer(),
+            "com.openai.codex"
+        );
+
+        request.meta = None;
+        assert_eq!(
+            call_tool_meta(request.meta.as_ref(), &context_meta),
+            context_meta
+        );
+
+        request.meta = Some(Meta(serde_json::Map::from_iter([(
+            "progressToken".to_string(),
+            serde_json::json!(7),
+        )])));
+        let selected = call_tool_meta(request.meta.as_ref(), &context_meta);
+        assert_eq!(selected.0.get("progressToken"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            broker_request_context(
+                &selected,
                 ConversationIdentityCompatibility::TrustedCodexThreadId,
             )
             .unwrap()
