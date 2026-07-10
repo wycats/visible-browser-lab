@@ -79,22 +79,21 @@ impl ServerHandler for VisibleBrowserLab {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
-        let request_context = match broker_request_context(
-            call_tool_meta(request.meta.as_ref(), &context.meta),
-            self.conversation_identity_compatibility,
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                return Ok(call_tool_result(SurfaceToolResult::structured_error(
-                    serde_json::to_value(error).unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "code":"invalid_request_context",
-                            "message":"invalid conversation identity metadata"
-                        })
-                    }),
-                )));
-            }
-        };
+        let meta = call_tool_meta(request.meta.as_ref(), &context.meta);
+        let request_context =
+            match broker_request_context(&meta, self.conversation_identity_compatibility) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(call_tool_result(SurfaceToolResult::structured_error(
+                        serde_json::to_value(error).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "code":"invalid_request_context",
+                                "message":"invalid conversation identity metadata"
+                            })
+                        }),
+                    )));
+                }
+            };
         let result = self
             .surface
             .call_tool(name, arguments, request_context)
@@ -141,8 +140,12 @@ fn broker_request_context(
     })
 }
 
-fn call_tool_meta<'a>(request_meta: Option<&'a Meta>, context_meta: &'a Meta) -> &'a Meta {
-    request_meta.unwrap_or(context_meta)
+fn call_tool_meta(request_meta: Option<&Meta>, context_meta: &Meta) -> Meta {
+    let mut merged = context_meta.clone();
+    if let Some(request_meta) = request_meta {
+        merged.0.extend(request_meta.0.clone());
+    }
+    merged
 }
 
 fn codex_workspace_cwd(meta: &Meta) -> Option<&str> {
@@ -230,13 +233,16 @@ mod tests {
 
     #[test]
     fn reads_protocol_metadata_from_the_call_tool_request() {
-        let context_meta = Meta(serde_json::Map::from_iter([(
-            "threadId".to_string(),
-            serde_json::json!("context-thread"),
-        )]));
+        let context_meta = Meta(serde_json::Map::from_iter([
+            ("threadId".to_string(), serde_json::json!("context-thread")),
+            ("contextOnly".to_string(), serde_json::json!(true)),
+        ]));
         let mut request: CallToolRequestParams = serde_json::from_value(serde_json::json!({
             "name": "list_tabs",
-            "_meta": { "threadId": "request-thread" }
+            "_meta": {
+                "threadId": "request-thread",
+                "requestOnly": true
+            }
         }))
         .unwrap();
 
@@ -246,8 +252,16 @@ mod tests {
             Some(&serde_json::json!("request-thread"))
         );
         assert_eq!(
+            selected.0.get("contextOnly"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            selected.0.get("requestOnly"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
             broker_request_context(
-                selected,
+                &selected,
                 ConversationIdentityCompatibility::TrustedCodexThreadId,
             )
             .unwrap()
@@ -258,9 +272,27 @@ mod tests {
         );
 
         request.meta = None;
-        assert!(std::ptr::eq(
+        assert_eq!(
             call_tool_meta(request.meta.as_ref(), &context_meta),
-            &context_meta
-        ));
+            context_meta
+        );
+
+        request.meta = Some(Meta(serde_json::Map::from_iter([(
+            "progressToken".to_string(),
+            serde_json::json!(7),
+        )])));
+        let selected = call_tool_meta(request.meta.as_ref(), &context_meta);
+        assert_eq!(selected.0.get("progressToken"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            broker_request_context(
+                &selected,
+                ConversationIdentityCompatibility::TrustedCodexThreadId,
+            )
+            .unwrap()
+            .conversation_identity
+            .unwrap()
+            .issuer(),
+            "com.openai.codex"
+        );
     }
 }
