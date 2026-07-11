@@ -706,6 +706,13 @@ impl LeaseRegistry {
             } else if let Some(lease) = self.leases.get_mut(tab_id) {
                 lease.state = LeaseState::Released;
                 lease.updated_at_ms = now_ms();
+                self.cleanup_owned_targets.insert(
+                    target_id.to_string(),
+                    CleanupOwnership {
+                        session_id: session_id.clone(),
+                        tab_id: tab_id.clone(),
+                    },
+                );
             }
         }
     }
@@ -1307,17 +1314,20 @@ mod tests {
                 .contains("released and are claimable")
         );
         assert!(!failed_close_error.message.contains("closed"));
-        assert!(
-            registry
-                .claim_tab(
-                    &successor.agent_session_id,
-                    snapshot("target-a"),
-                    false,
-                    None,
-                )
-                .is_ok(),
-            "a failed browser close must leave the surviving target claimable"
-        );
+        let adopted = registry
+            .claim_tab(
+                &successor.agent_session_id,
+                snapshot("target-a"),
+                false,
+                None,
+            )
+            .expect("a failed browser close must leave the surviving target claimable");
+        registry.backdate_session(&successor.agent_session_id, 2 * 3_600_000);
+        let successor_expiry =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(successor_expiry.len(), 1);
+        assert_eq!(successor_expiry[0].closed.len(), 1);
+        assert_eq!(successor_expiry[0].closed[0].tab_id, adopted.tab_id);
     }
 
     #[test]

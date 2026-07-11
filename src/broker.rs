@@ -3264,28 +3264,28 @@ async fn broker_release_tab(
             "user_instruction is accepted only when leave_visible is true",
         ));
     }
-    let active_target_id = state
+    let released_target_id = state
         .registry()
         .lock()
         .unwrap()
-        .owned_lease(&params.agent_session_id, &params.tab_id)?
+        .require_active_owned(&params.agent_session_id, &params.tab_id, true)?
         .target_id;
     if state
         .screencasts
         .lock()
         .await
-        .contains_key(&active_target_id)
+        .contains_key(&released_target_id)
     {
         return Err(BrowserToolError::invalid_input(
             "stop the active screencast before releasing its tab",
         ));
     }
-    if state.traces.lock().await.contains_key(&active_target_id) {
+    if state.traces.lock().await.contains_key(&released_target_id) {
         return Err(BrowserToolError::invalid_input(
             "stop the active performance trace before releasing its tab",
         ));
     }
-    if let Ok(target) = target_by_id(state, &active_target_id).await {
+    if let Ok(target) = target_by_id(state, &released_target_id).await {
         state
             .browser
             .emulate(&target, "reset", &serde_json::Map::new())
@@ -3300,7 +3300,7 @@ async fn broker_release_tab(
         .viewport_overrides
         .lock()
         .unwrap()
-        .remove(&active_target_id);
+        .remove(&released_target_id);
     let old_monitor = state
         .diagnostics()
         .lock()
@@ -7347,6 +7347,65 @@ mod tests {
             .backdate_session(&session.agent_session_id, 3_600_000 * 2);
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
         assert!(state.browser.page_targets().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_released_handle_cannot_reset_successor_emulation() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_emulation_reset(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let former_owner = state.registry.lock().unwrap().start_session(None);
+        let former_tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &former_owner.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .release_tab(&former_owner.agent_session_id, &former_tab.tab_id, false)
+            .unwrap();
+
+        let successor = state.registry.lock().unwrap().start_session(None);
+        let successor_tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .claim_tab(
+                &successor.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+                false,
+                None,
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: former_owner.agent_session_id,
+                tab_id: former_tab.tab_id,
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::TabNotActive);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&successor.agent_session_id, &successor_tab.tab_id, true)
+                .is_ok(),
+            "the stale release must not disturb the successor lease"
+        );
     }
 
     #[tokio::test]
