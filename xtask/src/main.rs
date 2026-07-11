@@ -915,7 +915,7 @@ fn vscode_model_description(tool: &ToolDefinition) -> String {
 fn vscode_server_instructions() -> String {
     format!(
         "VS Code chat supplies conversation identity out of band. Never call start_session or invent, request, or pass a session handle; if a call returns session_required, report its recovery guidance. {}",
-        agent_surface_contract::SERVER_INSTRUCTIONS
+        agent_surface_contract::COMMON_OPERATION_INSTRUCTIONS
     )
 }
 
@@ -2983,6 +2983,12 @@ mod tests {
 
         let new_tab = tools.iter().find(|tool| tool.name == "new_tab").unwrap();
         assert!(vscode_model_description(new_tab).contains("never call start_session"));
+
+        let server_instructions = vscode_server_instructions();
+        assert!(server_instructions.contains("Never call start_session"));
+        assert!(server_instructions.contains("Use only tab_id values owned"));
+        assert!(!server_instructions.contains("then called start_session"));
+        assert!(!server_instructions.contains("exact returned handle"));
     }
 
     #[test]
