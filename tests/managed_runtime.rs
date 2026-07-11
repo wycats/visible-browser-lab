@@ -377,6 +377,7 @@ mod macos {
             second_result.get("tab").context("new_tab omitted tab")?,
         )?;
         let endpoint = read_active_endpoint(state.path())?;
+        let managed_pid = read_managed_pid(state.path())?;
 
         client.call_tool(
             "close_tab",
@@ -391,6 +392,7 @@ mod macos {
             false,
         )?;
         wait_until_unhealthy(&endpoint)?;
+        wait_until_process_exited(managed_pid)?;
 
         client.shutdown();
         drop(cleanup);
@@ -733,6 +735,27 @@ mod macos {
             .context("DevToolsActivePort omitted port")?
             .parse::<u16>()?;
         Ok(format!("http://127.0.0.1:{port}"))
+    }
+
+    fn read_managed_pid(state_dir: &Path) -> Result<i32> {
+        let lock = fs::read_link(state_dir.join("chrome-profile/SingletonLock"))?;
+        lock.to_string_lossy()
+            .rsplit_once('-')
+            .context("managed profile lock omitted pid")?
+            .1
+            .parse()
+            .context("managed profile lock contained an invalid pid")
+    }
+
+    fn wait_until_process_exited(pid: i32) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            if Instant::now() >= deadline {
+                bail!("managed Chrome pid {pid} remained alive after final-target close");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     fn terminate_broker(state_dir: &Path) -> Result<()> {

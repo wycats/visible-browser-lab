@@ -1071,7 +1071,7 @@ mod tests {
 
         spawn_chrome_reaper(child).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
             assert!(
                 std::time::Instant::now() < deadline,

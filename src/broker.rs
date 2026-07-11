@@ -38,6 +38,7 @@ use crate::{
     },
     managed_chrome::{
         BrowserLaunchMode, STARTUP_PAGE, activate_managed_chrome, ensure_managed_chrome,
+        managed_chrome_pid,
     },
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
@@ -980,7 +981,23 @@ impl BrowserBackend {
                 drop(startup);
 
                 if only_disposable_targets {
+                    let managed_pid = managed_chrome_pid(&browser.config);
                     client.close_browser().await?;
+                    if let Some(pid) = managed_pid {
+                        wait_for_process_exit(pid, Duration::from_secs(2)).await;
+                        if process_is_running(pid) {
+                            tracing::warn!(
+                                pid,
+                                profile = %browser.config.chrome_profile_dir.display(),
+                                "managed Chrome remained alive after Browser.close; terminating its exact profile owner"
+                            );
+                            terminate_process(pid).await.map_err(|error| {
+                                BrowserToolError::chrome_unavailable(format!(
+                                    "failed to stop managed Chrome pid {pid} after closing its final target: {error:#}"
+                                ))
+                            })?;
+                        }
+                    }
                     *browser.client.lock().await = None;
                     browser.synthetic_replacement_targets.lock().await.clear();
                     browser.startup_targets.lock().await.clear();
