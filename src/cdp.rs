@@ -1211,38 +1211,31 @@ impl CdpClient {
         target: &CdpTarget,
         expression: &str,
     ) -> Result<EvaluateResult, BrowserToolError> {
-        for attempt in 0..2 {
-            let (page, connection) = self.page(&target.id).await?;
-            match page.evaluate_expression(expression).await {
-                Ok(result) => {
-                    let remote = result.object();
-                    return Ok(EvaluateResult {
-                        value: remote.value.clone(),
-                        preview: remote
-                            .description
-                            .clone()
-                            .or_else(|| Some(remote.r#type.as_ref().to_string())),
-                    });
+        let (page, connection) = self.page(&target.id).await?;
+        let result = match page.evaluate_expression(expression).await {
+            Ok(result) => result,
+            Err(error) => {
+                if stale_execution_context(&error) {
+                    tracing::warn!(
+                        target_id = %target.id,
+                        generation = connection.generation,
+                        "invalidating the CDP connection after Chrome discarded the page execution context"
+                    );
                 }
-                Err(error) => {
-                    let retry = attempt == 0 && stale_execution_context(&error);
-                    let mapped = self
-                        .runtime
-                        .page_error(&connection, "evaluate", error)
-                        .await;
-                    if retry {
-                        tracing::warn!(
-                            target_id = %target.id,
-                            generation = connection.generation,
-                            "reconnecting after Chrome discarded the page execution context"
-                        );
-                        continue;
-                    }
-                    return Err(mapped);
-                }
+                return Err(self
+                    .runtime
+                    .page_error(&connection, "evaluate", error)
+                    .await);
             }
-        }
-        unreachable!("evaluation retry loop always returns")
+        };
+        let remote = result.object();
+        Ok(EvaluateResult {
+            value: remote.value.clone(),
+            preview: remote
+                .description
+                .clone()
+                .or_else(|| Some(remote.r#type.as_ref().to_string())),
+        })
     }
 
     pub async fn evaluate_on_backend_node(
