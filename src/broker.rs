@@ -3391,6 +3391,11 @@ async fn broker_release_tab(
         .unwrap()
         .require_releasable_owned(&params.agent_session_id, &params.tab_id)?;
     let released_target_id = released_lease.target_id;
+    if params.leave_visible && released_lease.state == LeaseState::Missing {
+        return Err(BrowserToolError::invalid_input(
+            "leave_visible requires a tab that is still visible",
+        ));
+    }
     if released_lease.state == LeaseState::Active {
         if state
             .screencasts
@@ -9057,6 +9062,21 @@ mod tests {
         assert_eq!(
             missing_error.code,
             crate::leases::BrowserToolErrorCode::TargetMissing
+        );
+        let missing_preservation_error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("Keep the visible tab open".to_string()),
+            }),
+        )
+        .await
+        .expect_err("leave_visible must reject a missing target");
+        assert_eq!(
+            missing_preservation_error.code,
+            crate::leases::BrowserToolErrorCode::InvalidInput
         );
         broker_release_tab(
             &state,
