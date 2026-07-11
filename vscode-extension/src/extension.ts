@@ -10,6 +10,7 @@ import {
   type SurfaceRequestContext,
 } from "./invocation_context";
 import { confirmationFor } from "./confirmation";
+import { modelVisibleResult } from "./model_result";
 
 interface ToolContribution {
   name: string;
@@ -80,7 +81,7 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
 
     // LanguageModelTextPart is stable at the declared engine floor.
     return new vscode.LanguageModelToolResult([
-      new vscode.LanguageModelTextPart(JSON.stringify(output.result ?? null)),
+      new vscode.LanguageModelTextPart(JSON.stringify(modelVisibleResult(output.result ?? null))),
     ]);
   }
 }

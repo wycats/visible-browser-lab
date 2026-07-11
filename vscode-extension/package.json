@@ -18,7 +18,7 @@
     "format:check": "oxfmt --check package.json tsconfig.json src test unit",
     "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
     "test:extension-host": "pnpm run build:test && node dist-test/runner.js",
-    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js dist-unit/unit/confirmation.test.js",
+    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js dist-unit/unit/confirmation.test.js dist-unit/unit/model_result.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p unit/tsconfig.json --noEmit"
   },
   "devDependencies": {

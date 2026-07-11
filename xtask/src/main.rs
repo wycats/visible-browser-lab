@@ -902,7 +902,7 @@ fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
 fn vscode_model_description(tool: &ToolDefinition) -> String {
     if tool.name == "start_session" {
         return format!(
-            "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session and never returns or accepts a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+            "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session; its model-visible schema and result never accept or expose a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
             tool.description
         );
     }
