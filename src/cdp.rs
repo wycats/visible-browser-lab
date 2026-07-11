@@ -87,7 +87,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::leases::{BrowserToolError, TabSnapshot};
+use crate::leases::{BrowserToolError, BrowserToolErrorCode, TabSnapshot};
 use crate::protocol::{EvaluateResult, NetworkEvent};
 use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 
@@ -407,7 +407,14 @@ impl CdpClient {
             }
         };
         let result = self
-            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
             .await;
         match result {
             Err(error)
@@ -638,14 +645,25 @@ impl CdpClient {
     ) -> Result<bool, BrowserToolError> {
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
-            let (page, connection) = self.page(target_id).await?;
-            let restored = self
-                .restore_beforeunload_handlers_on_page(&page, &connection)
-                .await?;
-            if restored || Instant::now() >= deadline {
-                return Ok(restored);
+            let attempt = async {
+                let (page, connection) = self.page(target_id).await?;
+                self.restore_beforeunload_handlers_on_page(&page, &connection)
+                    .await
             }
-            sleep(Duration::from_millis(25)).await;
+            .await;
+            match attempt {
+                // A clean `false` means this is a committed new document and
+                // there is no old-document stash to restore. Only transient
+                // attachment/evaluation failures warrant the recovery grace.
+                Ok(restored) => return Ok(restored),
+                Err(error)
+                    if error.code == BrowserToolErrorCode::ChromeUnavailable
+                        && Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -846,7 +864,14 @@ impl CdpClient {
             }
         };
         let result = self
-            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
             .await;
         self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
@@ -951,7 +976,14 @@ impl CdpClient {
             }
         };
         let result = self
-            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
             .await;
         self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
@@ -3064,13 +3096,14 @@ impl CdpClient {
         connection: &RuntimeConnection,
         policy: Option<&str>,
         timeout_ms: u64,
+        waits_for_lifecycle: bool,
         operation: F,
     ) -> Result<(), BrowserToolError>
     where
         F: Future<Output = Result<(), BrowserToolError>>,
     {
         match timeout(
-            navigation_timeout_budget(timeout_ms),
+            navigation_timeout_budget(timeout_ms, waits_for_lifecycle),
             self.with_navigation_dialog_policy(page, connection, policy, operation),
         )
         .await
@@ -3374,12 +3407,17 @@ impl CdpClient {
     }
 }
 
-fn navigation_timeout_budget(timeout_ms: u64) -> Duration {
+fn navigation_timeout_budget(timeout_ms: u64, waits_for_lifecycle: bool) -> Duration {
     // Lifecycle waits start after listener setup and Page.navigate returns.
     // Keep the outer watchdog as a stuck-command/dialog backstop while giving
     // the requested lifecycle wait and its committed-document recovery time
     // to finish instead of cancelling them at the same deadline.
-    Duration::from_millis(timeout_ms).saturating_add(NAVIGATION_RECOVERY_GRACE)
+    let requested = Duration::from_millis(timeout_ms);
+    if waits_for_lifecycle {
+        requested.saturating_add(NAVIGATION_RECOVERY_GRACE)
+    } else {
+        requested
+    }
 }
 
 #[derive(Debug)]
@@ -4311,10 +4349,15 @@ mod tests {
     #[test]
     fn navigation_watchdog_leaves_time_for_lifecycle_recovery() {
         assert_eq!(
-            navigation_timeout_budget(10_000),
+            navigation_timeout_budget(10_000, true),
             Duration::from_secs(10) + NAVIGATION_RECOVERY_GRACE
         );
-        assert!(navigation_timeout_budget(10_000) > Duration::from_secs(10));
+        assert!(navigation_timeout_budget(10_000, true) > Duration::from_secs(10));
+        assert_eq!(
+            navigation_timeout_budget(10_000, false),
+            Duration::from_secs(10),
+            "no-wait navigation has no lifecycle wait that needs recovery grace"
+        );
     }
 
     #[test]
