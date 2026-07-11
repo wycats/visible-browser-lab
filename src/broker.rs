@@ -763,16 +763,11 @@ impl ManagedBrowserBackend {
         {
             let cdp = CdpClient::new(&managed.cdp_endpoint)
                 .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
-            if !managed.reused {
-                let startup_targets = cdp
-                    .page_targets()
-                    .await?
-                    .into_iter()
-                    .filter(is_managed_startup_target)
-                    .map(|target| target.id)
-                    .collect();
-                *self.startup_targets.lock().await = startup_targets;
-            }
+            let targets = cdp.page_targets().await?;
+            let (synthetic_replacements, startup_targets) =
+                classify_managed_launch_targets(&targets, managed.reused);
+            *self.synthetic_replacement_targets.lock().await = synthetic_replacements;
+            *self.startup_targets.lock().await = startup_targets;
             *client = Some((managed.cdp_endpoint, cdp));
         }
         Ok(client
@@ -801,6 +796,29 @@ fn is_managed_replacement_target(target: &CdpTarget) -> bool {
 
 fn is_managed_startup_target(target: &CdpTarget) -> bool {
     target.url == STARTUP_PAGE
+}
+
+fn classify_managed_launch_targets(
+    targets: &[CdpTarget],
+    reused: bool,
+) -> (HashSet<String>, HashSet<String>) {
+    let startup_targets = targets
+        .iter()
+        .filter(|target| is_managed_startup_target(target))
+        .map(|target| target.id.clone())
+        .collect();
+    let synthetic_replacements = if reused {
+        // A blank target in an existing browser may be human-created. Only a
+        // fresh launch lets VBL attribute that placeholder to Chrome itself.
+        HashSet::new()
+    } else {
+        targets
+            .iter()
+            .filter(|target| is_managed_replacement_target(target))
+            .map(|target| target.id.clone())
+            .collect()
+    };
+    (synthetic_replacements, startup_targets)
 }
 
 fn managed_targets_are_disposable(
@@ -963,12 +981,6 @@ impl BrowserBackend {
             Self::Managed(browser) => {
                 let _page_lifecycle = browser.page_lifecycle.lock().await;
                 let client = browser.client().await?;
-                let before = client
-                    .page_targets()
-                    .await?
-                    .into_iter()
-                    .map(|target| target.id)
-                    .collect::<HashSet<_>>();
                 client.close_target(target_id).await?;
 
                 let deadline = Instant::now() + Duration::from_millis(500);
@@ -989,11 +1001,6 @@ impl BrowserBackend {
                 let mut synthetic = browser.synthetic_replacement_targets.lock().await;
                 let mut startup = browser.startup_targets.lock().await;
                 synthetic.remove(target_id);
-                for target in &targets {
-                    if !before.contains(&target.id) && is_managed_replacement_target(target) {
-                        synthetic.insert(target.id.clone());
-                    }
-                }
                 synthetic.retain(|target| current_ids.contains(target));
                 startup.retain(|target| current_ids.contains(target));
                 let only_disposable_targets =
@@ -6964,6 +6971,30 @@ mod tests {
             target.url = url.to_string();
             assert!(!is_managed_replacement_target(&target), "{url}");
         }
+    }
+
+    #[test]
+    fn managed_launch_classification_preserves_blank_tabs_on_reuse() {
+        let mut startup = fake_target("startup");
+        startup.url = STARTUP_PAGE.to_string();
+        let mut blank = fake_target("blank");
+        blank.url = "about:blank".to_string();
+        let targets = vec![startup, blank];
+
+        let (fresh_synthetic, fresh_startup) = classify_managed_launch_targets(&targets, false);
+        assert_eq!(fresh_synthetic, HashSet::from(["blank".to_string()]));
+        assert_eq!(fresh_startup, HashSet::from(["startup".to_string()]));
+
+        let (reused_synthetic, reused_startup) = classify_managed_launch_targets(&targets, true);
+        assert!(
+            reused_synthetic.is_empty(),
+            "blank tabs in a reused browser have no safe VBL provenance"
+        );
+        assert_eq!(reused_startup, HashSet::from(["startup".to_string()]));
+        assert!(
+            !managed_targets_are_disposable(&targets, &reused_synthetic, &reused_startup),
+            "an unproven blank tab must prevent whole-browser disposal"
+        );
     }
 
     #[test]
