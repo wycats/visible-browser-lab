@@ -94,6 +94,7 @@ use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
+const NAVIGATION_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 const BEFOREUNLOAD_STASH_KEY: &str = "__io_github_wycats_visible_browser_lab_beforeunload_stash_v1";
 
 /// Every remote handle we create is tagged with a per-operation object
@@ -844,7 +845,10 @@ impl CdpClient {
                 _ => unreachable!("history wait state was validated before navigation"),
             }
         };
-        self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+        let result = self
+            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .await;
+        self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
     }
 
@@ -946,8 +950,41 @@ impl CdpClient {
                 _ => unreachable!("reload wait state was validated before navigation"),
             }
         };
-        self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+        let result = self
+            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .await;
+        self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
+    }
+
+    async fn finish_beforeunload_navigation(
+        &self,
+        target_id: &str,
+        policy: Option<&str>,
+        result: Result<(), BrowserToolError>,
+    ) -> Result<(), BrowserToolError> {
+        if policy != Some("accept") {
+            return result;
+        }
+        match result {
+            Ok(()) => {
+                // A committed document has no stash. A same-document history
+                // move or reload keeps the original document and must restore
+                // the guard that explicit acceptance temporarily removed.
+                self.restore_beforeunload_handlers(target_id).await?;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(restore_error) = self.restore_beforeunload_handlers(target_id).await {
+                    tracing::warn!(
+                        target_id,
+                        error = %restore_error.message,
+                        "failed to restore beforeunload handlers after rejected navigation"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn screenshot(
@@ -3033,7 +3070,7 @@ impl CdpClient {
         F: Future<Output = Result<(), BrowserToolError>>,
     {
         match timeout(
-            Duration::from_millis(timeout_ms),
+            navigation_timeout_budget(timeout_ms),
             self.with_navigation_dialog_policy(page, connection, policy, operation),
         )
         .await
@@ -3335,6 +3372,14 @@ impl CdpClient {
             "delivery_uncertain": false
         }))
     }
+}
+
+fn navigation_timeout_budget(timeout_ms: u64) -> Duration {
+    // Lifecycle waits start after listener setup and Page.navigate returns.
+    // Keep the outer watchdog as a stuck-command/dialog backstop while giving
+    // the requested lifecycle wait and its committed-document recovery time
+    // to finish instead of cancelling them at the same deadline.
+    Duration::from_millis(timeout_ms).saturating_add(NAVIGATION_RECOVERY_GRACE)
 }
 
 #[derive(Debug)]
@@ -4261,6 +4306,15 @@ mod tests {
             "loading",
             "DOMContentLoaded"
         ));
+    }
+
+    #[test]
+    fn navigation_watchdog_leaves_time_for_lifecycle_recovery() {
+        assert_eq!(
+            navigation_timeout_budget(10_000),
+            Duration::from_secs(10) + NAVIGATION_RECOVERY_GRACE
+        );
+        assert!(navigation_timeout_budget(10_000) > Duration::from_secs(10));
     }
 
     #[test]
