@@ -31,6 +31,11 @@ test("preserves page-controlled fields in nested evaluate results", () => {
   assert.deepEqual(modelVisibleResult(value), value);
 });
 
+test("preserves top-level array results", () => {
+  const value = [{ agent_session_id: "page-controlled-value", value: 1 }];
+  assert.deepEqual(modelVisibleResult(value), value);
+});
+
 test("does not mutate the broker result", () => {
   const brokerResult = { agent_session_id: "session-secret", mode: "explicit" };
   modelVisibleResult(brokerResult);
