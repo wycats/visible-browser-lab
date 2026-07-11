@@ -44,7 +44,7 @@ mod macos {
         fs,
         net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
@@ -397,6 +397,208 @@ mod macos {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "launches visible managed Chrome to verify beforeunload recovery"]
+    fn beforeunload_accept_keeps_the_owned_tab_usable() -> Result<()> {
+        let original_frontmost = frontmost_application()?;
+        let state = tempfile::Builder::new()
+            .prefix("vbl-managed-beforeunload-")
+            .tempdir_in("/tmp")?;
+        let cleanup = Cleanup {
+            state_dir: state.path().to_path_buf(),
+            original_frontmost,
+        };
+        let fixture = FixtureServer::start()?;
+        let chrome = chrome_for_testing_executable()?;
+        let mut client =
+            McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &chrome)?;
+        client.initialize("visible-browser-lab-managed-beforeunload")?;
+
+        let session = client.call_tool(
+            "start_session",
+            json!({
+                "label": "managed-beforeunload",
+                "start_url": fixture.url("/beforeunload"),
+                "focus": false
+            }),
+            Duration::from_secs(45),
+            false,
+        )?;
+        let session_id = field_str(&session, "agent_session_id")?;
+        let tab = OpenTab::from_summary(
+            &session_id,
+            session.get("tab").context("start_session omitted tab")?,
+        )?;
+        let sibling_result = client.call_tool(
+            "new_tab",
+            json!({
+                "agent_session_id": session_id,
+                "url": fixture.url("/sibling"),
+                "focus": false
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let sibling = OpenTab::from_summary(
+            &session_id,
+            sibling_result.get("tab").context("new_tab omitted tab")?,
+        )?;
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblGuard = event => { event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
+                "key": "Enter",
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client
+            .call_tool(
+                "navigate",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": tab.tab_id,
+                    "action": "url",
+                    "url": fixture.url("/dismissed-beforeunload"),
+                    "wait_until": "none",
+                    "timeout_ms": 5000,
+                    "before_unload": "dismiss",
+                    "observe": "none"
+                }),
+                Duration::from_secs(15),
+                false,
+            )
+            .context("dismiss beforeunload navigation")?;
+        let dismissed = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "location.pathname"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            dismissed.get("value").and_then(|value| value.as_str()),
+            Some("/chat/pending")
+        );
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "window.removeEventListener('beforeunload', window.__vblGuard); true"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblGuard = event => { event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "target": { "css": "#entry" },
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "target": { "css": "#entry" },
+                "key": "Enter",
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client
+            .call_tool(
+                "navigate",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": sibling.tab_id,
+                    "action": "url",
+                    "url": fixture.url("/after-beforeunload"),
+                    "wait_until": "none",
+                    "timeout_ms": 10000,
+                    "before_unload": "accept",
+                    "observe": "none"
+                }),
+                Duration::from_secs(15),
+                false,
+            )
+            .context("accept beforeunload navigation")?;
+        let title = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "document.title"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            title.get("value").and_then(|value| value.as_str()),
+            Some("VBL Fixture")
+        );
+
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
+            Duration::from_secs(15),
+            false,
+        )?;
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": sibling.tab_id }),
+            Duration::from_secs(15),
+            false,
+        )?;
+        client.shutdown();
+        drop(cleanup);
+        Ok(())
+    }
+
     #[derive(Debug, Clone)]
     struct FrontmostApplication {
         pid: u32,
@@ -512,7 +714,22 @@ mod macos {
                 "user-data-dir={}",
                 self.state_dir.join("chrome-profile").display()
             );
-            let _ = Command::new("pkill").args(["-f", &profile]).status();
+            let _ = Command::new("pkill")
+                .args(["-TERM", "-f", &profile])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Command::new("pgrep")
+                .args(["-f", &profile])
+                .stdout(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-f", &profile])
+                .status();
             let _ = restore_frontmost_application(&self.original_frontmost);
         }
     }

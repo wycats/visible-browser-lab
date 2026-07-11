@@ -358,6 +358,22 @@ impl CdpClient {
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
+        let original_href = if before_unload == Some("accept") {
+            let value = page
+                .evaluate_expression("location.href")
+                .await
+                .map_err(|error| map_cdp_error("read pre-navigation URL", &error))?;
+            Some(value.into_value::<String>().map_err(|error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid pre-navigation URL: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        if original_href.is_some() {
+            self.clear_beforeunload_handlers(&page, &connection).await?;
+        }
         let navigation = async {
             match wait_until.unwrap_or("load") {
                 "none" => self
@@ -389,8 +405,27 @@ impl CdpClient {
                 ))),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
-            .await
+        let result = self
+            .with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
+            .await;
+        match result {
+            Err(error)
+                if error.code == crate::leases::BrowserToolErrorCode::OperationTimeout
+                    && original_href.is_some() =>
+            {
+                match self
+                    .recover_completed_navigation(
+                        &target.id,
+                        original_href.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(error),
+                }
+            }
+            result => result,
+        }
     }
 
     async fn start_page_navigation(
@@ -430,8 +465,33 @@ impl CdpClient {
         if !self.start_page_navigation(page, connection, url).await? {
             return Ok(());
         }
-        self.wait_for_lifecycle_event(&mut events, timeout_ms, event_name)
+        match self
+            .wait_for_lifecycle_event(&mut events, timeout_ms, event_name)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.code == crate::leases::BrowserToolErrorCode::OperationTimeout => {
+                let ready_state = page
+                    .evaluate_expression("document.readyState")
+                    .await
+                    .map_err(|cdp_error| map_cdp_error("read document readiness", &cdp_error))?
+                    .into_value::<String>()
+                    .map_err(|value_error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned an invalid document state: {value_error}"
+                        ))
+                    })?;
+                let ready = match event_name {
+                    "DOMContentLoaded" => {
+                        matches!(ready_state.as_str(), "interactive" | "complete")
+                    }
+                    "load" => ready_state == "complete",
+                    _ => false,
+                };
+                if ready { Ok(()) } else { Err(error) }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn wait_for_lifecycle_event<T>(
@@ -452,6 +512,93 @@ impl CdpClient {
                 "timed out waiting for {event_name} during navigation"
             ))),
         }
+    }
+
+    async fn clear_beforeunload_handlers(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<(), BrowserToolError> {
+        // An explicit accept authorizes VBL to remove page-owned guards before
+        // navigating. This avoids Chromium leaving the target session wedged
+        // after acknowledging a native beforeunload dialog.
+        let expression = r#"(() => {
+            const listeners = typeof getEventListeners === 'function'
+                ? (getEventListeners(window).beforeunload ?? [])
+                : [];
+            for (const entry of listeners) {
+                window.removeEventListener('beforeunload', entry.listener, entry.useCapture);
+            }
+            window.onbeforeunload = null;
+        })()"#;
+        let response = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    RuntimeEvaluateParams::builder()
+                        .expression(expression)
+                        .include_command_line_api(true)
+                        .return_by_value(true)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "accept beforeunload navigation",
+            )
+            .await?;
+        if let Some(details) = response.result.exception_details {
+            return Err(BrowserToolError::chrome_unavailable(format!(
+                "accept beforeunload navigation failed: {}",
+                details.text
+            )));
+        }
+        Ok(())
+    }
+
+    async fn recover_completed_navigation(
+        &self,
+        target_id: &str,
+        original_href: &str,
+    ) -> Result<(), BrowserToolError> {
+        // Chromium can commit the navigation while its command response is
+        // lost during dialog teardown. Only treat that timeout as success when
+        // a fresh attachment proves both a changed URL and a usable document.
+        let recovery = async {
+            loop {
+                let (page, _) = self.page(target_id).await?;
+                let value = page
+                    .evaluate_expression(
+                        "({ href: location.href, readyState: document.readyState })",
+                    )
+                    .await
+                    .map_err(|error| map_cdp_error("verify recovered navigation", &error))?
+                    .into_value::<Value>()
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned invalid recovered navigation state: {error}"
+                        ))
+                    })?;
+                let href = value
+                    .get("href")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let ready_state = value
+                    .get("readyState")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if href != original_href && matches!(ready_state, "interactive" | "complete") {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        };
+        timeout(Duration::from_secs(2), recovery)
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout(
+                    "navigation did not recover after the CDP command timed out",
+                )
+            })?
     }
 
     pub async fn add_init_script(
@@ -498,6 +645,9 @@ impl CdpClient {
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
+        if before_unload == Some("accept") {
+            self.clear_beforeunload_handlers(&page, &connection).await?;
+        }
         let history = self
             .runtime
             .page_command(
@@ -553,7 +703,7 @@ impl CdpClient {
                 ))),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+        self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
             .await
     }
 
@@ -619,6 +769,9 @@ impl CdpClient {
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
+        if before_unload == Some("accept") {
+            self.clear_beforeunload_handlers(&page, &connection).await?;
+        }
         let navigation = async {
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
@@ -653,7 +806,7 @@ impl CdpClient {
                 ))),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+        self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
             .await
     }
 
@@ -2674,15 +2827,15 @@ impl CdpClient {
             })
     }
 
-    async fn with_navigation_dialog_policy<T, F>(
+    async fn with_navigation_dialog_policy<F>(
         &self,
         page: &Page,
         connection: &RuntimeConnection,
         policy: Option<&str>,
         operation: F,
-    ) -> Result<T, BrowserToolError>
+    ) -> Result<(), BrowserToolError>
     where
-        F: Future<Output = Result<T, BrowserToolError>>,
+        F: Future<Output = Result<(), BrowserToolError>>,
     {
         let Some(policy) = policy else {
             return operation.await;
@@ -2700,26 +2853,53 @@ impl CdpClient {
             .event_listener::<EventJavascriptDialogOpening>(page, connection)
             .await?;
         tokio::pin!(operation);
-        loop {
-            tokio::select! {
-                result = &mut operation => return result,
-                dialog = dialogs.next() => {
-                    let Some(_dialog) = dialog else {
-                        return operation.await;
-                    };
-                    self.runtime
-                        .page_command(
-                            connection,
-                            page.execute(
-                                HandleJavaScriptDialogParams::builder()
-                                    .accept(accept)
-                                    .build()
-                                    .map_err(BrowserToolError::invalid_input)?,
-                            ),
-                            "handle navigation dialog",
-                        )
-                        .await?;
-                }
+        tokio::select! {
+            result = &mut operation => result,
+            dialog = dialogs.next() => {
+                let Some(_dialog) = dialog else {
+                    return operation.await;
+                };
+                self.runtime
+                    .page_command(
+                        connection,
+                        page.execute(
+                            HandleJavaScriptDialogParams::builder()
+                                .accept(accept)
+                                .build()
+                                .map_err(BrowserToolError::invalid_input)?,
+                        ),
+                        "handle navigation dialog",
+                    )
+                    .await?;
+                self.runtime.invalidate(connection.generation).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn with_navigation_timeout<F>(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        policy: Option<&str>,
+        timeout_ms: u64,
+        operation: F,
+    ) -> Result<(), BrowserToolError>
+    where
+        F: Future<Output = Result<(), BrowserToolError>>,
+    {
+        match timeout(
+            Duration::from_millis(timeout_ms),
+            self.with_navigation_dialog_policy(page, connection, policy, operation),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.runtime.invalidate(connection.generation).await;
+                Err(BrowserToolError::operation_timeout(
+                    "navigation did not complete before the requested timeout",
+                ))
             }
         }
     }
