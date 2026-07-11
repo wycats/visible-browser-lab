@@ -2853,26 +2853,32 @@ impl CdpClient {
             .event_listener::<EventJavascriptDialogOpening>(page, connection)
             .await?;
         tokio::pin!(operation);
-        tokio::select! {
-            result = &mut operation => result,
-            dialog = dialogs.next() => {
-                let Some(_dialog) = dialog else {
-                    return operation.await;
-                };
-                self.runtime
-                    .page_command(
-                        connection,
-                        page.execute(
-                            HandleJavaScriptDialogParams::builder()
-                                .accept(accept)
-                                .build()
-                                .map_err(BrowserToolError::invalid_input)?,
-                        ),
-                        "handle navigation dialog",
-                    )
-                    .await?;
-                self.runtime.invalidate(connection.generation).await;
-                Ok(())
+        loop {
+            tokio::select! {
+                result = &mut operation => return result,
+                dialog = dialogs.next() => {
+                    let Some(_dialog) = dialog else {
+                        return operation.await;
+                    };
+                    self.runtime
+                        .page_command(
+                            connection,
+                            page.execute(
+                                HandleJavaScriptDialogParams::builder()
+                                    .accept(accept)
+                                    .build()
+                                    .map_err(BrowserToolError::invalid_input)?,
+                            ),
+                            "handle navigation dialog",
+                        )
+                        .await?;
+                    if !accept {
+                        // Dismissing beforeunload cancels the navigation, so
+                        // there is no navigation completion left to await.
+                        self.runtime.invalidate(connection.generation).await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }

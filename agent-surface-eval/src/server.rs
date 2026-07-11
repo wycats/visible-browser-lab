@@ -220,7 +220,13 @@ fn tool_response(
         }),
         "new_tab" | "claim_tab" | "focus_tab" => json!({"tab":tab_summary()}),
         "navigate" => page_action_response(fixture, include_result),
-        "release_tab" => json!({"released":true,"leave_visible":false}),
+        "release_tab" => json!({
+            "released": true,
+            "leave_visible": arguments
+                .get("leave_visible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }),
         "close_tab" => json!({"closed":true}),
         "wait_for" => {
             let mut response = page_action_response(fixture, include_result);
@@ -555,6 +561,36 @@ mod tests {
         let call: LoggedCall =
             serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
         assert!(!call.backend_action);
+    }
+
+    #[test]
+    fn release_tab_response_reflects_preservation_request() {
+        let temp = tempdir().unwrap();
+        let server = EvaluationServer::new(
+            "ownership-foreign-action-refusal",
+            temp.path().join("calls.jsonl"),
+        )
+        .unwrap();
+        let result = server.execute(
+            "release_tab",
+            Map::from_iter([
+                ("agent_session_id".to_string(), json!("session_eval")),
+                ("tab_id".to_string(), json!("tab_owned")),
+                ("leave_visible".to_string(), json!(true)),
+                (
+                    "user_instruction".to_string(),
+                    json!("Leave this tab visible for me."),
+                ),
+            ]),
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("leave_visible"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
