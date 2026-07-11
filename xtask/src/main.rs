@@ -1826,6 +1826,12 @@ fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBu
             dist.join("invocation_context.js").display()
         );
     }
+    if !dist.join("model_result.js").is_file() {
+        bail!(
+            "extension model-result module not found at `{}`. Run `pnpm build` first.",
+            dist.join("model_result.js").display()
+        );
+    }
     Ok(dist)
 }
 
@@ -1959,6 +1965,12 @@ fn write_vsix_archive(
     )?;
     add_file(
         &mut zip,
+        "extension/dist/model_result.js",
+        &extension_dist.join("model_result.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
         &format!("extension/bin/{binary_name}"),
         binary,
         executable_mode(target),
@@ -2017,6 +2029,7 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension/dist/extension.js",
         "extension/dist/confirmation.js",
         "extension/dist/invocation_context.js",
+        "extension/dist/model_result.js",
         "extension/skills/visible-browser-lab/SKILL.md",
     ] {
         if !names.iter().any(|name| name == required) {
@@ -3028,6 +3041,7 @@ mod tests {
         fs::write(dist.join("extension.js"), b"// bundle").unwrap();
         fs::write(dist.join("confirmation.js"), b"// confirmation module").unwrap();
         fs::write(dist.join("invocation_context.js"), b"// context module").unwrap();
+        fs::write(dist.join("model_result.js"), b"// model result module").unwrap();
         let vsix = output.path().join(format!(
             "visible-browser-lab-vscode-{version}-{target}.vsix"
         ));
