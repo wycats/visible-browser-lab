@@ -1501,6 +1501,21 @@ fn run_installed_facade_lifecycle(
         &session_id,
         session.get("tab").context("start_session omitted tab")?,
     )?;
+    client.call_tool(
+        "wait_for",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id.clone(),
+            "condition": {
+                "kind": "expression",
+                "expression": format!("document.title === {expected_title:?}")
+            },
+            "timeout_ms": 10_000,
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
     let owned = client.call_tool(
         "list_tabs",
         json!({ "agent_session_id": session_id }),
