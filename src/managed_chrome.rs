@@ -465,10 +465,7 @@ fn chrome_arguments_for(
 
     #[cfg(target_os = "macos")]
     if family == ChromeFamily::ChromeForTesting {
-        args.extend([
-            "--use-mock-keychain".into(),
-            "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC".into(),
-        ]);
+        args.push("--use-mock-keychain".into());
     }
 
     if capture_logs {
@@ -906,7 +903,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn chrome_for_testing_suppresses_host_permission_prompts_on_macos() {
+    fn chrome_for_testing_uses_mock_keychain_on_macos() {
         let config = RuntimeConfig::managed(PathBuf::from("/tmp/vbl"), None);
         let args = chrome_arguments_for(
             &config,
@@ -920,9 +917,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(args.contains(&"--use-mock-keychain".into()));
-        assert!(args.contains(
-            &"--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebRTC".into()
-        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -941,7 +935,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!args.contains(&"--use-mock-keychain".into()));
-        assert!(!args.iter().any(|arg| arg.contains("LocalNetworkAccess")));
     }
 
     #[cfg(target_os = "macos")]
