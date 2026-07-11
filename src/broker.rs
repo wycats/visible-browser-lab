@@ -36,7 +36,9 @@ use crate::{
         AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, ExpiredLease,
         LeaseRegistry, LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
-    managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
+    managed_chrome::{
+        BrowserLaunchMode, STARTUP_PAGE, activate_managed_chrome, ensure_managed_chrome,
+    },
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
         ClaimTabParams, ClickParams, CloseTabResult, ConsoleMessage, DomainParams,
@@ -723,6 +725,7 @@ struct ManagedBrowserBackend {
     client: Arc<AsyncMutex<Option<(String, CdpClient)>>>,
     page_lifecycle: Arc<AsyncMutex<()>>,
     synthetic_replacement_targets: Arc<AsyncMutex<HashSet<String>>>,
+    startup_targets: Arc<AsyncMutex<HashSet<String>>>,
 }
 
 impl ManagedBrowserBackend {
@@ -732,6 +735,7 @@ impl ManagedBrowserBackend {
             client: Arc::new(AsyncMutex::new(None)),
             page_lifecycle: Arc::new(AsyncMutex::new(())),
             synthetic_replacement_targets: Arc::new(AsyncMutex::new(HashSet::new())),
+            startup_targets: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -746,6 +750,16 @@ impl ManagedBrowserBackend {
         {
             let cdp = CdpClient::new(&managed.cdp_endpoint)
                 .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+            if !managed.reused {
+                let startup_targets = cdp
+                    .page_targets()
+                    .await?
+                    .into_iter()
+                    .filter(is_managed_startup_target)
+                    .map(|target| target.id)
+                    .collect();
+                *self.startup_targets.lock().await = startup_targets;
+            }
             *client = Some((managed.cdp_endpoint, cdp));
         }
         Ok(client
@@ -770,6 +784,22 @@ fn is_managed_replacement_target(target: &CdpTarget) -> bool {
         target.url.as_str(),
         "about:blank" | "chrome://newtab/" | "chrome://new-tab-page/"
     )
+}
+
+fn is_managed_startup_target(target: &CdpTarget) -> bool {
+    target.url == STARTUP_PAGE
+}
+
+fn managed_targets_are_disposable(
+    targets: &[CdpTarget],
+    synthetic_replacements: &HashSet<String>,
+    startup_targets: &HashSet<String>,
+) -> bool {
+    targets.iter().all(|target| {
+        startup_targets.contains(&target.id)
+            || (synthetic_replacements.contains(&target.id)
+                && is_managed_replacement_target(target))
+    })
 }
 
 impl BrowserBackend {
@@ -918,6 +948,7 @@ impl BrowserBackend {
                     .map(|target| target.id.clone())
                     .collect::<HashSet<_>>();
                 let mut synthetic = browser.synthetic_replacement_targets.lock().await;
+                let mut startup = browser.startup_targets.lock().await;
                 synthetic.remove(target_id);
                 for target in &targets {
                     if !before.contains(&target.id) && is_managed_replacement_target(target) {
@@ -925,15 +956,17 @@ impl BrowserBackend {
                     }
                 }
                 synthetic.retain(|target| current_ids.contains(target));
-                let only_synthetic_replacements = targets.iter().all(|target| {
-                    synthetic.contains(&target.id) && is_managed_replacement_target(target)
-                });
+                startup.retain(|target| current_ids.contains(target));
+                let only_disposable_targets =
+                    managed_targets_are_disposable(&targets, &synthetic, &startup);
                 drop(synthetic);
+                drop(startup);
 
-                if only_synthetic_replacements {
+                if only_disposable_targets {
                     client.close_browser().await?;
                     *browser.client.lock().await = None;
                     browser.synthetic_replacement_targets.lock().await.clear();
+                    browser.startup_targets.lock().await.clear();
                 }
                 Ok(())
             }
@@ -3264,32 +3297,34 @@ async fn broker_release_tab(
             "user_instruction is accepted only when leave_visible is true",
         ));
     }
-    let released_target_id = state
+    let released_lease = state
         .registry()
         .lock()
         .unwrap()
-        .require_active_owned(&params.agent_session_id, &params.tab_id, true)?
-        .target_id;
-    if state
-        .screencasts
-        .lock()
-        .await
-        .contains_key(&released_target_id)
-    {
-        return Err(BrowserToolError::invalid_input(
-            "stop the active screencast before releasing its tab",
-        ));
-    }
-    if state.traces.lock().await.contains_key(&released_target_id) {
-        return Err(BrowserToolError::invalid_input(
-            "stop the active performance trace before releasing its tab",
-        ));
-    }
-    if let Ok(target) = target_by_id(state, &released_target_id).await {
-        state
-            .browser
-            .emulate(&target, "reset", &serde_json::Map::new())
-            .await?;
+        .require_releasable_owned(&params.agent_session_id, &params.tab_id)?;
+    let released_target_id = released_lease.target_id;
+    if released_lease.state == LeaseState::Active {
+        if state
+            .screencasts
+            .lock()
+            .await
+            .contains_key(&released_target_id)
+        {
+            return Err(BrowserToolError::invalid_input(
+                "stop the active screencast before releasing its tab",
+            ));
+        }
+        if state.traces.lock().await.contains_key(&released_target_id) {
+            return Err(BrowserToolError::invalid_input(
+                "stop the active performance trace before releasing its tab",
+            ));
+        }
+        if let Ok(target) = target_by_id(state, &released_target_id).await {
+            state
+                .browser
+                .emulate(&target, "reset", &serde_json::Map::new())
+                .await?;
+        }
     }
     let lease = state.registry().lock().unwrap().release_tab(
         &params.agent_session_id,
@@ -6867,6 +6902,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_startup_target_is_disposable_only_when_launch_tracking_claims_it() {
+        let mut startup = fake_target("startup");
+        startup.url = STARTUP_PAGE.to_string();
+        let targets = vec![startup];
+
+        assert!(!managed_targets_are_disposable(
+            &targets,
+            &HashSet::new(),
+            &HashSet::new()
+        ));
+        assert!(managed_targets_are_disposable(
+            &targets,
+            &HashSet::new(),
+            &HashSet::from(["startup".to_string()])
+        ));
+    }
+
+    #[test]
     fn normalized_endpoint_omits_the_url_root_slash() {
         let client = CdpClient::new("http://127.0.0.1:9222/").unwrap();
 
@@ -8774,8 +8827,8 @@ mod tests {
         let missing_error = broker_focus_tab(
             &state,
             Ok(TabActionParams {
-                agent_session_id: session.agent_session_id,
-                tab_id: missing.tab_id,
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id.clone(),
             }),
         )
         .await
@@ -8783,6 +8836,29 @@ mod tests {
         assert_eq!(
             missing_error.code,
             crate::leases::BrowserToolErrorCode::TargetMissing
+        );
+        broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id,
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .expect("release_tab must clear a missing lease");
+        let owned_after_missing_release = broker_list_tabs(
+            &state,
+            Ok(ListTabsParams {
+                agent_session_id: session.agent_session_id,
+                scope: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(owned_after_missing_release, ListTabsResult::Owned { tabs } if tabs.is_empty())
         );
     }
 

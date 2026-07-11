@@ -873,6 +873,20 @@ impl LeaseRegistry {
             .clone())
     }
 
+    pub fn require_releasable_owned(
+        &self,
+        session_id: &AgentSessionId,
+        tab_id: &TabId,
+    ) -> Result<TabLease, BrowserToolError> {
+        let lease = self.owned_lease(session_id, tab_id)?;
+        match lease.state {
+            LeaseState::Active | LeaseState::Missing => Ok(lease),
+            LeaseState::Released | LeaseState::Closed => {
+                Err(BrowserToolError::tab_not_active(tab_id, &lease.state))
+            }
+        }
+    }
+
     pub fn update_tab_snapshot(
         &mut self,
         tab_id: &TabId,

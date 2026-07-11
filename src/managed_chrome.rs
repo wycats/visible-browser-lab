@@ -21,7 +21,7 @@ use crate::{
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(15);
 const CHROME_START_RETRY: Duration = Duration::from_millis(50);
 const CHROME_PROFILE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
-const STARTUP_PAGE: &str = "data:text/html,<title>Visible%20Browser%20Lab</title>";
+pub(crate) const STARTUP_PAGE: &str = "data:text/html,<title>Visible%20Browser%20Lab</title>";
 const CHROME_LOG_CAPTURE_ENV: &str = "VISIBLE_BROWSER_LAB_CHROME_LOGS";
 const MAX_CHROME_LOG_BYTES: u64 = 8 * 1024 * 1024;
 

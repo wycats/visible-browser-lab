@@ -550,6 +550,41 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        let invalid_forward = client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "forward",
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            true,
+        )?;
+        assert_eq!(
+            invalid_forward.get("code").and_then(|value| value.as_str()),
+            Some("invalid_input")
+        );
+        let guard_still_active = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            guard_still_active
+                .get("value")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a no-op history request must preserve the page's unload guard"
+        );
         client
             .call_tool(
                 "navigate",

@@ -6,7 +6,7 @@
 
 Visible Browser Lab closes every browser target it created when the responsible session expires, whether that session is ambient or explicit and whether the target is still leased or has been ordinarily released. Targets that existed before VBL claimed them remain durable human state and are never closed by session expiry. A caller can explicitly preserve a VBL-created target with `release_tab({ leave_visible: true, user_instruction: "..." })`, which permanently removes VBL's cleanup authority for that target.
 
-This RFC supersedes only the target-disposition rules in RFC 00009 and RFC 00011. Their session TTL, conversation identity, workspace binding, and non-disclosure contracts remain unchanged. Twill RFC 0013 is unaffected because cleanup ownership is VBL application policy, not conversation-identity infrastructure.
+This RFC supersedes only the target-disposition rules in RFC 00009 and RFC 00011. Their session TTL, conversation identity, workspace binding, and non-disclosure contracts remain unchanged. Twill's RFC 0013 is unaffected because cleanup ownership is VBL application policy, not conversation-identity infrastructure.
 
 # Motivation
 
@@ -68,7 +68,7 @@ Normal release returns the same shape with `leave_visible: false`. Supplying `us
 
 The expiry sweep closes every cleanup-owned target associated with the expiring session in either `Active` or `Released` state. Borrowed active or missing leases transition to `Released` without touching Chrome.
 
-Before an asynchronous close, the registry reserves the target. Claims fail while the reservation exists. A successful close or an already-missing target clears provenance and records the existing closed-target tombstone. A failed close releases the reservation and cleanup provenance so the surviving target is claimable rather than permanently stranded or repeatedly retried without a session owner.
+Before an asynchronous close, the registry reserves the target. Claims fail while the reservation exists. A successful close or an already-missing target clears provenance and records the existing closed-target tombstone. A failed close releases the reservation, restores cleanup provenance on the surviving target, and leaves it claimable. The expired session does not retry the close. If another session claims the target, cleanup responsibility transfers and that session's later expiry can close it.
 
 Closing the final VBL-created page in a VBL-managed Chrome instance closes that managed browser when only Chrome-synthesized replacement targets remain, rather than leaving replacement New Tab windows behind. The next browser operation relaunches Chrome lazily. External CDP runtimes retain their existing lifecycle, and VBL does not close a managed browser while another independently created page target remains.
 
@@ -107,6 +107,6 @@ Provenance remains in memory. That is deliberate: persisting or heuristically re
 - Cleanup provenance transfers when another session claims or takes over a VBL-created target, including after release; expiry of the former session cannot close it.
 - `close_tab` and target disappearance clear provenance.
 - Claim-versus-expiry reservations prevent adoption of a target selected for closure.
-- Close failure releases the reservation and leaves the target claimable without cleanup ownership.
+- Close failure releases the reservation, leaves the target claimable, and preserves transferable cleanup ownership for a successor.
 - Tool schemas, help, skill guidance, VS Code catalogs, and broker protocol agree on the new release shape.
 - No cleanup provenance, user instruction, conversation identity, or internal ambient handle appears in ordinary logs or browser-operation results.

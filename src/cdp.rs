@@ -645,8 +645,14 @@ impl CdpClient {
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        if before_unload == Some("accept") {
-            self.clear_beforeunload_handlers(&page, &connection).await?;
+        let wait_until = wait_until.unwrap_or("load");
+        if !matches!(
+            wait_until,
+            "none" | "dom_content_loaded" | "load" | "network_idle"
+        ) {
+            return Err(BrowserToolError::invalid_input(format!(
+                "unknown navigation wait state `{wait_until}`"
+            )));
         }
         let history = self
             .runtime
@@ -670,8 +676,11 @@ impl CdpClient {
                 })
             })?;
         let entry_id = entry.id;
+        if before_unload == Some("accept") {
+            self.clear_beforeunload_handlers(&page, &connection).await?;
+        }
         let navigation = async {
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .runtime
                     .page_command(
@@ -689,18 +698,10 @@ impl CdpClient {
                             "navigate browser history",
                         )
                         .await?;
-                    self.wait_for_history_entry(
-                        &page,
-                        &connection,
-                        index,
-                        wait_until.unwrap_or("load"),
-                        timeout_ms,
-                    )
-                    .await
+                    self.wait_for_history_entry(&page, &connection, index, wait_until, timeout_ms)
+                        .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("history wait state was validated before navigation"),
             }
         };
         self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
