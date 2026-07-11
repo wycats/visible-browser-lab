@@ -354,6 +354,7 @@ struct FakeBrowser {
     typed_text: Vec<String>,
     pressed_keys: Vec<String>,
     fail_emulation_reset: bool,
+    fail_page_targets: bool,
 }
 
 #[cfg(test)]
@@ -372,6 +373,7 @@ impl FakeBrowser {
             typed_text: Vec::new(),
             pressed_keys: Vec::new(),
             fail_emulation_reset: false,
+            fail_page_targets: false,
         }
     }
 
@@ -380,8 +382,18 @@ impl FakeBrowser {
         self
     }
 
-    fn page_targets(&self) -> Vec<CdpTarget> {
-        self.targets.clone()
+    fn with_failed_page_targets(mut self) -> Self {
+        self.fail_page_targets = true;
+        self
+    }
+
+    fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
+        if self.fail_page_targets {
+            return Err(BrowserToolError::chrome_unavailable(
+                "synthetic target lookup failure",
+            ));
+        }
+        Ok(self.targets.clone())
     }
 
     fn create_page(&mut self, url: Option<&str>, focus: bool) -> CdpTarget {
@@ -852,7 +864,7 @@ impl BrowserBackend {
     async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(browser) => Ok(browser.lock().unwrap().page_targets()),
+            Self::Fake(browser) => browser.lock().unwrap().page_targets(),
             _ => self.cdp_client().await?.page_targets().await,
         }
     }
@@ -862,6 +874,15 @@ impl BrowserBackend {
             let mut synthetic = browser.synthetic_replacement_targets.lock().await;
             let mut startup = browser.startup_targets.lock().await;
             mark_managed_target_claimed(target_id, &mut synthetic, &mut startup);
+        }
+    }
+
+    async fn reserve_page_lifecycle(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match self {
+            Self::Managed(browser) => Some(Arc::clone(&browser.page_lifecycle).lock_owned().await),
+            Self::External(_) => None,
+            #[cfg(test)]
+            Self::Fake(_) => None,
         }
     }
 
@@ -3277,6 +3298,10 @@ async fn broker_claim_tab(
     params: Result<ClaimTabParams, BrowserToolError>,
 ) -> Result<TabResult, BrowserToolError> {
     let params = params?;
+    // Serialize the target lookup, registry claim, and disposable-marker
+    // removal with managed create/close operations. Otherwise a claim can
+    // succeed after final-target disposal has decided to close the browser.
+    let page_lifecycle = state.browser.reserve_page_lifecycle().await;
     let target = target_by_id(state, &params.target_id).await?;
     if params.takeover {
         if let Some(capture) = state.traces.lock().await.remove(&target.id) {
@@ -3303,6 +3328,7 @@ async fn broker_claim_tab(
         params.user_instruction.as_deref(),
     )?;
     state.browser.mark_target_claimed(&target.id).await;
+    drop(page_lifecycle);
     let old_monitor = state.diagnostics().lock().unwrap().reset_target(&target.id);
     state.references().lock().unwrap().reset_target(&target.id);
     if let Some(monitor) = old_monitor {
@@ -3354,11 +3380,15 @@ async fn broker_release_tab(
                 "stop the active performance trace before releasing its tab",
             ));
         }
-        if let Ok(target) = target_by_id(state, &released_target_id).await {
-            state
-                .browser
-                .emulate(&target, "reset", &serde_json::Map::new())
-                .await?;
+        match target_by_id(state, &released_target_id).await {
+            Ok(target) => {
+                state
+                    .browser
+                    .emulate(&target, "reset", &serde_json::Map::new())
+                    .await?;
+            }
+            Err(error) if error.code == BrowserToolErrorCode::TargetMissing => {}
+            Err(error) => return Err(error),
         }
     }
     let lease = state.registry().lock().unwrap().release_tab(
@@ -6962,6 +6992,31 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn managed_page_lifecycle_reservations_serialize_claims_and_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let backend = BrowserBackend::Managed(Arc::new(ManagedBrowserBackend::new(
+            RuntimeConfig::managed(state.path().to_path_buf(), None),
+        )));
+        let first = backend.reserve_page_lifecycle().await.unwrap();
+        let contender = backend.clone();
+        let mut waiting = tokio::spawn(async move {
+            contender.reserve_page_lifecycle().await.unwrap();
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "a second managed target lifecycle operation must wait for the reservation"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the lifecycle reservation was not released")
+            .unwrap();
+    }
+
     #[test]
     fn claiming_a_managed_disposable_target_clears_its_markers() {
         let mut synthetic = HashSet::from(["target".to_string()]);
@@ -7454,6 +7509,47 @@ mod tests {
             .backdate_session(&session.agent_session_id, 3_600_000 * 2);
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
         assert!(state.browser.page_targets().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_propagates_target_lookup_failure_without_dropping_ownership() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_page_targets(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, BrowserToolErrorCode::ChromeUnavailable);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&session.agent_session_id, &tab.tab_id, true)
+                .is_ok(),
+            "a failed target lookup must leave the lease and cleanup ownership intact"
+        );
     }
 
     #[tokio::test]

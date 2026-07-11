@@ -44,7 +44,7 @@ use chromiumoxide::{
             },
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
-                CaptureScreenshotParams, EnableParams as PageEnableParams,
+                CaptureScreenshotParams, DialogType, EnableParams as PageEnableParams,
                 EventDomContentEventFired, EventJavascriptDialogOpening, EventLoadEventFired,
                 EventScreencastFrame, EventScreencastVisibilityChanged, Frame, FrameTree,
                 GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
@@ -2848,9 +2848,11 @@ impl CdpClient {
             tokio::select! {
                 result = &mut operation => return result,
                 dialog = dialogs.next() => {
-                    let Some(_dialog) = dialog else {
+                    let Some(dialog) = dialog else {
                         return operation.await;
                     };
+                    let dismissed_beforeunload =
+                        !accept && Self::dismissed_dialog_cancels_navigation(&dialog.r#type);
                     self.runtime
                         .page_command(
                             connection,
@@ -2863,7 +2865,7 @@ impl CdpClient {
                             "handle navigation dialog",
                         )
                         .await?;
-                    if !accept {
+                    if dismissed_beforeunload {
                         // Dismissing beforeunload cancels the navigation, so
                         // there is no navigation completion left to await.
                         self.runtime.invalidate(connection.generation).await;
@@ -2872,6 +2874,10 @@ impl CdpClient {
                 }
             }
         }
+    }
+
+    fn dismissed_dialog_cancels_navigation(dialog_type: &DialogType) -> bool {
+        matches!(dialog_type, DialogType::Beforeunload)
     }
 
     async fn with_navigation_timeout<F>(
@@ -4063,6 +4069,19 @@ mod tests {
         assert_eq!(params.top, Some(WINDOW_CASCADE_ORIGIN.1));
         assert_eq!(params.width, Some(WINDOW_DEFAULT_WIDTH));
         assert_eq!(params.height, Some(WINDOW_DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn only_dismissed_beforeunload_cancels_navigation_completion() {
+        assert!(CdpClient::dismissed_dialog_cancels_navigation(
+            &DialogType::Beforeunload
+        ));
+        for dialog_type in [DialogType::Alert, DialogType::Confirm, DialogType::Prompt] {
+            assert!(
+                !CdpClient::dismissed_dialog_cancels_navigation(&dialog_type),
+                "ordinary dialogs must continue awaiting navigation completion"
+            );
+        }
     }
 
     #[test]
