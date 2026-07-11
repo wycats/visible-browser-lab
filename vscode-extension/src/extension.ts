@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 
 import {
+  globalStartSessionError,
   resolveInvocationContext,
   supportsUnsupportedTokenInvocation,
   unsupportedInvocationTokenError,
@@ -67,6 +68,9 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
     const invocation = resolveInvocationContext(options);
     if (invocation.kind === "unsupported" && !supportsUnsupportedTokenInvocation(method)) {
       throw new Error(unsupportedInvocationTokenError(method));
+    }
+    if (invocation.kind === "global" && method === "start_session") {
+      throw new Error(globalStartSessionError());
     }
     const output = await invokeSurfaceCall(
       this.context,

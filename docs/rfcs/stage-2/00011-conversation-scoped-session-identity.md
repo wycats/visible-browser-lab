@@ -98,7 +98,7 @@ The VBL language-model tool adapter requires VS Code 1.120 or newer and shape-ch
 }
 ```
 
-The adapter also reads the token's URI-like `workingDirectory` when present. An absent token is the documented global-invocation path and supplies no conversation identity, so stateful calls return `session_required`. A present but incompatible token means a supported chat host failed to provide its required identity; stateful calls fail as `unsupported_host` with update/reload guidance. The VS Code model projection omits `agent_session_id`, preventing models from inventing or disclosing fallback handles; explicit sessions remain available through the canonical MCP and CLI surfaces.
+The adapter also reads the token's URI-like `workingDirectory` when present. An absent token is the documented global-invocation path and supplies no conversation identity, so stateful calls return `session_required`. The extension rejects a tokenless global `start_session` instead of creating an explicit session whose handle its static model projection cannot safely expose. A present but incompatible token means a supported chat host failed to provide its required identity; stateful calls fail as `unsupported_host` with update/reload guidance. The VS Code model projection omits `agent_session_id`, preventing models from inventing or disclosing fallback handles; explicit sessions remain available through the canonical MCP and CLI surfaces.
 
 Once VS Code stabilizes `chatSessionResource` on `LanguageModelToolInvocationOptions`, the adapter reads that public field first and retains the token bridge only for supported older versions. This provenance change does not affect the canonical identity or broker behavior.
 
@@ -236,7 +236,7 @@ VBL temporarily mirrors a type and normalization rule that Twill ultimately owns
 
 **Close every target on ambient expiry.** Rejected. A target claimed from the global inventory may be human-created durable state. Acquisition provenance gives VBL authority over the windows it created without extending that authority to tabs it merely borrowed.
 
-**Waiting for stable VS Code APIs.** Rejected as the only path. The guarded bridge provides current value and degrades to the explicit protocol. The canonical boundary is designed so stabilization changes only the adapter source.
+**Waiting for stable VS Code APIs.** Rejected as the only path. The guarded bridge provides current value and degrades to the `session_required` boundary while preserving the explicit protocol on the canonical MCP and CLI surfaces. The canonical boundary is designed so stabilization changes only the adapter source.
 
 **Persisting broker session state now.** Deferred. Identity correlation and durable broker state are separate capabilities. RFC 00009 already defines a safe recovery floor.
 
@@ -261,8 +261,8 @@ Language servers and IDE chat systems similarly attach workspace and session con
 - A target reserved for ambient-expiry closure cannot be claimed concurrently; a failed close removes the reservation and leaves the target claimable.
 - Workspace changes do not block ordinary browser operations; equal observations are accepted for workspace-sensitive operations, and conflicting observations fail only those operations without changing the binding.
 - Codex installed-artifact testing proves direct operation, thread isolation, and resume/compaction continuity while the TTL binding remains live.
-- VS Code 1.128 installed-artifact testing proves direct operation, simultaneous-chat isolation, history restoration, provider-independent continuity, and explicit fallback for a global invocation.
-- Tool-call arguments and normal non-`start_session` results in both hosts contain no ambient session handle.
+- VS Code 1.128 installed-artifact testing proves direct operation, simultaneous-chat isolation, history restoration, provider-independent continuity, the global-invocation `session_required` boundary, and explicit fallback through MCP or CLI.
+- Tool-call arguments and normal browser-operation results in both hosts contain no ambient session handle. The VS Code adapter also removes the backward-compatible handle from its model-visible `start_session` result.
 
 # Unresolved Questions
 

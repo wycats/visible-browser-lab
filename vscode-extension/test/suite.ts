@@ -53,7 +53,22 @@ export async function run(): Promise<void> {
     throw new Error("global tool invocation did not fall back to session_required");
   }
 
+  let globalStartSessionRejected = false;
+  try {
+    await vscode.lm.invokeTool("visible_browser_lab_start_session", {
+      input: {},
+      toolInvocationToken: undefined,
+    });
+  } catch (error) {
+    globalStartSessionRejected =
+      String(error).includes("session_required") &&
+      String(error).includes("Global VS Code tool invocations");
+  }
+  if (!globalStartSessionRejected) {
+    throw new Error("global start_session did not preserve the session_required boundary");
+  }
+
   console.log(
-    `extension-host smoke: ${contributed.length} tools registered; help preferred ${payload.preferred.tool}; global fallback session_required`,
+    `extension-host smoke: ${contributed.length} tools registered; help preferred ${payload.preferred.tool}; global fallback and start_session boundary session_required`,
   );
 }

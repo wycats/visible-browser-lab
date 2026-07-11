@@ -83,7 +83,7 @@
           "required": [],
           "type": "object"
         },
-        "modelDescription": "Start one lease-scoped browser session and optionally create its first background tab. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Start one lease-scoped browser session and optionally create its first background tab. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session; its model-visible schema and result never accept or expose a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_start_session",
         "userDescription": "Start one lease-scoped browser session and optionally create its first background tab."
       },

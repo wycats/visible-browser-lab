@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   extractInvocationContext,
+  globalStartSessionError,
   resolveInvocationContext,
   supportsUnsupportedTokenInvocation,
   unsupportedInvocationTokenError,
@@ -94,6 +95,13 @@ test("unsupported chat tokens produce actionable redacted guidance", () => {
   assert.equal(supportsUnsupportedTokenInvocation("help"), true);
   assert.equal(supportsUnsupportedTokenInvocation("start_session"), false);
   assert.equal(supportsUnsupportedTokenInvocation("list_tabs"), false);
+});
+
+test("global start_session cannot create an inaccessible explicit session", () => {
+  assert.equal(
+    globalStartSessionError(),
+    "start_session failed with session_required. Global VS Code tool invocations have no conversation identity and do not expose explicit session handles. Recovery: invoke Visible Browser Lab from a supported VS Code chat, or use the explicit MCP/CLI surface",
+  );
 });
 
 test("uses the active workspace fallback only without token-derived context", () => {

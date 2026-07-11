@@ -28,6 +28,10 @@ export function unsupportedInvocationTokenError(method: string): string {
   return `${method} failed with unsupported_host. VS Code did not expose a compatible chat session resource; Visible Browser Lab requires VS Code 1.120 or newer with the supported invocation-token shape. Recovery: update and reload VS Code, or use the explicit MCP/CLI surface`;
 }
 
+export function globalStartSessionError(): string {
+  return "start_session failed with session_required. Global VS Code tool invocations have no conversation identity and do not expose explicit session handles. Recovery: invoke Visible Browser Lab from a supported VS Code chat, or use the explicit MCP/CLI surface";
+}
+
 export function supportsUnsupportedTokenInvocation(method: string): boolean {
   return method === "help";
 }
