@@ -812,13 +812,27 @@ mod macos {
     }
 
     fn read_managed_pid(state_dir: &Path) -> Result<i32> {
-        let lock = fs::read_link(state_dir.join("chrome-profile/SingletonLock"))?;
-        lock.to_string_lossy()
-            .rsplit_once('-')
-            .context("managed profile lock omitted pid")?
-            .1
+        if let Ok(lock) = fs::read_link(state_dir.join("chrome-profile/SingletonLock"))
+            && let Some(pid) = lock
+                .to_string_lossy()
+                .rsplit_once('-')
+                .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        {
+            return Ok(pid);
+        }
+
+        fs::read_to_string(state_dir.join("managed-chrome.pid"))?
+            .trim()
             .parse()
-            .context("managed profile lock contained an invalid pid")
+            .context("managed Chrome pid file contained an invalid pid")
+    }
+
+    #[test]
+    fn managed_pid_falls_back_to_the_runtime_pid_file() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        fs::write(state.path().join("managed-chrome.pid"), "4242\n")?;
+        assert_eq!(read_managed_pid(state.path())?, 4242);
+        Ok(())
     }
 
     fn wait_until_process_exited(pid: i32) -> Result<()> {

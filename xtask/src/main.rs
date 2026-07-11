@@ -900,6 +900,12 @@ fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
 }
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
+    if tool.name == "start_session" {
+        return format!(
+            "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session and never returns or accepts a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+            tool.description
+        );
+    }
     format!(
         "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         tool.description
@@ -2932,9 +2938,10 @@ mod tests {
 
     #[test]
     fn vscode_model_schema_uses_only_ambient_session_identity() {
-        for tool in production_tool_definitions().unwrap() {
+        let tools = production_tool_definitions().unwrap();
+        for tool in &tools {
             let canonical_properties = tool.input_schema["properties"].as_object().unwrap();
-            let vscode_schema = vscode_input_schema(&tool);
+            let vscode_schema = vscode_input_schema(tool);
             let vscode_properties = vscode_schema["properties"].as_object().unwrap();
 
             assert!(
@@ -2952,6 +2959,17 @@ mod tests {
                 );
             }
         }
+
+        let start_session = tools
+            .iter()
+            .find(|tool| tool.name == "start_session")
+            .unwrap();
+        let start_description = vscode_model_description(start_session);
+        assert!(start_description.contains("reuses the current ambient session"));
+        assert!(!start_description.contains("never call start_session"));
+
+        let new_tab = tools.iter().find(|tool| tool.name == "new_tab").unwrap();
+        assert!(vscode_model_description(new_tab).contains("never call start_session"));
     }
 
     #[test]
