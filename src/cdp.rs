@@ -94,7 +94,7 @@ use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
-const BEFOREUNLOAD_STASH_KEY: &str = "__visibleBrowserLabBeforeUnloadStash";
+const BEFOREUNLOAD_STASH_KEY: &str = "__io_github_wycats_visible_browser_lab_beforeunload_stash_v1";
 
 /// Every remote handle we create is tagged with a per-operation object
 /// group. Ungrouped handles pin their DOM nodes (including whole detached
@@ -420,24 +420,38 @@ impl CdpClient {
                     )
                     .await
                 {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        self.restore_beforeunload_handlers(&target.id).await?;
+                        Ok(())
+                    }
                     Err(_) => {
-                        self.restore_beforeunload_handlers(
-                            &target.id,
-                            original_href.as_deref().unwrap_or_default(),
-                        )
-                        .await;
+                        if let Err(restore_error) =
+                            self.restore_beforeunload_handlers(&target.id).await
+                        {
+                            tracing::warn!(
+                                target_id = %target.id,
+                                error = %restore_error.message,
+                                "failed to restore beforeunload handlers after rejected navigation"
+                            );
+                        }
                         Err(error)
                     }
                 }
             }
             Err(error) if original_href.is_some() => {
-                self.restore_beforeunload_handlers(
-                    &target.id,
-                    original_href.as_deref().unwrap_or_default(),
-                )
-                .await;
+                if let Err(restore_error) = self.restore_beforeunload_handlers(&target.id).await {
+                    tracing::warn!(
+                        target_id = %target.id,
+                        error = %restore_error.message,
+                        "failed to restore beforeunload handlers after rejected navigation"
+                    );
+                }
                 Err(error)
+            }
+            Ok(()) if original_href.is_some() => {
+                self.restore_beforeunload_handlers_on_page(&page, &connection)
+                    .await?;
+                Ok(())
             }
             result => result,
         }
@@ -466,6 +480,22 @@ impl CdpClient {
             .result
             .loader_id
             .map(|loader_id| loader_id.as_ref().to_string()))
+    }
+
+    async fn main_frame_loader_id(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<String, BrowserToolError> {
+        let tree = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(GetFrameTreeParams::default()),
+                "read page frame tree",
+            )
+            .await?;
+        Ok(tree.result.frame_tree.frame.loader_id.as_ref().to_string())
     }
 
     async fn navigate_and_wait_for_event<T>(
@@ -557,7 +587,7 @@ impl CdpClient {
         // after acknowledging a native beforeunload dialog.
         let expression = format!(
             r#"(() => {{
-            const stashKey = Symbol.for({stash_key});
+            const stashKey = {stash_key};
             const listeners = typeof getEventListeners === 'function'
                 ? (getEventListeners(window).beforeunload ?? [])
                 : [];
@@ -601,15 +631,33 @@ impl CdpClient {
         Ok(())
     }
 
-    async fn restore_beforeunload_handlers(&self, target_id: &str, original_href: &str) {
-        let Ok((page, connection)) = self.page(target_id).await else {
-            return;
-        };
+    async fn restore_beforeunload_handlers(
+        &self,
+        target_id: &str,
+    ) -> Result<bool, BrowserToolError> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let (page, connection) = self.page(target_id).await?;
+            let restored = self
+                .restore_beforeunload_handlers_on_page(&page, &connection)
+                .await?;
+            if restored || Instant::now() >= deadline {
+                return Ok(restored);
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn restore_beforeunload_handlers_on_page(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<bool, BrowserToolError> {
         let expression = format!(
             r#"(() => {{
-                const stashKey = Symbol.for({stash_key});
+                const stashKey = {stash_key};
                 const stash = window[stashKey];
-                if (!stash || location.href !== {original_href}) return false;
+                if (!stash) return false;
                 for (const entry of stash.listeners) {{
                     window.addEventListener('beforeunload', entry.listener, {{
                         capture: entry.capture,
@@ -622,12 +670,11 @@ impl CdpClient {
                 return true;
             }})()"#,
             stash_key = serde_json::to_string(BEFOREUNLOAD_STASH_KEY).unwrap(),
-            original_href = serde_json::to_string(original_href).unwrap(),
         );
         let restore = self
             .runtime
             .page_command(
-                &connection,
+                connection,
                 page.execute(
                     RuntimeEvaluateParams::builder()
                         .expression(expression)
@@ -637,14 +684,23 @@ impl CdpClient {
                 ),
                 "restore beforeunload navigation guard",
             )
-            .await;
-        if let Err(error) = restore {
-            tracing::warn!(
-                target_id,
-                error = %error.message,
-                "failed to restore beforeunload handlers after rejected navigation"
-            );
+            .await?;
+        if let Some(details) = restore.result.exception_details {
+            return Err(BrowserToolError::chrome_unavailable(format!(
+                "restore beforeunload navigation guard failed: {}",
+                details.text
+            )));
         }
+        restore
+            .result
+            .result
+            .value
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                BrowserToolError::chrome_unavailable(
+                    "Chrome returned an invalid beforeunload restoration result",
+                )
+            })
     }
 
     async fn recover_completed_navigation(
@@ -1276,15 +1332,7 @@ impl CdpClient {
 
     pub async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let tree = self
-            .runtime
-            .page_command(
-                &connection,
-                page.execute(GetFrameTreeParams::default()),
-                "read page frame tree",
-            )
-            .await?;
-        Ok(tree.result.frame_tree.frame.loader_id.as_ref().to_string())
+        self.main_frame_loader_id(&page, &connection).await
     }
 
     pub async fn accessibility_snapshot(

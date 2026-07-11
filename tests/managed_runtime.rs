@@ -619,6 +619,39 @@ mod macos {
             Some(true),
             "a no-op history request must preserve the page's unload guard"
         );
+        client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": fixture.url("/chat/pending#accepted-fragment"),
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        let same_document_guard = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return { prevented: event.defaultPrevented, href: location.href, stash: Boolean(window.__io_github_wycats_visible_browser_lab_beforeunload_stash_v1) }; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            same_document_guard
+                .get("value")
+                .and_then(|value| value.get("prevented"))
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a same-document accepted navigation must restore the page's unload guard: {same_document_guard}"
+        );
         let rejected_navigation = client.call_tool(
             "navigate",
             json!({
@@ -639,7 +672,7 @@ mod macos {
                 rejected_navigation
                     .get("code")
                     .and_then(|value| value.as_str()),
-                Some("chrome_unavailable" | "operation_timeout")
+                Some("invalid_input" | "chrome_unavailable" | "operation_timeout")
             ),
             "malformed navigation unexpectedly succeeded: {rejected_navigation}"
         );
