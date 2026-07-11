@@ -114,6 +114,16 @@ pub struct TabActionParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseTabParams {
+    pub agent_session_id: AgentSessionId,
+    pub tab_id: TabId,
+    #[serde(default)]
+    pub leave_visible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_instruction: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NavigateParams {
     pub agent_session_id: AgentSessionId,
     pub tab_id: TabId,
@@ -567,6 +577,7 @@ pub struct NetworkEventsResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseTabResult {
     pub released: bool,
+    pub leave_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +797,26 @@ mod tests {
         assert_eq!(value["target"]["css"], "#submit");
         assert_eq!(value["timeout_ms"], 500);
         assert_eq!(value["observe"], "diff");
+    }
+
+    #[test]
+    fn release_tab_params_default_to_cleanup_eligible() {
+        let params: ReleaseTabParams = serde_json::from_value(json!({
+            "agent_session_id": "session_test",
+            "tab_id": "tab_test"
+        }))
+        .unwrap();
+
+        assert!(!params.leave_visible);
+        assert!(params.user_instruction.is_none());
+        assert_eq!(
+            serde_json::to_value(ReleaseTabResult {
+                released: true,
+                leave_visible: false,
+            })
+            .unwrap(),
+            json!({"released": true, "leave_visible": false})
+        );
     }
 
     #[test]

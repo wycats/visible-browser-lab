@@ -43,11 +43,11 @@ use crate::{
         ElementReferenceTarget, ElementTarget, EvaluateResult, FillFormParams, FillFormResult,
         FillParams, FormField, ListTabsParams, ListTabsResult, ListTabsScope, NavigationAction,
         NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionEffect,
-        PageActionEvidence, PageActionResult, ReleaseTabResult, ScreenshotImage, ScreenshotParams,
-        ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams, SnapshotResult,
-        StartSessionParams, StartSessionResult, TabActionParams, TabResult, V3EvaluateParams,
-        V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams,
-        WaitForResult,
+        PageActionEvidence, PageActionResult, ReleaseTabParams, ReleaseTabResult, ScreenshotImage,
+        ScreenshotParams, ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams,
+        SnapshotResult, StartSessionParams, StartSessionResult, TabActionParams, TabResult,
+        V3EvaluateParams, V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition,
+        WaitForParams, WaitForResult,
     },
     semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
@@ -350,6 +350,7 @@ struct FakeBrowser {
     filled_backend_nodes: Vec<(i64, String)>,
     typed_text: Vec<String>,
     pressed_keys: Vec<String>,
+    fail_emulation_reset: bool,
 }
 
 #[cfg(test)]
@@ -367,7 +368,13 @@ impl FakeBrowser {
             filled_backend_nodes: Vec::new(),
             typed_text: Vec::new(),
             pressed_keys: Vec::new(),
+            fail_emulation_reset: false,
         }
+    }
+
+    fn with_failed_emulation_reset(mut self) -> Self {
+        self.fail_emulation_reset = true;
+        self
     }
 
     fn page_targets(&self) -> Vec<CdpTarget> {
@@ -1606,7 +1613,14 @@ impl BrowserBackend {
     ) -> Result<Value, BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(_) => Ok(Value::Object(arguments.clone())),
+            Self::Fake(browser) => {
+                if operation == "reset" && browser.lock().unwrap().fail_emulation_reset {
+                    return Err(BrowserToolError::invalid_input(
+                        "fake emulation reset failed",
+                    ));
+                }
+                Ok(Value::Object(arguments.clone()))
+            }
             _ => {
                 self.cdp_client()
                     .await?
@@ -2431,16 +2445,16 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
                 .remove(&lease.target_id);
         }
         for lease in &session.closed {
-            close_expired_ambient_target(state, &session.session_id, lease).await;
+            close_expired_vbl_target(state, &session.session_id, lease).await;
         }
     }
 }
 
-/// Close a target created for an ambient session after the registry has
+/// Close a target created by VBL after the registry has
 /// reserved it against concurrent claims. This is best-effort maintenance:
 /// the session is already expired, and a close failure must leave the target
 /// claimable rather than permanently reserved.
-async fn close_expired_ambient_target(
+async fn close_expired_vbl_target(
     state: &BrokerState,
     session_id: &AgentSessionId,
     lease: &ExpiredLease,
@@ -2462,7 +2476,7 @@ async fn close_expired_ambient_target(
                 tracing::warn!(
                     target = %lease.target_id,
                     error = %error.message,
-                    "failed to reset emulation before ambient expiry close"
+                    "failed to reset emulation before VBL-created target expiry close"
                 );
             }
             match state.browser.close_target(&lease.target_id).await {
@@ -2472,7 +2486,7 @@ async fn close_expired_ambient_target(
                     tracing::warn!(
                         target = %lease.target_id,
                         error = %error.message,
-                        "failed to close ambient-created target on session expiry"
+                        "failed to close VBL-created target on session expiry"
                     );
                     false
                 }
@@ -2483,7 +2497,7 @@ async fn close_expired_ambient_target(
             tracing::warn!(
                 target = %lease.target_id,
                 error = %error.message,
-                "failed to inspect ambient-created target on session expiry"
+                "failed to inspect VBL-created target on session expiry"
             );
             false
         }
@@ -3172,9 +3186,21 @@ async fn broker_claim_tab(
 
 async fn broker_release_tab(
     state: &BrokerState,
-    params: Result<TabActionParams, BrowserToolError>,
+    params: Result<ReleaseTabParams, BrowserToolError>,
 ) -> Result<ReleaseTabResult, BrowserToolError> {
     let params = params?;
+    let instruction = params.user_instruction.as_deref().map(str::trim);
+    if params.leave_visible {
+        if instruction.is_none_or(str::is_empty) {
+            return Err(BrowserToolError::invalid_input(
+                "leave_visible requires a non-empty user_instruction",
+            ));
+        }
+    } else if params.user_instruction.is_some() {
+        return Err(BrowserToolError::invalid_input(
+            "user_instruction is accepted only when leave_visible is true",
+        ));
+    }
     let active_target_id = state
         .registry()
         .lock()
@@ -3196,18 +3222,22 @@ async fn broker_release_tab(
             "stop the active performance trace before releasing its tab",
         ));
     }
-    let lease = state
-        .registry()
-        .lock()
-        .unwrap()
-        .release_tab(&params.agent_session_id, &params.tab_id)?;
-    if let Ok(target) = target_by_id(state, &lease.target_id).await {
+    if let Ok(target) = target_by_id(state, &active_target_id).await {
         state
             .browser
             .emulate(&target, "reset", &serde_json::Map::new())
             .await?;
-        state.viewport_overrides.lock().unwrap().remove(&target.id);
     }
+    let lease = state.registry().lock().unwrap().release_tab(
+        &params.agent_session_id,
+        &params.tab_id,
+        params.leave_visible,
+    )?;
+    state
+        .viewport_overrides
+        .lock()
+        .unwrap()
+        .remove(&active_target_id);
     let old_monitor = state
         .diagnostics()
         .lock()
@@ -3220,7 +3250,10 @@ async fn broker_release_tab(
         // claim's monitor has enabled the same domains.
         monitor.shutdown().await;
     }
-    Ok(ReleaseTabResult { released: true })
+    Ok(ReleaseTabResult {
+        released: true,
+        leave_visible: params.leave_visible,
+    })
 }
 
 async fn broker_focus_tab(
@@ -7015,7 +7048,7 @@ mod tests {
         assert!(
             expired_error
                 .message
-                .contains("1 ambient-created browser target closed")
+                .contains("1 VBL-created browser target closed")
         );
     }
 
@@ -7065,7 +7098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_expiry_keeps_vbl_created_targets_open() {
+    async fn explicit_expiry_closes_vbl_created_targets() {
         let state = fake_state(vec![fake_target("target-a")]);
         let explicit = state.registry.lock().unwrap().start_session(None);
         state
@@ -7085,11 +7118,11 @@ mod tests {
 
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
 
-        assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn ambient_expiry_keeps_an_explicitly_released_created_target_open() {
+    async fn ambient_expiry_closes_an_ordinarily_released_created_target() {
         let state = fake_state(vec![fake_target("target-a")]);
         let ambient = state.registry.lock().unwrap().ambient_session(
             ambient_identity("conversation"),
@@ -7109,7 +7142,7 @@ mod tests {
             .registry
             .lock()
             .unwrap()
-            .release_tab(&ambient.agent_session_id, &tab.tab_id)
+            .release_tab(&ambient.agent_session_id, &tab.tab_id, false)
             .unwrap();
         state
             .registry
@@ -7119,7 +7152,119 @@ mod tests {
 
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
 
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preserving_release_requires_user_instruction_and_survives_expiry() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let missing_instruction = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("  ".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_instruction.code, BrowserToolErrorCode::InvalidInput);
+
+        let stray_instruction = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: Some("keep this open".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stray_instruction.code, BrowserToolErrorCode::InvalidInput);
+
+        let released = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id,
+                leave_visible: true,
+                user_instruction: Some("Leave this page open for me".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(released.released);
+        assert!(released.leave_visible);
+
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
         assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_failure_does_not_apply_preservation_or_drop_ownership() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_emulation_reset(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("Leave this page open for me".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&session.agent_session_id, &tab.tab_id, true)
+                .is_ok(),
+            "a failed browser reset must leave the lease and cleanup ownership intact"
+        );
+
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -8430,9 +8575,11 @@ mod tests {
 
         broker_release_tab(
             &state,
-            Ok(TabActionParams {
+            Ok(ReleaseTabParams {
                 agent_session_id: session.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
             }),
         )
         .await
@@ -8829,9 +8976,11 @@ mod tests {
 
         broker_release_tab(
             &state,
-            Ok(TabActionParams {
+            Ok(ReleaseTabParams {
                 agent_session_id: session.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
             }),
         )
         .await

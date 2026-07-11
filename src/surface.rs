@@ -200,8 +200,15 @@ fn structured_browser_error(error: BrowserToolError) -> SurfaceToolResult {
 fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, String) {
     let (tools, guidance) = match topic {
         "tabs" => (
-            vec!["list_tabs", "new_tab", "claim_tab", "start_session"],
-            "Use the conversation-selected session and its owned tab handles. Call start_session only after session_required, and inspect global_readonly only when choosing a target to claim.",
+            vec![
+                "list_tabs",
+                "new_tab",
+                "claim_tab",
+                "release_tab",
+                "close_tab",
+                "start_session",
+            ],
+            "Use the conversation-selected session and its owned tab handles. Call start_session only after session_required, and inspect global_readonly only when choosing a target to claim. Ordinary release makes a target claimable while VBL-created targets remain eligible for expiry cleanup; use leave_visible with the user's instruction only for an explicit durable handoff.",
         ),
         "snapshot" => (
             vec!["snapshot"],
@@ -249,7 +256,7 @@ fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, Str
         ),
         _ => (
             vec!["snapshot", "help", "start_session"],
-            "Call browser operations directly, inspect the page semantically, choose the narrowest action tool, and close or release each owned tab. Call start_session only after session_required.",
+            "Call browser operations directly, inspect the page semantically, choose the narrowest action tool, and close or release each owned tab. Ordinary release keeps VBL-created targets eligible for expiry cleanup; use leave_visible only for an explicitly instructed durable handoff. Call start_session only after session_required.",
         ),
     };
     let suffix = operation

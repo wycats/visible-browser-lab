@@ -154,9 +154,15 @@ function confirmationFor(
         message: `Close owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"}.`,
       };
     case "release_tab":
+      if (input.leave_visible === true) {
+        return {
+          title: "Leave browser tab visible?",
+          message: `Release owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"} and preserve it after this session expires.`,
+        };
+      }
       return {
         title: "Release browser tab?",
-        message: `Release owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"} without closing it.`,
+        message: `Release owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"}; a VBL-created target remains eligible for expiry cleanup.`,
       };
     case "focus_tab":
       return {

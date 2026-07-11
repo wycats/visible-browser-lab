@@ -234,15 +234,15 @@ impl BrowserToolError {
         let disposition = match (closed_targets, pending_close_targets) {
             (0, 0) => "its tabs were released and are claimable".to_string(),
             (closed, 0) => format!(
-                "{closed} ambient-created browser {} closed; any other tabs were released and are claimable",
+                "{closed} VBL-created browser {} closed; any other tabs were released and are claimable",
                 target(closed)
             ),
             (0, pending) => format!(
-                "{pending} ambient-created browser {} still being closed; any other tabs were released and are claimable",
+                "{pending} VBL-created browser {} still being closed; any other tabs were released and are claimable",
                 target(pending)
             ),
             (closed, pending) => format!(
-                "{closed} ambient-created browser {} closed and {pending} {} still being closed; any other tabs were released and are claimable",
+                "{closed} VBL-created browser {} closed and {pending} {} still being closed; any other tabs were released and are claimable",
                 target(closed),
                 target(pending)
             ),
@@ -410,6 +410,12 @@ struct ExpiredSessionTombstone {
     closed_targets: usize,
 }
 
+#[derive(Debug, Clone)]
+struct CleanupOwnership {
+    session_id: AgentSessionId,
+    tab_id: TabId,
+}
+
 #[derive(Debug, Default)]
 pub struct LeaseRegistry {
     sessions: HashMap<AgentSessionId, BrowserSession>,
@@ -417,12 +423,13 @@ pub struct LeaseRegistry {
     ambient_identities: HashMap<AgentSessionId, ConversationIdentity>,
     leases: HashMap<TabId, TabLease>,
     active_target_owners: HashMap<String, TabId>,
-    /// Leases created by VBL for ambient sessions. If one is still active
-    /// when its session expires, the broker closes its target instead of
-    /// leaving another agent-created window behind. Claimed targets and
-    /// every explicit-session lease deliberately stay out of this set.
-    ambient_created_leases: HashSet<TabId>,
-    /// Targets selected for ambient-expiry closure but not yet closed by the
+    /// Targets VBL created and still has authority to clean up. Ownership
+    /// follows the target across ordinary release, claim, and takeover so an
+    /// old session cannot close a target adopted by a new session. Claimed
+    /// human targets never enter this map; an explicit preserving release
+    /// removes the entry.
+    cleanup_owned_targets: HashMap<String, CleanupOwnership>,
+    /// Targets selected for expiry closure but not yet closed by the
     /// async browser layer. Claims are rejected while a target is reserved,
     /// preventing a concurrent caller from adopting a target the sweep is
     /// about to close.
@@ -452,7 +459,7 @@ pub struct ExpiredSession {
 }
 
 /// A lease reclaimed by the expiry sweep, with the target it was bound to so
-/// the broker can clear target-side state and, for ambient-created targets,
+/// the broker can clear target-side state and, for VBL-created targets,
 /// close the target itself.
 pub struct ExpiredLease {
     pub tab_id: TabId,
@@ -568,9 +575,10 @@ impl LeaseRegistry {
     }
 
     /// Expire every session whose last touch is older than `ttl`. Claimed
-    /// targets and every explicit-session lease are released, never closed.
-    /// An ambient session's still-active VBL-created targets are reserved for
-    /// async closure so abandoned conversations do not accumulate windows.
+    /// human targets are released, never closed. VBL-created targets that
+    /// still carry cleanup ownership are reserved for async closure whether
+    /// the session is ambient or explicit and whether the lease is active or
+    /// ordinarily released.
     /// The session record itself is removed and tombstoned so later calls
     /// naming it get `session_expired` rather than `unknown_session`.
     ///
@@ -612,15 +620,29 @@ impl LeaseRegistry {
                 let mut closed = Vec::new();
                 for lease in self.leases.values_mut() {
                     if lease.owner_session_id == session_id
-                        && matches!(lease.state, LeaseState::Active | LeaseState::Missing)
+                        && matches!(
+                            lease.state,
+                            LeaseState::Active | LeaseState::Missing | LeaseState::Released
+                        )
                     {
+                        let cleanup_owned = self
+                            .cleanup_owned_targets
+                            .get(&lease.target_id)
+                            .is_some_and(|ownership| {
+                                ownership.session_id == session_id
+                                    && ownership.tab_id == lease.tab_id
+                            });
+                        if lease.state == LeaseState::Released && !cleanup_owned {
+                            continue;
+                        }
+
                         lease.updated_at_ms = now_ms;
                         let expired_lease = ExpiredLease {
                             tab_id: lease.tab_id.clone(),
                             target_id: lease.target_id.clone(),
                         };
-                        let ambient_created = self.ambient_created_leases.remove(&lease.tab_id);
-                        if lease.state == LeaseState::Active && ambient_created {
+                        if cleanup_owned && lease.state != LeaseState::Missing {
+                            self.cleanup_owned_targets.remove(&lease.target_id);
                             lease.state = LeaseState::Closed;
                             self.pending_expiry_closes
                                 .insert(lease.target_id.clone(), lease.tab_id.clone());
@@ -681,6 +703,9 @@ impl LeaseRegistry {
             }
             if closed {
                 self.expired_closed_targets.insert(target_id.to_string());
+            } else if let Some(lease) = self.leases.get_mut(tab_id) {
+                lease.state = LeaseState::Released;
+                lease.updated_at_ms = now_ms();
             }
         }
     }
@@ -705,8 +730,6 @@ impl LeaseRegistry {
     ) -> Result<OwnedTabSummary, BrowserToolError> {
         self.require_session(session_id)?;
         let focused = target.focused;
-        let ambient = self.ambient_identities.contains_key(session_id);
-
         if self.active_lease_for_target(&target.target_id).is_some()
             || self.pending_expiry_closes.contains_key(&target.target_id)
             || self.expired_closed_targets.contains(&target.target_id)
@@ -715,9 +738,13 @@ impl LeaseRegistry {
         }
 
         let lease = self.insert_active_lease(session_id, target);
-        if ambient {
-            self.ambient_created_leases.insert(lease.tab_id.clone());
-        }
+        self.cleanup_owned_targets.insert(
+            lease.target_id.clone(),
+            CleanupOwnership {
+                session_id: session_id.clone(),
+                tab_id: lease.tab_id.clone(),
+            },
+        );
         Ok(owned_summary(&lease, focused))
     }
 
@@ -737,7 +764,7 @@ impl LeaseRegistry {
             return Err(BrowserToolError::target_owned(&target.target_id));
         }
 
-        let mut preserve_ambient_created = false;
+        let transfer_cleanup = self.cleanup_owned_targets.contains_key(&target.target_id);
         if let Some(existing) = self.active_lease_for_target(&target.target_id).cloned() {
             if !takeover {
                 return Err(BrowserToolError::target_owned(&target.target_id));
@@ -751,15 +778,18 @@ impl LeaseRegistry {
             }
 
             self.leases.remove(&existing.tab_id);
-            let existing_was_ambient_created = self.ambient_created_leases.remove(&existing.tab_id);
-            preserve_ambient_created =
-                existing.owner_session_id == *session_id && existing_was_ambient_created;
             self.remove_active_target_if_matches(&existing.target_id, &existing.tab_id);
         }
 
         let lease = self.insert_active_lease(session_id, target);
-        if preserve_ambient_created {
-            self.ambient_created_leases.insert(lease.tab_id.clone());
+        if transfer_cleanup {
+            self.cleanup_owned_targets.insert(
+                lease.target_id.clone(),
+                CleanupOwnership {
+                    session_id: session_id.clone(),
+                    tab_id: lease.tab_id.clone(),
+                },
+            );
         }
         Ok(owned_summary(&lease, focused))
     }
@@ -865,8 +895,13 @@ impl LeaseRegistry {
         &mut self,
         session_id: &AgentSessionId,
         tab_id: &TabId,
+        leave_visible: bool,
     ) -> Result<TabLease, BrowserToolError> {
-        self.transition_owned_tab(session_id, tab_id, LeaseState::Released)
+        let lease = self.transition_owned_tab(session_id, tab_id, LeaseState::Released)?;
+        if leave_visible {
+            self.remove_cleanup_ownership_if_matches(&lease.target_id, &lease.tab_id);
+        }
+        Ok(lease)
     }
 
     pub fn close_tab_mark(
@@ -874,7 +909,9 @@ impl LeaseRegistry {
         session_id: &AgentSessionId,
         tab_id: &TabId,
     ) -> Result<TabLease, BrowserToolError> {
-        self.transition_owned_tab(session_id, tab_id, LeaseState::Closed)
+        let lease = self.transition_owned_tab(session_id, tab_id, LeaseState::Closed)?;
+        self.remove_cleanup_ownership_if_matches(&lease.target_id, &lease.tab_id);
+        Ok(lease)
     }
 
     pub fn mark_missing(&mut self, tab_id: &TabId) -> Result<TabLease, BrowserToolError> {
@@ -895,6 +932,7 @@ impl LeaseRegistry {
         }
 
         self.remove_active_target_if_matches(&target_id, tab_id);
+        self.remove_cleanup_ownership_if_matches(&target_id, tab_id);
 
         Ok(self
             .leases
@@ -1028,13 +1066,21 @@ impl LeaseRegistry {
         }
 
         self.remove_active_target_if_matches(&target_id, tab_id);
-        self.ambient_created_leases.remove(tab_id);
-
         Ok(self
             .leases
             .get(tab_id)
             .expect("transitioned tab should still be tracked")
             .clone())
+    }
+
+    fn remove_cleanup_ownership_if_matches(&mut self, target_id: &str, tab_id: &TabId) {
+        if self
+            .cleanup_owned_targets
+            .get(target_id)
+            .is_some_and(|ownership| ownership.tab_id == *tab_id)
+        {
+            self.cleanup_owned_targets.remove(target_id);
+        }
     }
 
     fn require_owned_tab(
@@ -1179,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_session_expires_and_its_leases_are_released_not_closed() {
+    fn explicit_vbl_created_lease_is_reserved_for_close_on_expiry() {
         let mut registry = LeaseRegistry::new();
         let session = registry.start_session(Some("agent".to_string()));
         let summary = registry
@@ -1192,13 +1238,12 @@ mod tests {
 
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].session_id, session.agent_session_id);
-        assert_eq!(expired[0].released.len(), 1);
-        assert!(expired[0].closed.is_empty());
-        assert_eq!(expired[0].released[0].tab_id, summary.tab_id);
+        assert!(expired[0].released.is_empty());
+        assert_eq!(expired[0].closed.len(), 1);
+        assert_eq!(expired[0].closed[0].tab_id, summary.tab_id);
         assert!(!registry.has_sessions());
-        // Released, not gone: the lease record survives as a claimable tab.
         let lease = registry.leases.get(&summary.tab_id).unwrap();
-        assert!(matches!(lease.state, LeaseState::Released));
+        assert!(matches!(lease.state, LeaseState::Closed));
     }
 
     #[test]
@@ -1228,7 +1273,7 @@ mod tests {
         assert!(
             expired_error
                 .message
-                .contains("1 ambient-created browser target still being closed")
+                .contains("1 VBL-created browser target still being closed")
         );
         assert!(
             expired_error
@@ -1310,7 +1355,7 @@ mod tests {
         assert!(
             expired_error
                 .message
-                .contains("1 ambient-created browser target closed")
+                .contains("1 VBL-created browser target closed")
         );
         assert!(!expired_error.message.contains("still being closed"));
     }
@@ -1336,6 +1381,100 @@ mod tests {
             registry.leases.get(&summary.tab_id).unwrap().state,
             LeaseState::Released
         ));
+    }
+
+    #[test]
+    fn preserving_release_clears_cleanup_ownership() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(None);
+        let summary = registry
+            .lease_tab(&session.agent_session_id, focused_snapshot("target-a"))
+            .unwrap();
+        registry
+            .release_tab(&session.agent_session_id, &summary.tab_id, true)
+            .unwrap();
+
+        registry.backdate_session(&session.agent_session_id, 2 * 3_600_000);
+        let expired =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].released.is_empty());
+        assert!(expired[0].closed.is_empty());
+        assert!(matches!(
+            registry.leases.get(&summary.tab_id).unwrap().state,
+            LeaseState::Released
+        ));
+    }
+
+    #[test]
+    fn claiming_a_released_created_target_transfers_cleanup_ownership() {
+        let mut registry = LeaseRegistry::new();
+        let first = registry.start_session(Some("first".to_string()));
+        let second = registry.start_session(Some("second".to_string()));
+        let released = registry
+            .lease_tab(&first.agent_session_id, snapshot("target-a"))
+            .unwrap();
+        registry
+            .release_tab(&first.agent_session_id, &released.tab_id, false)
+            .unwrap();
+        let adopted = registry
+            .claim_tab(&second.agent_session_id, snapshot("target-a"), false, None)
+            .unwrap();
+
+        registry.backdate_session(&first.agent_session_id, 2 * 3_600_000);
+        let first_expiry =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(first_expiry.len(), 1);
+        assert!(first_expiry[0].closed.is_empty());
+        assert!(
+            registry
+                .require_active_owned(&second.agent_session_id, &adopted.tab_id, true)
+                .is_ok(),
+            "the former session must not close a target adopted by its successor"
+        );
+
+        registry.backdate_session(&second.agent_session_id, 2 * 3_600_000);
+        let second_expiry =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(second_expiry.len(), 1);
+        assert_eq!(second_expiry[0].closed.len(), 1);
+        assert_eq!(second_expiry[0].closed[0].tab_id, adopted.tab_id);
+    }
+
+    #[test]
+    fn taking_over_an_active_created_target_transfers_cleanup_ownership() {
+        let mut registry = LeaseRegistry::new();
+        let first = registry.start_session(Some("first".to_string()));
+        let second = registry.start_session(Some("second".to_string()));
+        registry
+            .lease_tab(&first.agent_session_id, snapshot("target-a"))
+            .unwrap();
+        let adopted = registry
+            .claim_tab(
+                &second.agent_session_id,
+                snapshot("target-a"),
+                true,
+                Some("take over the VBL-created target"),
+            )
+            .unwrap();
+
+        registry.backdate_session(&first.agent_session_id, 2 * 3_600_000);
+        let first_expiry =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(first_expiry.len(), 1);
+        assert!(first_expiry[0].closed.is_empty());
+        assert!(
+            registry
+                .require_active_owned(&second.agent_session_id, &adopted.tab_id, true)
+                .is_ok()
+        );
+
+        registry.backdate_session(&second.agent_session_id, 2 * 3_600_000);
+        let second_expiry =
+            registry.expire_sessions(Duration::from_secs(3_600), now_ms(), &HashSet::new());
+        assert_eq!(second_expiry[0].closed.len(), 1);
+        assert_eq!(second_expiry[0].closed[0].tab_id, adopted.tab_id);
     }
 
     #[test]
@@ -1629,7 +1768,7 @@ mod tests {
             .lease_tab(&session.agent_session_id, snapshot("released"))
             .unwrap();
         registry
-            .release_tab(&session.agent_session_id, &released.tab_id)
+            .release_tab(&session.agent_session_id, &released.tab_id, false)
             .unwrap();
         let released_error = registry
             .require_active_owned(&session.agent_session_id, &released.tab_id, true)

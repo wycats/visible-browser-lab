@@ -220,7 +220,7 @@ fn tool_response(
         }),
         "new_tab" | "claim_tab" | "focus_tab" => json!({"tab":tab_summary()}),
         "navigate" => page_action_response(fixture, include_result),
-        "release_tab" => json!({"released":true}),
+        "release_tab" => json!({"released":true,"leave_visible":false}),
         "close_tab" => json!({"closed":true}),
         "wait_for" => {
             let mut response = page_action_response(fixture, include_result);

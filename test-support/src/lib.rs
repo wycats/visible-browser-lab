@@ -1112,6 +1112,9 @@ pub fn run_live_smoke(
     {
         bail!("release_tab did not report released=true");
     }
+    if release.get("leave_visible").and_then(Value::as_bool) != Some(false) {
+        bail!("release_tab did not report leave_visible=false");
+    }
     remove_open_tab(open_tabs, &transferable_tab.tab_id);
 
     let claimed = client.call_tool(

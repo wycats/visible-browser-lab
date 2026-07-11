@@ -178,7 +178,14 @@
               "minLength": 1,
               "type": "string"
             },
+            "leave_visible": {
+              "type": "boolean"
+            },
             "tab_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_instruction": {
               "minLength": 1,
               "type": "string"
             }
@@ -188,9 +195,9 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Release an owned tab lease while leaving its browser target open and claimable. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Release an owned tab lease and make its browser target claimable. VBL-created targets remain eligible for session-expiry cleanup unless an explicit user instruction requests leave_visible. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_release_tab",
-        "userDescription": "Release an owned tab lease while leaving its browser target open and claimable."
+        "userDescription": "Release an owned tab lease and make its browser target claimable. VBL-created targets remain eligible for session-expiry cleanup unless an explicit user instruction requests leave_visible."
       },
       {
         "displayName": "Focus Tab",

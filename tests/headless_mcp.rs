@@ -1171,6 +1171,9 @@ impl BrowserMcpHarness {
         if result.get("released").and_then(Value::as_bool) != Some(true) {
             bail!("release_tab did not report released=true: {result}");
         }
+        if result.get("leave_visible").and_then(Value::as_bool) != Some(false) {
+            bail!("release_tab did not report leave_visible=false: {result}");
+        }
         self.tabs[tab].owner = None;
         Ok(())
     }
