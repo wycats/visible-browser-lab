@@ -429,11 +429,10 @@ pub struct LeaseRegistry {
     /// human targets never enter this map; an explicit preserving release
     /// removes the entry.
     cleanup_owned_targets: HashMap<String, CleanupOwnership>,
-    /// Targets selected for expiry closure but not yet closed by the
-    /// async browser layer. Claims are rejected while a target is reserved,
-    /// preventing a concurrent caller from adopting a target the sweep is
-    /// about to close.
-    pending_expiry_closes: HashMap<String, TabId>,
+    /// Targets reserved for close but not yet committed by the async browser
+    /// layer. Claims and missing-target reconciliation are blocked while a
+    /// target is reserved, preventing either path from racing the close.
+    pending_target_closes: HashMap<String, TabId>,
     /// Target ids the expiry sweep confirmed closed or already missing.
     /// Keeping them for the broker lifetime rejects claim requests that
     /// captured a target snapshot before closure and reached the registry
@@ -644,7 +643,7 @@ impl LeaseRegistry {
                         if cleanup_owned && lease.state != LeaseState::Missing {
                             self.cleanup_owned_targets.remove(&lease.target_id);
                             lease.state = LeaseState::Closed;
-                            self.pending_expiry_closes
+                            self.pending_target_closes
                                 .insert(lease.target_id.clone(), lease.tab_id.clone());
                             closed.push(expired_lease);
                         } else {
@@ -693,8 +692,8 @@ impl LeaseRegistry {
         tab_id: &TabId,
         closed: bool,
     ) {
-        if self.pending_expiry_closes.get(target_id) == Some(tab_id) {
-            self.pending_expiry_closes.remove(target_id);
+        if self.pending_target_closes.get(target_id) == Some(tab_id) {
+            self.pending_target_closes.remove(target_id);
             if let Some(tombstone) = self.expired_sessions.get_mut(session_id) {
                 tombstone.pending_close_targets = tombstone.pending_close_targets.saturating_sub(1);
                 if closed {
@@ -738,7 +737,7 @@ impl LeaseRegistry {
         self.require_session(session_id)?;
         let focused = target.focused;
         if self.active_lease_for_target(&target.target_id).is_some()
-            || self.pending_expiry_closes.contains_key(&target.target_id)
+            || self.pending_target_closes.contains_key(&target.target_id)
             || self.expired_closed_targets.contains(&target.target_id)
         {
             return Err(BrowserToolError::target_owned(&target.target_id));
@@ -765,7 +764,7 @@ impl LeaseRegistry {
         self.require_session(session_id)?;
         let focused = target.focused;
 
-        if self.pending_expiry_closes.contains_key(&target.target_id)
+        if self.pending_target_closes.contains_key(&target.target_id)
             || self.expired_closed_targets.contains(&target.target_id)
         {
             return Err(BrowserToolError::target_owned(&target.target_id));
@@ -935,6 +934,32 @@ impl LeaseRegistry {
         Ok(lease)
     }
 
+    /// Reserve an owned target while the browser layer closes it. Inventory
+    /// reconciliation must not mark the lease missing in the interval between
+    /// Chrome removing the target and the broker committing the closed state.
+    pub fn reserve_owned_tab_close(
+        &mut self,
+        session_id: &AgentSessionId,
+        tab_id: &TabId,
+    ) -> Result<TabLease, BrowserToolError> {
+        let lease = self.owned_lease(session_id, tab_id)?;
+        if !matches!(lease.state, LeaseState::Active | LeaseState::Missing) {
+            return Err(BrowserToolError::tab_not_active(tab_id, &lease.state));
+        }
+        if self.pending_target_closes.contains_key(&lease.target_id) {
+            return Err(BrowserToolError::target_owned(&lease.target_id));
+        }
+        self.pending_target_closes
+            .insert(lease.target_id.clone(), lease.tab_id.clone());
+        Ok(lease)
+    }
+
+    pub fn finish_owned_tab_close_reservation(&mut self, target_id: &str, tab_id: &TabId) {
+        if self.pending_target_closes.get(target_id) == Some(tab_id) {
+            self.pending_target_closes.remove(target_id);
+        }
+    }
+
     pub fn mark_missing(&mut self, tab_id: &TabId) -> Result<TabLease, BrowserToolError> {
         let now = now_ms();
         let target_id;
@@ -975,7 +1000,10 @@ impl LeaseRegistry {
         let missing_tab_ids = self
             .active_target_owners
             .iter()
-            .filter(|(target_id, _)| !visible_target_ids.contains(*target_id))
+            .filter(|(target_id, _)| {
+                !visible_target_ids.contains(*target_id)
+                    && !self.pending_target_closes.contains_key(*target_id)
+            })
             .map(|(_, tab_id)| tab_id.clone())
             .collect::<Vec<_>>();
 
@@ -1009,7 +1037,7 @@ impl LeaseRegistry {
             let owner_label = owner.and_then(|session| session.label.clone());
             let claimable = active_lease.is_none()
                 && !self
-                    .pending_expiry_closes
+                    .pending_target_closes
                     .contains_key(&visible_tab.target_id)
                 && !self.expired_closed_targets.contains(&visible_tab.target_id);
 
@@ -1781,6 +1809,59 @@ mod tests {
         assert!(leased.focused);
         assert_eq!(error.code, BrowserToolErrorCode::TabNotOwned);
         assert_eq!(error.recovery, Some(RecoveryAction::ListTabs));
+    }
+
+    #[test]
+    fn owned_close_reservation_blocks_missing_reconciliation_until_commit() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+        let tab = registry
+            .lease_tab(&session.agent_session_id, snapshot("target-close"))
+            .unwrap();
+
+        let reserved = registry
+            .reserve_owned_tab_close(&session.agent_session_id, &tab.tab_id)
+            .unwrap();
+        assert_eq!(reserved.target_id, "target-close");
+        assert!(
+            registry
+                .mark_missing_targets_not_in(Vec::<String>::new())
+                .is_empty(),
+            "inventory reconciliation must not race an in-flight owned close"
+        );
+
+        let closed = registry
+            .close_tab_mark(&session.agent_session_id, &tab.tab_id)
+            .unwrap();
+        registry.finish_owned_tab_close_reservation(&closed.target_id, &closed.tab_id);
+
+        assert!(matches!(
+            registry.leases.get(&tab.tab_id).unwrap().state,
+            LeaseState::Closed
+        ));
+        assert!(!registry.pending_target_closes.contains_key("target-close"));
+    }
+
+    #[test]
+    fn failed_owned_close_releases_reconciliation_reservation() {
+        let mut registry = LeaseRegistry::new();
+        let session = registry.start_session(Some("agent".to_string()));
+        let tab = registry
+            .lease_tab(&session.agent_session_id, snapshot("target-close"))
+            .unwrap();
+
+        let reserved = registry
+            .reserve_owned_tab_close(&session.agent_session_id, &tab.tab_id)
+            .unwrap();
+        registry.finish_owned_tab_close_reservation(&reserved.target_id, &reserved.tab_id);
+
+        let missing = registry.mark_missing_targets_not_in(Vec::<String>::new());
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].tab_id, tab.tab_id);
+        assert!(matches!(
+            registry.leases.get(&tab.tab_id).unwrap().state,
+            LeaseState::Missing
+        ));
     }
 
     #[test]

@@ -6498,7 +6498,16 @@ async fn broker_close_tab(
         ));
     }
 
-    if matches!(lease.state, LeaseState::Active) {
+    let lease = state
+        .registry()
+        .lock()
+        .unwrap()
+        .reserve_owned_tab_close(&params.agent_session_id, &params.tab_id)?;
+
+    let close_result = async {
+        if !matches!(lease.state, LeaseState::Active) {
+            return Ok(());
+        }
         match target_by_id(state, &lease.target_id).await {
             Ok(target) => {
                 state
@@ -6510,6 +6519,16 @@ async fn broker_close_tab(
             Err(error) if error.code == crate::leases::BrowserToolErrorCode::TargetMissing => {}
             Err(error) => return Err(error),
         }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = close_result {
+        state
+            .registry()
+            .lock()
+            .unwrap()
+            .finish_owned_tab_close_reservation(&lease.target_id, &params.tab_id);
+        return Err(error);
     }
     state
         .viewport_overrides
@@ -6517,11 +6536,12 @@ async fn broker_close_tab(
         .unwrap()
         .remove(&lease.target_id);
 
-    let closed = state
-        .registry()
-        .lock()
-        .unwrap()
-        .close_tab_mark(&params.agent_session_id, &params.tab_id)?;
+    let closed = {
+        let mut registry = state.registry().lock().unwrap();
+        let result = registry.close_tab_mark(&params.agent_session_id, &params.tab_id);
+        registry.finish_owned_tab_close_reservation(&lease.target_id, &params.tab_id);
+        result?
+    };
     state.clear_focused_target(&closed.target_id);
     state
         .diagnostics()
