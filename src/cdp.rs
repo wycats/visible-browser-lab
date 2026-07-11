@@ -365,10 +365,14 @@ impl CdpClient {
         })?;
         let (page, connection) = self.page(&target.id).await?;
         let original_href = if before_unload == Some("accept") {
-            let value = page
-                .evaluate_expression("location.href")
-                .await
-                .map_err(|error| map_cdp_error("read pre-navigation URL", &error))?;
+            let value = self
+                .runtime
+                .page_command(
+                    &connection,
+                    page.evaluate_expression("location.href"),
+                    "read pre-navigation URL",
+                )
+                .await?;
             Some(value.into_value::<String>().map_err(|error| {
                 BrowserToolError::chrome_unavailable(format!(
                     "Chrome returned an invalid pre-navigation URL: {error}"
@@ -551,10 +555,14 @@ impl CdpClient {
                     .loader_id
                     .as_ref()
                     .to_string();
-                let ready_state = page
-                    .evaluate_expression("document.readyState")
-                    .await
-                    .map_err(|cdp_error| map_cdp_error("read document readiness", &cdp_error))?
+                let ready_state = self
+                    .runtime
+                    .page_command(
+                        connection,
+                        page.evaluate_expression("document.readyState"),
+                        "read document readiness",
+                    )
+                    .await?
                     .into_value::<String>()
                     .map_err(|value_error| {
                         BrowserToolError::chrome_unavailable(format!(
@@ -746,13 +754,17 @@ impl CdpClient {
         // a fresh attachment proves both a changed URL and a usable document.
         let recovery = async {
             loop {
-                let (page, _) = self.page(target_id).await?;
-                let value = page
-                    .evaluate_expression(
-                        "({ href: location.href, readyState: document.readyState })",
+                let (page, connection) = self.page(target_id).await?;
+                let value = self
+                    .runtime
+                    .page_command(
+                        &connection,
+                        page.evaluate_expression(
+                            "({ href: location.href, readyState: document.readyState })",
+                        ),
+                        "verify recovered navigation",
                     )
-                    .await
-                    .map_err(|error| map_cdp_error("verify recovered navigation", &error))?
+                    .await?
                     .into_value::<Value>()
                     .map_err(|error| {
                         BrowserToolError::chrome_unavailable(format!(
@@ -879,7 +891,7 @@ impl CdpClient {
                             "navigate browser history",
                         )
                         .await?;
-                    self.wait_for_history_entry(&page, &connection, index, wait_until, timeout_ms)
+                    self.wait_for_history_entry(&target.id, index, wait_until, timeout_ms)
                         .await
                 }
                 _ => unreachable!("history wait state was validated before navigation"),
@@ -901,22 +913,29 @@ impl CdpClient {
 
     async fn wait_for_history_entry(
         &self,
-        page: &Page,
-        connection: &RuntimeConnection,
+        target_id: &str,
         expected_index: i64,
         wait_until: &str,
         timeout_ms: u64,
     ) -> Result<(), BrowserToolError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let history = self
-                .runtime
-                .page_command(
-                    connection,
-                    page.execute(GetNavigationHistoryParams::default()),
-                    "observe browser history navigation",
-                )
-                .await?;
+            let (page, connection) = self.page(target_id).await?;
+            let history = match page.execute(GetNavigationHistoryParams::default()).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let retry = invalidates_connection(&error) && Instant::now() < deadline;
+                    let mapped = self
+                        .runtime
+                        .page_error(&connection, "observe browser history navigation", error)
+                        .await;
+                    if retry {
+                        sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return Err(mapped);
+                }
+            };
             if history.result.current_index == expected_index {
                 let ready_state = match page.evaluate_expression("document.readyState").await {
                     Ok(value) => value.into_value::<String>().map_err(|error| {
@@ -924,12 +943,27 @@ impl CdpClient {
                             "Chrome returned an invalid document state: {error}"
                         ))
                     })?,
+                    Err(error) if invalidates_connection(&error) => {
+                        let retry = Instant::now() < deadline;
+                        let mapped = self
+                            .runtime
+                            .page_error(&connection, "read history document state", error)
+                            .await;
+                        if retry {
+                            sleep(Duration::from_millis(25)).await;
+                            continue;
+                        }
+                        return Err(mapped);
+                    }
                     Err(_) if Instant::now() < deadline => {
                         sleep(Duration::from_millis(25)).await;
                         continue;
                     }
                     Err(error) => {
-                        return Err(map_cdp_error("read history document state", &error));
+                        return Err(self
+                            .runtime
+                            .page_error(&connection, "read history document state", error)
+                            .await);
                     }
                 };
                 let ready = match wait_until {
@@ -1387,10 +1421,16 @@ impl CdpClient {
         let (page, connection) = self.page(&target.id).await?;
         let selector_json = serde_json::to_string(selector)
             .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
-        let count = page
-            .evaluate_expression(format!("document.querySelectorAll({selector_json}).length"))
-            .await
-            .map_err(|error| map_cdp_error("resolve evaluation CSS target", &error))?
+        let count = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression(format!(
+                    "document.querySelectorAll({selector_json}).length"
+                )),
+                "resolve evaluation CSS target",
+            )
+            .await?
             .value()
             .and_then(Value::as_u64)
             .unwrap_or(0);
@@ -2326,11 +2366,15 @@ impl CdpClient {
   return {{ state: "ready" }};
 }})()"#
         );
-        let (page, _connection) = self.page(&target.id).await?;
-        let result = page
-            .evaluate_expression(expression)
-            .await
-            .map_err(|error| map_cdp_error("fill CSS target", &error))?;
+        let (page, connection) = self.page(&target.id).await?;
+        let result = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression(expression),
+                "fill CSS target",
+            )
+            .await?;
         let result = result.value().cloned().ok_or_else(|| {
             BrowserToolError::chrome_unavailable("fill CSS target omitted result")
         })?;
