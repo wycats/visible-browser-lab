@@ -81,7 +81,17 @@ pub async fn ensure_managed_chrome(
             pid: managed_chrome_pid(config),
         });
     }
-    wait_for_profile_release(config).await?;
+    if let Some(endpoint) = wait_for_active_endpoint_or_profile_release(config).await? {
+        let executable = discover_chrome(config.chrome_path.as_deref())
+            .ok()
+            .map(|installation| installation.executable);
+        return Ok(ManagedChrome {
+            cdp_endpoint: endpoint,
+            reused: true,
+            executable,
+            pid: managed_chrome_pid(config),
+        });
+    }
 
     remove_stale_active_port(&config.devtools_active_port_path).await?;
     let installation = discover_chrome(config.chrome_path.as_deref())?;
@@ -284,21 +294,32 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
     validate_endpoint(&endpoint).await.then_some(endpoint)
 }
 
-async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<()> {
+async fn wait_for_active_endpoint_or_profile_release(
+    config: &RuntimeConfig,
+) -> Result<Option<String>> {
     let profile_lock = config.chrome_profile_dir.join("SingletonLock");
     if profile_is_available(&profile_lock).await? {
-        return Ok(());
+        return Ok(None);
     }
 
     let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
     loop {
+        if let Some(endpoint) = healthy_active_endpoint(config).await {
+            tracing::info!(
+                endpoint,
+                profile = %config.chrome_profile_dir.display(),
+                "recovered the existing managed Chrome CDP endpoint"
+            );
+            return Ok(Some(endpoint));
+        }
         if profile_is_available(&profile_lock).await? {
-            return Ok(());
+            return Ok(None);
         }
         if Instant::now() >= deadline {
             bail!(
-                "managed Chrome profile `{}` remained locked by a running Chrome process after its CDP endpoint stopped responding",
-                config.chrome_profile_dir.display()
+                "managed Chrome profile `{}` remains owned by a running Chrome process whose CDP endpoint did not recover within {} seconds",
+                config.chrome_profile_dir.display(),
+                CHROME_PROFILE_RELEASE_TIMEOUT.as_secs()
             );
         }
         sleep(CHROME_START_RETRY).await;
@@ -991,7 +1012,12 @@ mod tests {
             tokio::fs::remove_file(lock_to_release).await.unwrap();
         });
 
-        wait_for_profile_release(&config).await.unwrap();
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            None
+        );
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
     }
 
@@ -1008,8 +1034,70 @@ mod tests {
         let profile_lock = config.chrome_profile_dir.join("SingletonLock");
         symlink("test-host-2147483647", &profile_lock).unwrap();
 
-        wait_for_profile_release(&config).await.unwrap();
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            None
+        );
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reuses_a_live_profile_when_its_endpoint_recovers_after_one_timeout() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(config.chrome_profile_dir.join("SingletonLock"), b"active")
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/recovered\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = first.read(&mut request).await.unwrap();
+            sleep(Duration::from_millis(1_100)).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = second.read(&mut request).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/recovered"}}"#
+            );
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            Some(format!("http://127.0.0.1:{port}"))
+        );
+        server.await.unwrap();
     }
 
     #[test]

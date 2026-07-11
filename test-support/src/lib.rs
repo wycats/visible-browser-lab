@@ -1289,6 +1289,7 @@ pub fn wait_for_network_event(
 }
 
 pub struct FixtureServer {
+    address: std::net::SocketAddr,
     base_url: String,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -1297,6 +1298,10 @@ pub struct FixtureServer {
 impl FixtureServer {
     pub fn start() -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind fixture server")?;
+        Self::from_listener(listener)
+    }
+
+    fn from_listener(listener: TcpListener) -> Result<Self> {
         listener
             .set_nonblocking(true)
             .context("failed to configure fixture server")?;
@@ -1327,6 +1332,7 @@ impl FixtureServer {
         });
 
         Ok(Self {
+            address,
             base_url: format!("http://{address}"),
             stop: Some(stop_tx),
             thread: Some(thread),
@@ -1336,16 +1342,29 @@ impl FixtureServer {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
-}
 
-impl Drop for FixtureServer {
-    fn drop(&mut self) {
+    pub fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    pub fn restart(&mut self) -> Result<()> {
+        self.stop();
+        let replacement = Self::from_listener(
+            TcpListener::bind(self.address).context("failed to rebind fixture server")?,
+        )?;
+        *self = replacement;
+        Ok(())
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

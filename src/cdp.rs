@@ -1211,24 +1211,38 @@ impl CdpClient {
         target: &CdpTarget,
         expression: &str,
     ) -> Result<EvaluateResult, BrowserToolError> {
-        let (page, connection) = self.page(&target.id).await?;
-        let result = match page.evaluate_expression(expression).await {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(self
-                    .runtime
-                    .page_error(&connection, "evaluate", error)
-                    .await);
+        for attempt in 0..2 {
+            let (page, connection) = self.page(&target.id).await?;
+            match page.evaluate_expression(expression).await {
+                Ok(result) => {
+                    let remote = result.object();
+                    return Ok(EvaluateResult {
+                        value: remote.value.clone(),
+                        preview: remote
+                            .description
+                            .clone()
+                            .or_else(|| Some(remote.r#type.as_ref().to_string())),
+                    });
+                }
+                Err(error) => {
+                    let retry = attempt == 0 && stale_execution_context(&error);
+                    let mapped = self
+                        .runtime
+                        .page_error(&connection, "evaluate", error)
+                        .await;
+                    if retry {
+                        tracing::warn!(
+                            target_id = %target.id,
+                            generation = connection.generation,
+                            "reconnecting after Chrome discarded the page execution context"
+                        );
+                        continue;
+                    }
+                    return Err(mapped);
+                }
             }
-        };
-        let remote = result.object();
-        Ok(EvaluateResult {
-            value: remote.value.clone(),
-            preview: remote
-                .description
-                .clone()
-                .or_else(|| Some(remote.r#type.as_ref().to_string())),
-        })
+        }
+        unreachable!("evaluation retry loop always returns")
     }
 
     pub async fn evaluate_on_backend_node(
@@ -3631,7 +3645,24 @@ fn invalidates_connection(error: &CdpError) -> bool {
             | CdpError::NoResponse
             | CdpError::ChannelSendError(_)
             | CdpError::UnexpectedWsMessage(_)
-    )
+    ) || stale_execution_context(error)
+}
+
+fn stale_execution_context(error: &CdpError) -> bool {
+    match error {
+        CdpError::Chrome(error) => {
+            error.code == -32000
+                && (error
+                    .message
+                    .contains("Cannot find context with specified id")
+                    || error.message.contains("Execution context was destroyed"))
+        }
+        CdpError::ChromeMessage(message) => {
+            message.contains("Cannot find context with specified id")
+                || message.contains("Execution context was destroyed")
+        }
+        _ => false,
+    }
 }
 
 fn map_cdp_error(operation: &str, error: &CdpError) -> BrowserToolError {
@@ -4379,6 +4410,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_execution_context_invalidates_the_browser_generation() {
+        let error = CdpError::Chrome(chromiumoxide::types::Error {
+            code: -32000,
+            message: "Cannot find context with specified id".to_string(),
+        });
+        assert!(stale_execution_context(&error));
+        assert!(invalidates_connection(&error));
+
+        let ordinary = CdpError::Chrome(chromiumoxide::types::Error {
+            code: -32000,
+            message: "No node with given id found".to_string(),
+        });
+        assert!(!stale_execution_context(&ordinary));
+        assert!(!invalidates_connection(&ordinary));
+    }
+
+    #[test]
     fn navigation_watchdog_leaves_time_for_lifecycle_recovery() {
         assert_eq!(
             navigation_timeout_budget(10_000, true),
@@ -4588,6 +4636,63 @@ mod tests {
             .unwrap();
 
         assert!(result.value.is_some());
+        chrome.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "launches isolated headless Chrome to stress localhost server churn"]
+    async fn keeps_a_target_usable_across_localhost_server_restarts() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fixture = visible_browser_lab_test_support::FixtureServer::start().unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+        let target = client
+            .create_page(Some(&fixture.url("/managed")), false)
+            .await
+            .unwrap();
+        let target_id = target.id.clone();
+
+        for iteration in 0..20 {
+            fixture.stop();
+            let _ = client
+                .navigate(
+                    &target,
+                    &fixture.url(&format!("/offline-{iteration}")),
+                    Some("none"),
+                    5_000,
+                    None,
+                )
+                .await;
+            fixture.restart().unwrap();
+            client
+                .navigate(
+                    &target,
+                    &fixture.url(&format!("/online-{iteration}")),
+                    Some("dom_content_loaded"),
+                    10_000,
+                    None,
+                )
+                .await
+                .unwrap();
+            let result = client.evaluate(&target, "document.title").await.unwrap();
+            assert_eq!(
+                result.value.as_ref().and_then(Value::as_str),
+                Some("VBL Fixture")
+            );
+            assert!(
+                client
+                    .page_targets()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| candidate.id == target_id),
+                "target changed during localhost restart iteration {iteration}"
+            );
+        }
+
+        client.close_target(&target_id).await.unwrap();
         chrome.shutdown();
     }
 }
