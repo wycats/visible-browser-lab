@@ -1,37 +1,35 @@
 {
-  "activationEvents": [
-    "onLanguageModelTool:visible_browser_lab_start_session",
-    "onLanguageModelTool:visible_browser_lab_list_tabs",
-    "onLanguageModelTool:visible_browser_lab_new_tab",
-    "onLanguageModelTool:visible_browser_lab_claim_tab",
-    "onLanguageModelTool:visible_browser_lab_release_tab",
-    "onLanguageModelTool:visible_browser_lab_focus_tab",
-    "onLanguageModelTool:visible_browser_lab_close_tab",
-    "onLanguageModelTool:visible_browser_lab_snapshot",
-    "onLanguageModelTool:visible_browser_lab_navigate",
-    "onLanguageModelTool:visible_browser_lab_wait_for",
-    "onLanguageModelTool:visible_browser_lab_click",
-    "onLanguageModelTool:visible_browser_lab_fill",
-    "onLanguageModelTool:visible_browser_lab_fill_form",
-    "onLanguageModelTool:visible_browser_lab_type_text",
-    "onLanguageModelTool:visible_browser_lab_press_key",
-    "onLanguageModelTool:visible_browser_lab_screenshot",
-    "onLanguageModelTool:visible_browser_lab_evaluate",
-    "onLanguageModelTool:visible_browser_lab_interact",
-    "onLanguageModelTool:visible_browser_lab_console",
-    "onLanguageModelTool:visible_browser_lab_network",
-    "onLanguageModelTool:visible_browser_lab_emulation",
-    "onLanguageModelTool:visible_browser_lab_performance",
-    "onLanguageModelTool:visible_browser_lab_audit",
-    "onLanguageModelTool:visible_browser_lab_memory",
-    "onLanguageModelTool:visible_browser_lab_screencast",
-    "onLanguageModelTool:visible_browser_lab_artifacts",
-    "onLanguageModelTool:visible_browser_lab_help"
-  ],
+  "name": "visible-browser-lab",
+  "displayName": "Visible Browser Lab",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "Native VS Code language model tools for lease-scoped visible Chrome interaction.",
   "categories": [
     "AI",
     "Other"
   ],
+  "publisher": "wycats",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p test/tsconfig.json",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test:unit",
+    "format": "oxfmt --write package.json tsconfig.json src test unit",
+    "format:check": "oxfmt --check package.json tsconfig.json src test unit",
+    "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
+    "test:extension-host": "pnpm run build:test && node dist-test/runner.js",
+    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js dist-unit/unit/confirmation.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p unit/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.120.0",
+    "@vscode/test-electron": "^2.5.2",
+    "oxfmt": "^0.56.0",
+    "oxlint": "^1.71.0",
+    "oxlint-tsgolint": "^0.23.0",
+    "typescript": "^5.9.0"
+  },
   "contributes": {
     "configuration": {
       "properties": {
@@ -2022,36 +2020,38 @@
       }
     ]
   },
-  "description": "Native VS Code language model tools for lease-scoped visible Chrome interaction.",
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "@types/vscode": "^1.105.0",
-    "@vscode/test-electron": "^2.5.2",
-    "oxfmt": "^0.56.0",
-    "oxlint": "^1.71.0",
-    "oxlint-tsgolint": "^0.23.0",
-    "typescript": "^5.9.0"
-  },
-  "displayName": "Visible Browser Lab",
+  "activationEvents": [
+    "onLanguageModelTool:visible_browser_lab_artifacts",
+    "onLanguageModelTool:visible_browser_lab_audit",
+    "onLanguageModelTool:visible_browser_lab_claim_tab",
+    "onLanguageModelTool:visible_browser_lab_click",
+    "onLanguageModelTool:visible_browser_lab_close_tab",
+    "onLanguageModelTool:visible_browser_lab_console",
+    "onLanguageModelTool:visible_browser_lab_emulation",
+    "onLanguageModelTool:visible_browser_lab_evaluate",
+    "onLanguageModelTool:visible_browser_lab_fill",
+    "onLanguageModelTool:visible_browser_lab_fill_form",
+    "onLanguageModelTool:visible_browser_lab_focus_tab",
+    "onLanguageModelTool:visible_browser_lab_help",
+    "onLanguageModelTool:visible_browser_lab_interact",
+    "onLanguageModelTool:visible_browser_lab_list_tabs",
+    "onLanguageModelTool:visible_browser_lab_memory",
+    "onLanguageModelTool:visible_browser_lab_navigate",
+    "onLanguageModelTool:visible_browser_lab_network",
+    "onLanguageModelTool:visible_browser_lab_new_tab",
+    "onLanguageModelTool:visible_browser_lab_performance",
+    "onLanguageModelTool:visible_browser_lab_press_key",
+    "onLanguageModelTool:visible_browser_lab_release_tab",
+    "onLanguageModelTool:visible_browser_lab_screencast",
+    "onLanguageModelTool:visible_browser_lab_screenshot",
+    "onLanguageModelTool:visible_browser_lab_snapshot",
+    "onLanguageModelTool:visible_browser_lab_start_session",
+    "onLanguageModelTool:visible_browser_lab_type_text",
+    "onLanguageModelTool:visible_browser_lab_wait_for"
+  ],
   "engines": {
-    "vscode": "^1.105.0"
+    "vscode": "^1.120.0"
   },
-  "main": "./dist/extension.js",
-  "name": "visible-browser-lab",
-  "private": true,
-  "publisher": "wycats",
-  "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "build:test": "tsc -p test/tsconfig.json",
-    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test:unit",
-    "format": "oxfmt --write package.json tsconfig.json src test unit",
-    "format:check": "oxfmt --check package.json tsconfig.json src test unit",
-    "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
-    "test:extension-host": "pnpm run build:test && node dist-test/runner.js",
-    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js dist-unit/unit/confirmation.test.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p unit/tsconfig.json --noEmit"
-  },
-  "version": "0.0.0-dev",
   "visibleBrowserLab": {
     "runtimeBinary": "bin/visible-browser-lab-mcp",
     "serverInstructions": "Generated during packaging by `cargo xtask vscode-manifest`."

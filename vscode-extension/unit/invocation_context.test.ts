@@ -1,7 +1,13 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
-import { extractInvocationContext, withWorkspaceFallback } from "../src/invocation_context";
+import {
+  extractInvocationContext,
+  resolveInvocationContext,
+  supportsUnsupportedTokenInvocation,
+  unsupportedInvocationTokenError,
+  withWorkspaceFallback,
+} from "../src/invocation_context";
 
 function uri(value: string, fsPath: string, scheme = "file") {
   return {
@@ -60,6 +66,34 @@ test("rejects missing or changed token shapes", () => {
     }),
     undefined,
   );
+});
+
+test("distinguishes global invocations from unsupported chat tokens", () => {
+  assert.deepEqual(resolveInvocationContext({ toolInvocationToken: undefined }), {
+    kind: "global",
+  });
+  assert.deepEqual(
+    resolveInvocationContext({ toolInvocationToken: { sessionId: "legacy-session" } }),
+    { kind: "unsupported" },
+  );
+  assert.equal(
+    resolveInvocationContext({
+      toolInvocationToken: {
+        sessionResource: uri("vscode-chat-session://authority/path", ""),
+      },
+    }).kind,
+    "ambient",
+  );
+});
+
+test("unsupported chat tokens produce actionable redacted guidance", () => {
+  assert.equal(
+    unsupportedInvocationTokenError("list_tabs"),
+    "list_tabs failed with unsupported_host. VS Code did not expose a compatible chat session resource; Visible Browser Lab requires VS Code 1.120 or newer with the supported invocation-token shape. Recovery: update and reload VS Code, or use the explicit MCP/CLI surface",
+  );
+  assert.equal(supportsUnsupportedTokenInvocation("help"), true);
+  assert.equal(supportsUnsupportedTokenInvocation("start_session"), false);
+  assert.equal(supportsUnsupportedTokenInvocation("list_tabs"), false);
 });
 
 test("uses the active workspace fallback only without token-derived context", () => {

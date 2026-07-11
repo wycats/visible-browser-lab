@@ -3,7 +3,9 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 
 import {
-  extractInvocationContext,
+  resolveInvocationContext,
+  supportsUnsupportedTokenInvocation,
+  unsupportedInvocationTokenError,
   withWorkspaceFallback,
   type SurfaceRequestContext,
 } from "./invocation_context";
@@ -61,18 +63,22 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
     token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelToolResult> {
     const method = browserMethod(this.contribution.name);
+    const invocation = resolveInvocationContext(options);
+    if (invocation.kind === "unsupported" && !supportsUnsupportedTokenInvocation(method)) {
+      throw new Error(unsupportedInvocationTokenError(method));
+    }
     const output = await invokeSurfaceCall(
       this.context,
       method,
       options.input ?? {},
-      extractInvocationContext(options),
+      invocation.kind === "ambient" ? invocation.context : undefined,
       token,
     );
     if (!output.ok) {
       throw new Error(formatToolError(method, output.error));
     }
 
-    // LanguageModelTextPart is stable at the declared engine floor (1.105).
+    // LanguageModelTextPart is stable at the declared engine floor.
     return new vscode.LanguageModelToolResult([
       new vscode.LanguageModelTextPart(JSON.stringify(output.result ?? null)),
     ]);

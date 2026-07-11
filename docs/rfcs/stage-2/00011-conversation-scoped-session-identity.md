@@ -40,7 +40,7 @@ On the first stateful browser call, the broker creates a browser session for the
 
 The identity is infrastructure metadata. It never appears in the tool's input schema, the model-visible arguments, normal browser-operation results, help examples, or logs. The internal `agent_session_id` remains available to the broker and to explicit clients. A caller that deliberately invokes `start_session` still receives the handle for backward compatibility, but ordinary ambient calls do not disclose it.
 
-If the host does not provide a usable identity, VBL behaves like the explicit protocol. A stateful call without `agent_session_id` returns `session_required`; the agent calls `start_session` and passes the returned handle thereafter. Global VS Code tool invocations, older host versions, and bare MCP clients therefore degrade to an existing supported mode rather than failing unpredictably.
+If the host does not provide a usable identity, VBL behaves like the explicit protocol. A stateful call without `agent_session_id` returns `session_required`; an explicit MCP or CLI caller calls `start_session` and passes the returned handle thereafter. Global VS Code tool invocations retain that `session_required` boundary. The packaged VS Code extension requires 1.120 or newer, the first supported host line whose chat token carries `sessionResource`; a present but incompatible chat token fails as `unsupported_host` rather than presenting model-visible session handles or silently routing without identity.
 
 A persisted host identity does not make broker state persistent. Reopening a chat or resuming a Codex thread reuses the session while the broker and its TTL binding remain live. If the broker restarts or the session expires, the next ambient call creates a new session. Claimed human tabs remain open and claimable. Windows VBL created for the expired ambient conversation are closed if the conversation still owns them, preventing abandoned conversations from accumulating windows indefinitely.
 
@@ -88,7 +88,7 @@ The process identifier, MCP connection, and stdio lifetime are not identity sour
 
 ### VS Code
 
-The VBL language-model tool adapter shape-checks `options.toolInvocationToken` for a URI-like `sessionResource`. When present, it constructs:
+The VBL language-model tool adapter requires VS Code 1.120 or newer and shape-checks `options.toolInvocationToken` for a URI-like `sessionResource`. When present, it constructs:
 
 ```json
 {
@@ -98,7 +98,7 @@ The VBL language-model tool adapter shape-checks `options.toolInvocationToken` f
 }
 ```
 
-The adapter also reads the token's URI-like `workingDirectory` when present. When the token shape is absent or changes, the adapter supplies no conversation identity and the explicit protocol remains available.
+The adapter also reads the token's URI-like `workingDirectory` when present. An absent token is the documented global-invocation path and supplies no conversation identity, so stateful calls return `session_required`. A present but incompatible token means a supported chat host failed to provide its required identity; stateful calls fail as `unsupported_host` with update/reload guidance. The VS Code model projection omits `agent_session_id`, preventing models from inventing or disclosing fallback handles; explicit sessions remain available through the canonical MCP and CLI surfaces.
 
 Once VS Code stabilizes `chatSessionResource` on `LanguageModelToolInvocationOptions`, the adapter reads that public field first and retains the token bridge only for supported older versions. This provenance change does not affect the canonical identity or broker behavior.
 

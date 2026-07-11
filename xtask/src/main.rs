@@ -790,7 +790,7 @@ fn vscode_extension_manifest(version: &str) -> Result<Value> {
         "version": version,
         "publisher": "wycats",
         "engines": {
-            "vscode": "^1.105.0"
+            "vscode": "^1.120.0"
         },
         "categories": ["AI", "Other"],
         "activationEvents": activation_events,
