@@ -1,7 +1,5 @@
 <!-- exo:12 ulid:01kx79feb0qfea58tw8fq4djjq -->
 
-# RFC 12: Ownership-Aware Browser Cleanup
-
 # RFC 00012: Ownership-Aware Browser Cleanup
 
 # Summary
