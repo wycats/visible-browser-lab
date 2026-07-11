@@ -619,6 +619,47 @@ mod macos {
             Some(true),
             "a no-op history request must preserve the page's unload guard"
         );
+        let rejected_navigation = client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": "http://[",
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            true,
+        )?;
+        assert!(
+            matches!(
+                rejected_navigation
+                    .get("code")
+                    .and_then(|value| value.as_str()),
+                Some("chrome_unavailable" | "operation_timeout")
+            ),
+            "malformed navigation unexpectedly succeeded: {rejected_navigation}"
+        );
+        let guard_restored = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            guard_restored
+                .get("value")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a rejected navigation must restore the current document's unload guard"
+        );
         client
             .call_tool(
                 "navigate",

@@ -985,7 +985,18 @@ impl BrowserBackend {
 
                 let deadline = Instant::now() + Duration::from_millis(500);
                 let targets = loop {
-                    let targets = client.page_targets().await?;
+                    let targets = match client.page_targets().await {
+                        Ok(targets) => targets,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error.message,
+                                target_id,
+                                profile = %browser.config.chrome_profile_dir.display(),
+                                "managed target closed, but final browser inventory was unavailable"
+                            );
+                            return Ok(());
+                        }
+                    };
                     if targets.iter().all(|target| target.id != target_id)
                         || Instant::now() >= deadline
                     {
@@ -1010,7 +1021,13 @@ impl BrowserBackend {
 
                 if only_disposable_targets {
                     let managed_pid = managed_chrome_pid(&browser.config);
-                    client.close_browser().await?;
+                    if let Err(error) = client.close_browser().await {
+                        tracing::warn!(
+                            error = %error.message,
+                            profile = %browser.config.chrome_profile_dir.display(),
+                            "managed target closed, but final Browser.close did not complete"
+                        );
+                    }
                     if let Some(pid) = managed_pid {
                         wait_for_process_exit(pid, Duration::from_secs(2)).await;
                         if process_is_running(pid) {
@@ -1019,11 +1036,14 @@ impl BrowserBackend {
                                 profile = %browser.config.chrome_profile_dir.display(),
                                 "managed Chrome remained alive after Browser.close; terminating its exact profile owner"
                             );
-                            terminate_process(pid).await.map_err(|error| {
-                                BrowserToolError::chrome_unavailable(format!(
-                                    "failed to stop managed Chrome pid {pid} after closing its final target: {error:#}"
-                                ))
-                            })?;
+                            if let Err(error) = terminate_process(pid).await {
+                                tracing::warn!(
+                                    pid,
+                                    error = %format!("{error:#}"),
+                                    profile = %browser.config.chrome_profile_dir.display(),
+                                    "managed target closed, but its final Chrome process could not be stopped"
+                                );
+                            }
                         }
                     }
                     *browser.client.lock().await = None;
