@@ -796,7 +796,7 @@ fn managed_targets_are_disposable(
     startup_targets: &HashSet<String>,
 ) -> bool {
     targets.iter().all(|target| {
-        startup_targets.contains(&target.id)
+        (startup_targets.contains(&target.id) && is_managed_startup_target(target))
             || (synthetic_replacements.contains(&target.id)
                 && is_managed_replacement_target(target))
     })
@@ -6914,6 +6914,14 @@ mod tests {
         ));
         assert!(managed_targets_are_disposable(
             &targets,
+            &HashSet::new(),
+            &HashSet::from(["startup".to_string()])
+        ));
+
+        let mut navigated = targets[0].clone();
+        navigated.url = "https://example.com/human-state".to_string();
+        assert!(!managed_targets_are_disposable(
+            &[navigated],
             &HashSet::new(),
             &HashSet::from(["startup".to_string()])
         ));

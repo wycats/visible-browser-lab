@@ -11,5 +11,5 @@
     "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["../src/invocation_context.ts", "**/*.ts"]
+  "include": ["../src/confirmation.ts", "../src/invocation_context.ts", "**/*.ts"]
 }
