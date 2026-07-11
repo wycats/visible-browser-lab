@@ -44,14 +44,12 @@ mod macos {
         fs,
         net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
         thread,
         time::{Duration, Instant},
     };
 
     use anyhow::{Context, Result, bail};
-    use chromiumoxide::Browser;
-    use futures_util::StreamExt;
     use serde_json::json;
     use visible_browser_lab_test_support::{
         FixtureServer, McpClient, OpenTab, chrome_for_testing_executable, field_str,
@@ -281,6 +279,7 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        wait_until_unhealthy(&first_endpoint)?;
 
         client.shutdown();
         terminate_broker(state.path())?;
@@ -294,11 +293,8 @@ mod macos {
             false,
         )?;
         let restarted_session_id = field_str(&restarted_session, "agent_session_id")?;
-        assert_eq!(read_active_endpoint(state.path())?, first_endpoint);
         assert_frontmost(&original_frontmost, "broker restart and browser reuse")?;
 
-        close_browser(&first_endpoint)?;
-        wait_until_unhealthy(&first_endpoint)?;
         let replacement = restarted.call_tool(
             "new_tab",
             json!({
@@ -329,8 +325,459 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
-        close_browser(&replacement_endpoint)?;
+        wait_until_unhealthy(&replacement_endpoint)?;
         restarted.shutdown();
+        drop(cleanup);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "launches visible managed Chrome to verify final-window cleanup"]
+    fn closing_all_managed_tabs_does_not_leave_replacement_windows() -> Result<()> {
+        let original_frontmost = frontmost_application()?;
+        let state = tempfile::Builder::new()
+            .prefix("vbl-managed-close-")
+            .tempdir_in("/tmp")?;
+        let cleanup = Cleanup {
+            state_dir: state.path().to_path_buf(),
+            original_frontmost,
+        };
+        let chrome = chrome_for_testing_executable()?;
+        let mut client =
+            McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &chrome)?;
+        client.initialize("visible-browser-lab-managed-close")?;
+
+        let session = client.call_tool(
+            "start_session",
+            json!({
+                "label": "managed-close",
+                "start_url": "about:blank",
+                "focus": false
+            }),
+            Duration::from_secs(45),
+            false,
+        )?;
+        let session_id = field_str(&session, "agent_session_id")?;
+        let first = OpenTab::from_summary(
+            &session_id,
+            session.get("tab").context("start_session omitted tab")?,
+        )?;
+        let second_result = client.call_tool(
+            "new_tab",
+            json!({
+                "agent_session_id": session_id,
+                "url": "about:blank",
+                "focus": false
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let second = OpenTab::from_summary(
+            &session_id,
+            second_result.get("tab").context("new_tab omitted tab")?,
+        )?;
+        let endpoint = read_active_endpoint(state.path())?;
+        let managed_pid = read_managed_pid(state.path())?;
+
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": first.tab_id }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": second.tab_id }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        wait_until_unhealthy(&endpoint)?;
+        wait_until_process_exited(managed_pid)?;
+
+        client.shutdown();
+        drop(cleanup);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "launches visible managed Chrome to verify beforeunload recovery"]
+    fn beforeunload_accept_keeps_the_owned_tab_usable() -> Result<()> {
+        let original_frontmost = frontmost_application()?;
+        let state = tempfile::Builder::new()
+            .prefix("vbl-managed-beforeunload-")
+            .tempdir_in("/tmp")?;
+        let cleanup = Cleanup {
+            state_dir: state.path().to_path_buf(),
+            original_frontmost,
+        };
+        let fixture = FixtureServer::start()?;
+        let chrome = chrome_for_testing_executable()?;
+        let mut client =
+            McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &chrome)?;
+        client.initialize("visible-browser-lab-managed-beforeunload")?;
+
+        let session = client.call_tool(
+            "start_session",
+            json!({
+                "label": "managed-beforeunload",
+                "start_url": fixture.url("/beforeunload"),
+                "focus": false
+            }),
+            Duration::from_secs(45),
+            false,
+        )?;
+        let session_id = field_str(&session, "agent_session_id")?;
+        let tab = OpenTab::from_summary(
+            &session_id,
+            session.get("tab").context("start_session omitted tab")?,
+        )?;
+        let sibling_result = client.call_tool(
+            "new_tab",
+            json!({
+                "agent_session_id": session_id,
+                "url": fixture.url("/sibling"),
+                "focus": false
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let sibling = OpenTab::from_summary(
+            &session_id,
+            sibling_result.get("tab").context("new_tab omitted tab")?,
+        )?;
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblBeforeUnloadSideEffects = 0; localStorage.setItem('vbl-beforeunload-side-effects', '0'); window.__vblGuard = event => { window.__vblBeforeUnloadSideEffects += 1; localStorage.setItem('vbl-beforeunload-side-effects', String(Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0') + 1)); event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "target": { "css": "#entry" },
+                "key": "Enter",
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client
+            .call_tool(
+                "navigate",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": tab.tab_id,
+                    "action": "url",
+                    "url": fixture.url("/dismissed-beforeunload"),
+                    "wait_until": "none",
+                    "timeout_ms": 5000,
+                    "before_unload": "dismiss",
+                    "observe": "none"
+                }),
+                Duration::from_secs(15),
+                false,
+            )
+            .context("dismiss beforeunload navigation")?;
+        let dismissed = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "location.pathname"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            dismissed.get("value").and_then(|value| value.as_str()),
+            Some("/chat/pending")
+        );
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "window.removeEventListener('beforeunload', window.__vblGuard); true"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblBeforeUnloadSideEffects = 0; localStorage.setItem('vbl-beforeunload-side-effects', '0'); window.__vblGuard = event => { window.__vblBeforeUnloadSideEffects += 1; localStorage.setItem('vbl-beforeunload-side-effects', String(Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0') + 1)); event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        client.call_tool(
+            "click",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "target": { "css": "#entry" },
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "press_key",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "target": { "css": "#entry" },
+                "key": "Enter",
+                "observe": "none"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        for invalid_wait_request in [
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": fixture.url("/invalid-wait"),
+                "wait_until": "loaded",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "reload",
+                "wait_until": "loaded",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+        ] {
+            let invalid_wait = client.call_tool(
+                "navigate",
+                invalid_wait_request,
+                Duration::from_secs(10),
+                true,
+            )?;
+            assert_eq!(
+                invalid_wait.get("code").and_then(|value| value.as_str()),
+                Some("invalid_input")
+            );
+        }
+        let invalid_forward = client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "forward",
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            true,
+        )?;
+        assert_eq!(
+            invalid_forward.get("code").and_then(|value| value.as_str()),
+            Some("invalid_input")
+        );
+        let guard_still_active = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            guard_still_active
+                .get("value")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a no-op history request must preserve the page's unload guard"
+        );
+        client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": fixture.url("/chat/pending#accepted-fragment"),
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        let same_document_guard = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const sideEffects = window.__vblBeforeUnloadSideEffects; const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return { prevented: event.defaultPrevented, href: location.href, sideEffects, stash: Boolean(window.__io_github_wycats_visible_browser_lab_beforeunload_stash_v1) }; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            same_document_guard
+                .get("value")
+                .and_then(|value| value.get("prevented"))
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a same-document accepted navigation must restore the page's unload guard: {same_document_guard}"
+        );
+        let side_effects_before_cross_document = same_document_guard
+            .get("value")
+            .and_then(|value| value.get("sideEffects"))
+            .and_then(|value| value.as_u64())
+            .context("same-document guard result omitted sideEffects")?;
+        assert_eq!(
+            side_effects_before_cross_document, 1,
+            "a same-document accept must not duplicate Chrome's own beforeunload side effect: {same_document_guard}"
+        );
+        let rejected_navigation = client.call_tool(
+            "navigate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": "http://[",
+                "wait_until": "none",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            Duration::from_secs(10),
+            true,
+        )?;
+        assert!(
+            matches!(
+                rejected_navigation
+                    .get("code")
+                    .and_then(|value| value.as_str()),
+                Some("invalid_input" | "chrome_unavailable" | "operation_timeout")
+            ),
+            "malformed navigation unexpectedly succeeded: {rejected_navigation}"
+        );
+        let guard_restored = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented; })()"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            guard_restored
+                .get("value")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "a rejected navigation must restore the current document's unload guard"
+        );
+        let side_effects_before_cross_document = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0')"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        let side_effects_before_cross_document = side_effects_before_cross_document
+            .get("value")
+            .and_then(|value| value.as_u64())
+            .context("pre-navigation side-effect count was not numeric")?;
+        client
+            .call_tool(
+                "navigate",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": sibling.tab_id,
+                    "action": "url",
+                    "url": fixture.url("/after-beforeunload"),
+                    "wait_until": "none",
+                    "timeout_ms": 10000,
+                    "before_unload": "accept",
+                    "observe": "none"
+                }),
+                Duration::from_secs(15),
+                false,
+            )
+            .context("accept beforeunload navigation")?;
+        let title = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "document.title"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            title.get("value").and_then(|value| value.as_str()),
+            Some("VBL Fixture")
+        );
+        let unload_side_effects = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0')"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            unload_side_effects
+                .get("value")
+                .and_then(|value| value.as_u64()),
+            Some(side_effects_before_cross_document + 1),
+            "accepting a cross-document beforeunload must add exactly one persisted side effect: {unload_side_effects}"
+        );
+
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
+            Duration::from_secs(15),
+            false,
+        )?;
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": sibling.tab_id }),
+            Duration::from_secs(15),
+            false,
+        )?;
+        client.shutdown();
         drop(cleanup);
         Ok(())
     }
@@ -404,6 +851,41 @@ mod macos {
         Ok(format!("http://127.0.0.1:{port}"))
     }
 
+    fn read_managed_pid(state_dir: &Path) -> Result<i32> {
+        if let Ok(lock) = fs::read_link(state_dir.join("chrome-profile/SingletonLock"))
+            && let Some(pid) = lock
+                .to_string_lossy()
+                .rsplit_once('-')
+                .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        {
+            return Ok(pid);
+        }
+
+        fs::read_to_string(state_dir.join("managed-chrome.pid"))?
+            .trim()
+            .parse()
+            .context("managed Chrome pid file contained an invalid pid")
+    }
+
+    #[test]
+    fn managed_pid_falls_back_to_the_runtime_pid_file() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        fs::write(state.path().join("managed-chrome.pid"), "4242\n")?;
+        assert_eq!(read_managed_pid(state.path())?, 4242);
+        Ok(())
+    }
+
+    fn wait_until_process_exited(pid: i32) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            if Instant::now() >= deadline {
+                bail!("managed Chrome pid {pid} remained alive after final-target close");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
     fn terminate_broker(state_dir: &Path) -> Result<()> {
         let pid = fs::read_to_string(state_dir.join("broker-v4.pid"))?
             .trim()
@@ -419,22 +901,6 @@ mod macos {
             thread::sleep(Duration::from_millis(50));
         }
         Ok(())
-    }
-
-    fn close_browser(endpoint: &str) -> Result<()> {
-        tokio::runtime::Runtime::new()?.block_on(async {
-            let (mut browser, mut handler) = Browser::connect(endpoint).await?;
-            let handler_task = tokio::spawn(async move {
-                while let Some(result) = handler.next().await {
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            });
-            let _ = browser.close().await;
-            let _ = tokio::time::timeout(Duration::from_secs(5), handler_task).await;
-            Ok::<(), anyhow::Error>(())
-        })
     }
 
     fn wait_until_unhealthy(endpoint: &str) -> Result<()> {
@@ -466,7 +932,22 @@ mod macos {
                 "user-data-dir={}",
                 self.state_dir.join("chrome-profile").display()
             );
-            let _ = Command::new("pkill").args(["-f", &profile]).status();
+            let _ = Command::new("pkill")
+                .args(["-TERM", "-f", &profile])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Command::new("pgrep")
+                .args(["-f", &profile])
+                .stdout(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-f", &profile])
+                .status();
             let _ = restore_frontmost_application(&self.original_frontmost);
         }
     }

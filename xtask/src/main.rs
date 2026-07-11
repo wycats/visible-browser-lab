@@ -790,7 +790,7 @@ fn vscode_extension_manifest(version: &str) -> Result<Value> {
         "version": version,
         "publisher": "wycats",
         "engines": {
-            "vscode": "^1.105.0"
+            "vscode": "^1.120.0"
         },
         "categories": ["AI", "Other"],
         "activationEvents": activation_events,
@@ -829,7 +829,7 @@ fn vscode_extension_manifest(version: &str) -> Result<Value> {
             }
         },
         "visibleBrowserLab": {
-            "serverInstructions": agent_surface_contract::SERVER_INSTRUCTIONS,
+            "serverInstructions": vscode_server_instructions(),
             "runtimeBinary": "bin/visible-browser-lab-mcp"
         }
     }))
@@ -868,13 +868,24 @@ fn vscode_language_model_tool(tool: &ToolDefinition) -> Value {
         "userDescription": tool.description,
         "modelDescription": vscode_model_description(tool),
         "icon": "$(browser)",
-        "inputSchema": tool.input_schema,
+        "inputSchema": vscode_input_schema(tool),
     });
     if let Some(reference) = vscode_tool_reference_name(&tool.name) {
         contribution["canBeReferencedInPrompt"] = Value::Bool(true);
         contribution["toolReferenceName"] = Value::String(reference.to_string());
     }
     contribution
+}
+
+fn vscode_input_schema(tool: &ToolDefinition) -> Value {
+    let mut schema = tool.input_schema.clone();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.remove("agent_session_id");
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|field| field.as_str() != Some("agent_session_id"));
+    }
+    schema
 }
 
 fn vscode_tool_name(tool_name: &str) -> String {
@@ -889,9 +900,22 @@ fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
 }
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
+    if tool.name == "start_session" {
+        return format!(
+            "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session; its model-visible schema and result never accept or expose a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+            tool.description
+        );
+    }
     format!(
-        "{} Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         tool.description
+    )
+}
+
+fn vscode_server_instructions() -> String {
+    format!(
+        "VS Code chat supplies conversation identity out of band. Never call start_session or invent, request, or pass a session handle; if a call returns session_required, report its recovery guidance. {}",
+        agent_surface_contract::COMMON_OPERATION_INSTRUCTIONS
     )
 }
 
@@ -919,8 +943,8 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
             .iter()
             .find(|candidate| candidate["name"].as_str() == Some(&expected_name))
             .with_context(|| format!("VS Code manifest omitted tool `{expected_name}`"))?;
-        if contribution["inputSchema"] != tool.input_schema {
-            bail!("VS Code input schema for `{expected_name}` does not match the shared catalog");
+        if contribution["inputSchema"] != vscode_input_schema(tool) {
+            bail!("VS Code input schema for `{expected_name}` does not match its host projection");
         }
         if contribution["displayName"].as_str() != Some(tool.title.as_str()) {
             bail!("VS Code displayName for `{expected_name}` does not match the shared catalog");
@@ -1501,6 +1525,21 @@ fn run_installed_facade_lifecycle(
         &session_id,
         session.get("tab").context("start_session omitted tab")?,
     )?;
+    client.call_tool(
+        "wait_for",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id.clone(),
+            "condition": {
+                "kind": "expression",
+                "expression": format!("document.title === {expected_title:?}")
+            },
+            "timeout_ms": 10_000,
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
     let owned = client.call_tool(
         "list_tabs",
         json!({ "agent_session_id": session_id }),
@@ -1775,10 +1814,22 @@ fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBu
             dist.join("extension.js").display()
         );
     }
+    if !dist.join("confirmation.js").is_file() {
+        bail!(
+            "extension confirmation module not found at `{}`. Run `pnpm build` first.",
+            dist.join("confirmation.js").display()
+        );
+    }
     if !dist.join("invocation_context.js").is_file() {
         bail!(
             "extension invocation-context module not found at `{}`. Run `pnpm build` first.",
             dist.join("invocation_context.js").display()
+        );
+    }
+    if !dist.join("model_result.js").is_file() {
+        bail!(
+            "extension model-result module not found at `{}`. Run `pnpm build` first.",
+            dist.join("model_result.js").display()
         );
     }
     Ok(dist)
@@ -1902,8 +1953,20 @@ fn write_vsix_archive(
     )?;
     add_file(
         &mut zip,
+        "extension/dist/confirmation.js",
+        &extension_dist.join("confirmation.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
         "extension/dist/invocation_context.js",
         &extension_dist.join("invocation_context.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
+        "extension/dist/model_result.js",
+        &extension_dist.join("model_result.js"),
         0o644,
     )?;
     add_file(
@@ -1964,7 +2027,9 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension.vsixmanifest",
         "extension/package.json",
         "extension/dist/extension.js",
+        "extension/dist/confirmation.js",
         "extension/dist/invocation_context.js",
+        "extension/dist/model_result.js",
         "extension/skills/visible-browser-lab/SKILL.md",
     ] {
         if !names.iter().any(|name| name == required) {
@@ -2885,6 +2950,48 @@ mod tests {
     }
 
     #[test]
+    fn vscode_model_schema_uses_only_ambient_session_identity() {
+        let tools = production_tool_definitions().unwrap();
+        for tool in &tools {
+            let canonical_properties = tool.input_schema["properties"].as_object().unwrap();
+            let vscode_schema = vscode_input_schema(tool);
+            let vscode_properties = vscode_schema["properties"].as_object().unwrap();
+
+            assert!(
+                !vscode_properties.contains_key("agent_session_id"),
+                "{} exposes an explicit session handle to the VS Code model",
+                tool.name
+            );
+            if canonical_properties.contains_key("agent_session_id") {
+                assert!(
+                    tool.input_schema["properties"]["agent_session_id"]["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("exact returned value")),
+                    "{} lost the canonical explicit-fallback contract",
+                    tool.name
+                );
+            }
+        }
+
+        let start_session = tools
+            .iter()
+            .find(|tool| tool.name == "start_session")
+            .unwrap();
+        let start_description = vscode_model_description(start_session);
+        assert!(start_description.contains("reuses the current ambient session"));
+        assert!(!start_description.contains("never call start_session"));
+
+        let new_tab = tools.iter().find(|tool| tool.name == "new_tab").unwrap();
+        assert!(vscode_model_description(new_tab).contains("never call start_session"));
+
+        let server_instructions = vscode_server_instructions();
+        assert!(server_instructions.contains("Never call start_session"));
+        assert!(server_instructions.contains("Use only tab_id values owned"));
+        assert!(!server_instructions.contains("then called start_session"));
+        assert!(!server_instructions.contains("exact returned handle"));
+    }
+
+    #[test]
     fn release_version_normalizes_tag_prefix() {
         let root = repo_root().unwrap();
 
@@ -2938,7 +3045,9 @@ mod tests {
         let dist = output.path().join("dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(dist.join("extension.js"), b"// bundle").unwrap();
+        fs::write(dist.join("confirmation.js"), b"// confirmation module").unwrap();
         fs::write(dist.join("invocation_context.js"), b"// context module").unwrap();
+        fs::write(dist.join("model_result.js"), b"// model result module").unwrap();
         let vsix = output.path().join(format!(
             "visible-browser-lab-vscode-{version}-{target}.vsix"
         ));

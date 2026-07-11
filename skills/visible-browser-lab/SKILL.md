@@ -27,7 +27,7 @@ Use `list_tabs` with its default scope for normal work. The default list shows t
 
 Use `new_tab` to create an owned background tab. Set `focus: true` only when the user wants Chrome activated immediately. Use `claim_tab` to claim an unowned Chrome target by `target_id`. Use takeover only when the user explicitly asks to transfer ownership, with a non-empty `user_instruction`; takeover returns a new leased `tab_id` and invalidates the previous active lease.
 
-Use every page-scoped tool only with an owned `tab_id`. `release_tab` leaves the Chrome target visible and claimable. `close_tab` closes the Chrome target and marks the lease closed.
+Use every page-scoped tool only with an owned `tab_id`. `release_tab` makes the Chrome target visible and claimable, while VBL-created targets remain eligible for cleanup when the responsible session expires. Only when the user explicitly asks to keep a VBL-created target open after the session should you pass `leave_visible: true` together with their non-empty `user_instruction`. `close_tab` closes the Chrome target and marks the lease closed.
 
 Inspect an unfamiliar page with `snapshot`. Its compact accessibility tree assigns short `ref` values to elements in the main document and frames. Pass those references to `click` and `fill`. A reference remains subordinate to its session, tab lease, frame, and document; after navigation or `element_stale`, call `snapshot` again. Use `{ "css": "..." }` only when the accessibility snapshot does not represent the target.
 

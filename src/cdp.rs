@@ -17,6 +17,7 @@ use chromiumoxide::{
             accessibility::{
                 AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
             },
+            browser::CloseParams as BrowserCloseParams,
             dom::{
                 BackendNodeId, DescribeNodeParams, GetBoxModelParams, GetContentQuadsParams,
                 GetDocumentParams, PushNodesByBackendIdsToFrontendParams, QuerySelectorAllParams,
@@ -43,7 +44,7 @@ use chromiumoxide::{
             },
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
-                CaptureScreenshotParams, EnableParams as PageEnableParams,
+                CaptureScreenshotParams, DialogType, EnableParams as PageEnableParams,
                 EventDomContentEventFired, EventJavascriptDialogOpening, EventLoadEventFired,
                 EventScreencastFrame, EventScreencastVisibilityChanged, Frame, FrameTree,
                 GetFrameTreeParams, GetLayoutMetricsParams, GetNavigationHistoryParams,
@@ -86,13 +87,15 @@ use tokio::{
 };
 use url::Url;
 
-use crate::leases::{BrowserToolError, TabSnapshot};
+use crate::leases::{BrowserToolError, BrowserToolErrorCode, TabSnapshot};
 use crate::protocol::{EvaluateResult, NetworkEvent};
 use crate::semantic::{RawAxFrame, RawAxNode, RawAxSnapshot};
 
 const PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
+const NAVIGATION_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+const BEFOREUNLOAD_STASH_KEY: &str = "__io_github_wycats_visible_browser_lab_beforeunload_stash_v1";
 
 /// Every remote handle we create is tagged with a per-operation object
 /// group. Ungrouped handles pin their DOM nodes (including whole detached
@@ -336,6 +339,18 @@ impl CdpClient {
         Ok(())
     }
 
+    pub async fn close_browser(&self) -> Result<(), BrowserToolError> {
+        let connection = self.runtime.connection().await?;
+        self.runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(BrowserCloseParams::default()),
+                "close Chrome",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn navigate(
         &self,
         target: &CdpTarget,
@@ -344,9 +359,34 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
+        Url::parse(url).map_err(|error| {
+            BrowserToolError::invalid_input(format!("invalid navigation URL `{url}`: {error}"))
+        })?;
         let (page, connection) = self.page(&target.id).await?;
+        let original_href = if before_unload == Some("accept") {
+            let value = page
+                .evaluate_expression("location.href")
+                .await
+                .map_err(|error| map_cdp_error("read pre-navigation URL", &error))?;
+            Some(value.into_value::<String>().map_err(|error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid pre-navigation URL: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        if let Some(original_href) = original_href.as_deref() {
+            self.clear_beforeunload_handlers(
+                &page,
+                &connection,
+                !same_document_url_change(original_href, url),
+            )
+            .await?;
+        }
         let navigation = async {
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .start_page_navigation(&page, &connection, url)
                     .await
@@ -371,13 +411,66 @@ impl CdpClient {
                     )
                     .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("navigation wait state was validated before navigation"),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
-            .await
+        let result = self
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
+            .await;
+        match result {
+            Err(error)
+                if error.code == crate::leases::BrowserToolErrorCode::OperationTimeout
+                    && original_href.is_some() =>
+            {
+                match self
+                    .recover_completed_navigation(
+                        &target.id,
+                        original_href.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.restore_beforeunload_handlers(&target.id).await?;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        if let Err(restore_error) =
+                            self.restore_beforeunload_handlers(&target.id).await
+                        {
+                            tracing::warn!(
+                                target_id = %target.id,
+                                error = %restore_error.message,
+                                "failed to restore beforeunload handlers after rejected navigation"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) if original_href.is_some() => {
+                if let Err(restore_error) = self.restore_beforeunload_handlers(&target.id).await {
+                    tracing::warn!(
+                        target_id = %target.id,
+                        error = %restore_error.message,
+                        "failed to restore beforeunload handlers after rejected navigation"
+                    );
+                }
+                Err(error)
+            }
+            Ok(()) if original_href.is_some() => {
+                self.restore_beforeunload_handlers_on_page(&page, &connection)
+                    .await?;
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     async fn start_page_navigation(
@@ -385,7 +478,7 @@ impl CdpClient {
         page: &Page,
         connection: &RuntimeConnection,
         url: &str,
-    ) -> Result<bool, BrowserToolError> {
+    ) -> Result<Option<String>, BrowserToolError> {
         let response = self
             .runtime
             .page_command(
@@ -399,7 +492,26 @@ impl CdpClient {
                 "navigation to `{url}` failed: {error}"
             )));
         }
-        Ok(response.result.loader_id.is_some())
+        Ok(response
+            .result
+            .loader_id
+            .map(|loader_id| loader_id.as_ref().to_string()))
+    }
+
+    async fn main_frame_loader_id(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<String, BrowserToolError> {
+        let tree = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(GetFrameTreeParams::default()),
+                "read page frame tree",
+            )
+            .await?;
+        Ok(tree.result.frame_tree.frame.loader_id.as_ref().to_string())
     }
 
     async fn navigate_and_wait_for_event<T>(
@@ -414,11 +526,51 @@ impl CdpClient {
         T: chromiumoxide::cdp::IntoEventKind + Unpin,
     {
         let mut events = self.event_listener::<T>(page, connection).await?;
-        if !self.start_page_navigation(page, connection, url).await? {
+        let Some(expected_loader_id) = self.start_page_navigation(page, connection, url).await?
+        else {
             return Ok(());
-        }
-        self.wait_for_lifecycle_event(&mut events, timeout_ms, event_name)
+        };
+        match self
+            .wait_for_lifecycle_event(&mut events, timeout_ms, event_name)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.code == crate::leases::BrowserToolErrorCode::OperationTimeout => {
+                let frame_tree = self
+                    .runtime
+                    .page_command(
+                        connection,
+                        page.execute(GetFrameTreeParams::default()),
+                        "verify committed navigation",
+                    )
+                    .await?;
+                let committed_loader_id = frame_tree
+                    .result
+                    .frame_tree
+                    .frame
+                    .loader_id
+                    .as_ref()
+                    .to_string();
+                let ready_state = page
+                    .evaluate_expression("document.readyState")
+                    .await
+                    .map_err(|cdp_error| map_cdp_error("read document readiness", &cdp_error))?
+                    .into_value::<String>()
+                    .map_err(|value_error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned an invalid document state: {value_error}"
+                        ))
+                    })?;
+                let ready = committed_navigation_reached_wait_state(
+                    &expected_loader_id,
+                    &committed_loader_id,
+                    &ready_state,
+                    event_name,
+                );
+                if ready { Ok(()) } else { Err(error) }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn wait_for_lifecycle_event<T>(
@@ -439,6 +591,195 @@ impl CdpClient {
                 "timed out waiting for {event_name} during navigation"
             ))),
         }
+    }
+
+    async fn clear_beforeunload_handlers(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        dispatch_side_effects: bool,
+    ) -> Result<(), BrowserToolError> {
+        // For cross-document accepts, run the page's unload side effects once;
+        // then temporarily remove its guards. This preserves application
+        // cleanup while avoiding Chromium leaving the target session wedged
+        // after a native dialog acceptance.
+        let expression = format!(
+            r#"(() => {{
+            const stashKey = {stash_key};
+            if ({dispatch_side_effects}) {{
+                window.dispatchEvent(new Event('beforeunload', {{ cancelable: true }}));
+            }}
+            const listeners = typeof getEventListeners === 'function'
+                ? (getEventListeners(window).beforeunload ?? [])
+                : [];
+            window[stashKey] = {{
+                listeners: listeners.map(entry => ({{
+                    listener: entry.listener,
+                    capture: Boolean(entry.useCapture),
+                    passive: Boolean(entry.passive),
+                    once: Boolean(entry.once),
+                }})),
+                onbeforeunload: window.onbeforeunload,
+            }};
+            for (const entry of listeners) {{
+                window.removeEventListener('beforeunload', entry.listener, entry.useCapture);
+            }}
+            window.onbeforeunload = null;
+        }})()"#,
+            stash_key = serde_json::to_string(BEFOREUNLOAD_STASH_KEY).unwrap(),
+            dispatch_side_effects = dispatch_side_effects
+        );
+        let response = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    RuntimeEvaluateParams::builder()
+                        .expression(expression)
+                        .include_command_line_api(true)
+                        .return_by_value(true)
+                        .build()
+                        .map_err(BrowserToolError::invalid_input)?,
+                ),
+                "accept beforeunload navigation",
+            )
+            .await?;
+        if let Some(details) = response.result.exception_details {
+            return Err(BrowserToolError::chrome_unavailable(format!(
+                "accept beforeunload navigation failed: {}",
+                details.text
+            )));
+        }
+        Ok(())
+    }
+
+    async fn restore_beforeunload_handlers(
+        &self,
+        target_id: &str,
+    ) -> Result<bool, BrowserToolError> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let attempt = async {
+                let (page, connection) = self.page(target_id).await?;
+                self.restore_beforeunload_handlers_on_page(&page, &connection)
+                    .await
+            }
+            .await;
+            match attempt {
+                // A clean `false` means this is a committed new document and
+                // there is no old-document stash to restore. Only transient
+                // attachment/evaluation failures warrant the recovery grace.
+                Ok(restored) => return Ok(restored),
+                Err(error)
+                    if error.code == BrowserToolErrorCode::ChromeUnavailable
+                        && Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn restore_beforeunload_handlers_on_page(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<bool, BrowserToolError> {
+        let expression = format!(
+            r#"(() => {{
+                const stashKey = {stash_key};
+                const stash = window[stashKey];
+                if (!stash) return false;
+                for (const entry of stash.listeners) {{
+                    window.addEventListener('beforeunload', entry.listener, {{
+                        capture: entry.capture,
+                        passive: entry.passive,
+                        once: entry.once,
+                    }});
+                }}
+                window.onbeforeunload = stash.onbeforeunload;
+                delete window[stashKey];
+                return true;
+            }})()"#,
+            stash_key = serde_json::to_string(BEFOREUNLOAD_STASH_KEY).unwrap(),
+        );
+        let restore = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(
+                    RuntimeEvaluateParams::builder()
+                        .expression(expression)
+                        .return_by_value(true)
+                        .build()
+                        .expect("beforeunload restore expression is valid"),
+                ),
+                "restore beforeunload navigation guard",
+            )
+            .await?;
+        if let Some(details) = restore.result.exception_details {
+            return Err(BrowserToolError::chrome_unavailable(format!(
+                "restore beforeunload navigation guard failed: {}",
+                details.text
+            )));
+        }
+        restore
+            .result
+            .result
+            .value
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                BrowserToolError::chrome_unavailable(
+                    "Chrome returned an invalid beforeunload restoration result",
+                )
+            })
+    }
+
+    async fn recover_completed_navigation(
+        &self,
+        target_id: &str,
+        original_href: &str,
+    ) -> Result<(), BrowserToolError> {
+        // Chromium can commit the navigation while its command response is
+        // lost during dialog teardown. Only treat that timeout as success when
+        // a fresh attachment proves both a changed URL and a usable document.
+        let recovery = async {
+            loop {
+                let (page, _) = self.page(target_id).await?;
+                let value = page
+                    .evaluate_expression(
+                        "({ href: location.href, readyState: document.readyState })",
+                    )
+                    .await
+                    .map_err(|error| map_cdp_error("verify recovered navigation", &error))?
+                    .into_value::<Value>()
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned invalid recovered navigation state: {error}"
+                        ))
+                    })?;
+                let href = value
+                    .get("href")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let ready_state = value
+                    .get("readyState")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if href != original_href && matches!(ready_state, "interactive" | "complete") {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        };
+        timeout(Duration::from_secs(2), recovery)
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout(
+                    "navigation did not recover after the CDP command timed out",
+                )
+            })?
     }
 
     pub async fn add_init_script(
@@ -484,6 +825,7 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
         let history = self
             .runtime
@@ -507,8 +849,19 @@ impl CdpClient {
                 })
             })?;
         let entry_id = entry.id;
+        if before_unload == Some("accept") {
+            let current_url = history
+                .result
+                .entries
+                .get(history.result.current_index.max(0) as usize)
+                .map(|current| current.url.as_str());
+            let dispatch_side_effects =
+                current_url.is_none_or(|current| !same_document_url_change(current, &entry.url));
+            self.clear_beforeunload_handlers(&page, &connection, dispatch_side_effects)
+                .await?;
+        }
         let navigation = async {
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .runtime
                     .page_command(
@@ -526,21 +879,23 @@ impl CdpClient {
                             "navigate browser history",
                         )
                         .await?;
-                    self.wait_for_history_entry(
-                        &page,
-                        &connection,
-                        index,
-                        wait_until.unwrap_or("load"),
-                        timeout_ms,
-                    )
-                    .await
+                    self.wait_for_history_entry(&page, &connection, index, wait_until, timeout_ms)
+                        .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("history wait state was validated before navigation"),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+        let result = self
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
+            .await;
+        self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
     }
 
@@ -605,11 +960,16 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
+        if before_unload == Some("accept") {
+            self.clear_beforeunload_handlers(&page, &connection, true)
+                .await?;
+        }
         let navigation = async {
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .runtime
                     .page_command(&connection, command(), "reload page")
@@ -635,13 +995,51 @@ impl CdpClient {
                     self.wait_for_lifecycle_event(&mut events, timeout_ms, "load")
                         .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("reload wait state was validated before navigation"),
             }
         };
-        self.with_navigation_dialog_policy(&page, &connection, before_unload, navigation)
+        let result = self
+            .with_navigation_timeout(
+                &page,
+                &connection,
+                before_unload,
+                timeout_ms,
+                wait_until != "none",
+                navigation,
+            )
+            .await;
+        self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
+    }
+
+    async fn finish_beforeunload_navigation(
+        &self,
+        target_id: &str,
+        policy: Option<&str>,
+        result: Result<(), BrowserToolError>,
+    ) -> Result<(), BrowserToolError> {
+        if policy != Some("accept") {
+            return result;
+        }
+        match result {
+            Ok(()) => {
+                // A committed document has no stash. A same-document history
+                // move or reload keeps the original document and must restore
+                // the guard that explicit acceptance temporarily removed.
+                self.restore_beforeunload_handlers(target_id).await?;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(restore_error) = self.restore_beforeunload_handlers(target_id).await {
+                    tracing::warn!(
+                        target_id,
+                        error = %restore_error.message,
+                        "failed to restore beforeunload handlers after rejected navigation"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn screenshot(
@@ -1026,15 +1424,7 @@ impl CdpClient {
 
     pub async fn document_revision(&self, target: &CdpTarget) -> Result<String, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let tree = self
-            .runtime
-            .page_command(
-                &connection,
-                page.execute(GetFrameTreeParams::default()),
-                "read page frame tree",
-            )
-            .await?;
-        Ok(tree.result.frame_tree.frame.loader_id.as_ref().to_string())
+        self.main_frame_loader_id(&page, &connection).await
     }
 
     pub async fn accessibility_snapshot(
@@ -2661,15 +3051,15 @@ impl CdpClient {
             })
     }
 
-    async fn with_navigation_dialog_policy<T, F>(
+    async fn with_navigation_dialog_policy<F>(
         &self,
         page: &Page,
         connection: &RuntimeConnection,
         policy: Option<&str>,
         operation: F,
-    ) -> Result<T, BrowserToolError>
+    ) -> Result<(), BrowserToolError>
     where
-        F: Future<Output = Result<T, BrowserToolError>>,
+        F: Future<Output = Result<(), BrowserToolError>>,
     {
         let Some(policy) = policy else {
             return operation.await;
@@ -2691,9 +3081,11 @@ impl CdpClient {
             tokio::select! {
                 result = &mut operation => return result,
                 dialog = dialogs.next() => {
-                    let Some(_dialog) = dialog else {
+                    let Some(dialog) = dialog else {
                         return operation.await;
                     };
+                    let dismissed_beforeunload =
+                        !accept && Self::dismissed_dialog_cancels_navigation(&dialog.r#type);
                     self.runtime
                         .page_command(
                             connection,
@@ -2706,7 +3098,45 @@ impl CdpClient {
                             "handle navigation dialog",
                         )
                         .await?;
+                    if dismissed_beforeunload {
+                        // Dismissing beforeunload cancels the navigation, so
+                        // there is no navigation completion left to await.
+                        self.runtime.invalidate(connection.generation).await;
+                        return Ok(());
+                    }
                 }
+            }
+        }
+    }
+
+    fn dismissed_dialog_cancels_navigation(dialog_type: &DialogType) -> bool {
+        matches!(dialog_type, DialogType::Beforeunload)
+    }
+
+    async fn with_navigation_timeout<F>(
+        &self,
+        page: &Page,
+        connection: &RuntimeConnection,
+        policy: Option<&str>,
+        timeout_ms: u64,
+        waits_for_lifecycle: bool,
+        operation: F,
+    ) -> Result<(), BrowserToolError>
+    where
+        F: Future<Output = Result<(), BrowserToolError>>,
+    {
+        match timeout(
+            navigation_timeout_budget(timeout_ms, waits_for_lifecycle),
+            self.with_navigation_dialog_policy(page, connection, policy, operation),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.runtime.invalidate(connection.generation).await;
+                Err(BrowserToolError::operation_timeout(
+                    "navigation did not complete before the requested timeout",
+                ))
             }
         }
     }
@@ -3000,6 +3430,19 @@ impl CdpClient {
     }
 }
 
+fn navigation_timeout_budget(timeout_ms: u64, waits_for_lifecycle: bool) -> Duration {
+    // Lifecycle waits start after listener setup and Page.navigate returns.
+    // Keep the outer watchdog as a stuck-command/dialog backstop while giving
+    // the requested lifecycle wait and its committed-document recovery time
+    // to finish instead of cancelling them at the same deadline.
+    let requested = Duration::from_millis(timeout_ms);
+    if waits_for_lifecycle {
+        requested.saturating_add(NAVIGATION_RECOVERY_GRACE)
+    } else {
+        requested
+    }
+}
+
 #[derive(Debug)]
 struct CdpRuntime {
     endpoint: CdpEndpoint,
@@ -3201,6 +3644,45 @@ fn map_cdp_error(operation: &str, error: &CdpError) -> BrowserToolError {
             "{operation} failed because Chrome no longer exposes the target"
         )),
         _ => BrowserToolError::chrome_unavailable(format!("{operation} failed: {error}")),
+    }
+}
+
+fn validated_navigation_wait_state(wait_until: Option<&str>) -> Result<&str, BrowserToolError> {
+    let wait_until = wait_until.unwrap_or("load");
+    if matches!(
+        wait_until,
+        "none" | "dom_content_loaded" | "load" | "network_idle"
+    ) {
+        Ok(wait_until)
+    } else {
+        Err(BrowserToolError::invalid_input(format!(
+            "unknown navigation wait state `{wait_until}`"
+        )))
+    }
+}
+
+fn same_document_url_change(current: &str, requested: &str) -> bool {
+    let (Ok(mut current), Ok(mut requested)) = (Url::parse(current), Url::parse(requested)) else {
+        return false;
+    };
+    current.set_fragment(None);
+    requested.set_fragment(None);
+    current == requested
+}
+
+fn committed_navigation_reached_wait_state(
+    expected_loader_id: &str,
+    committed_loader_id: &str,
+    ready_state: &str,
+    event_name: &str,
+) -> bool {
+    if committed_loader_id != expected_loader_id {
+        return false;
+    }
+    match event_name {
+        "DOMContentLoaded" => matches!(ready_state, "interactive" | "complete"),
+        "load" => ready_state == "complete",
+        _ => false,
     }
 }
 
@@ -3859,6 +4341,67 @@ mod tests {
         assert_eq!(params.top, Some(WINDOW_CASCADE_ORIGIN.1));
         assert_eq!(params.width, Some(WINDOW_DEFAULT_WIDTH));
         assert_eq!(params.height, Some(WINDOW_DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn only_dismissed_beforeunload_cancels_navigation_completion() {
+        assert!(CdpClient::dismissed_dialog_cancels_navigation(
+            &DialogType::Beforeunload
+        ));
+        for dialog_type in [DialogType::Alert, DialogType::Confirm, DialogType::Prompt] {
+            assert!(
+                !CdpClient::dismissed_dialog_cancels_navigation(&dialog_type),
+                "ordinary dialogs must continue awaiting navigation completion"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_out_navigation_requires_the_expected_document_loader() {
+        assert!(committed_navigation_reached_wait_state(
+            "new-loader",
+            "new-loader",
+            "complete",
+            "load"
+        ));
+        assert!(!committed_navigation_reached_wait_state(
+            "new-loader",
+            "old-loader",
+            "complete",
+            "load"
+        ));
+        assert!(!committed_navigation_reached_wait_state(
+            "new-loader",
+            "new-loader",
+            "loading",
+            "DOMContentLoaded"
+        ));
+    }
+
+    #[test]
+    fn navigation_watchdog_leaves_time_for_lifecycle_recovery() {
+        assert_eq!(
+            navigation_timeout_budget(10_000, true),
+            Duration::from_secs(10) + NAVIGATION_RECOVERY_GRACE
+        );
+        assert!(navigation_timeout_budget(10_000, true) > Duration::from_secs(10));
+        assert_eq!(
+            navigation_timeout_budget(10_000, false),
+            Duration::from_secs(10),
+            "no-wait navigation has no lifecycle wait that needs recovery grace"
+        );
+    }
+
+    #[test]
+    fn fragment_only_navigation_is_same_document() {
+        assert!(same_document_url_change(
+            "https://example.test/chat/pending#old",
+            "https://example.test/chat/pending#accepted"
+        ));
+        assert!(!same_document_url_change(
+            "https://example.test/chat/pending",
+            "https://example.test/after"
+        ));
     }
 
     #[test]

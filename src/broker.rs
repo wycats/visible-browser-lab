@@ -36,18 +36,21 @@ use crate::{
         AgentSessionId, BrowserSession, BrowserToolError, BrowserToolErrorCode, ExpiredLease,
         LeaseRegistry, LeaseState, OwnedTabSummary, TabId, TabLease, TabSnapshot,
     },
-    managed_chrome::{BrowserLaunchMode, activate_managed_chrome, ensure_managed_chrome},
+    managed_chrome::{
+        BrowserLaunchMode, STARTUP_PAGE, activate_managed_chrome, ensure_managed_chrome,
+        managed_chrome_pid,
+    },
     protocol::{
         BROKER_PROTOCOL_VERSION, BrokerClient, BrokerRequest, BrokerResponse, BrokerStatus,
         ClaimTabParams, ClickParams, CloseTabResult, ConsoleMessage, DomainParams,
         ElementReferenceTarget, ElementTarget, EvaluateResult, FillFormParams, FillFormResult,
         FillParams, FormField, ListTabsParams, ListTabsResult, ListTabsScope, NavigationAction,
         NetworkEvent, NewTabParams, Observation, ObservationMode, PageActionEffect,
-        PageActionEvidence, PageActionResult, ReleaseTabResult, ScreenshotImage, ScreenshotParams,
-        ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams, SnapshotResult,
-        StartSessionParams, StartSessionResult, TabActionParams, TabResult, V3EvaluateParams,
-        V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition, WaitForParams,
-        WaitForResult,
+        PageActionEvidence, PageActionResult, ReleaseTabParams, ReleaseTabResult, ScreenshotImage,
+        ScreenshotParams, ScreenshotResult, SessionGovernanceMode, SnapshotMode, SnapshotParams,
+        SnapshotResult, StartSessionParams, StartSessionResult, TabActionParams, TabResult,
+        V3EvaluateParams, V3NavigateParams, V3PressKeyParams, V3TypeTextParams, WaitCondition,
+        WaitForParams, WaitForResult,
     },
     semantic::{ElementReference, ElementReferenceRegistry, RawAxSnapshot, SnapshotBuildContext},
 };
@@ -350,6 +353,8 @@ struct FakeBrowser {
     filled_backend_nodes: Vec<(i64, String)>,
     typed_text: Vec<String>,
     pressed_keys: Vec<String>,
+    fail_emulation_reset: bool,
+    fail_page_targets: bool,
 }
 
 #[cfg(test)]
@@ -367,11 +372,28 @@ impl FakeBrowser {
             filled_backend_nodes: Vec::new(),
             typed_text: Vec::new(),
             pressed_keys: Vec::new(),
+            fail_emulation_reset: false,
+            fail_page_targets: false,
         }
     }
 
-    fn page_targets(&self) -> Vec<CdpTarget> {
-        self.targets.clone()
+    fn with_failed_emulation_reset(mut self) -> Self {
+        self.fail_emulation_reset = true;
+        self
+    }
+
+    fn with_failed_page_targets(mut self) -> Self {
+        self.fail_page_targets = true;
+        self
+    }
+
+    fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
+        if self.fail_page_targets {
+            return Err(BrowserToolError::chrome_unavailable(
+                "synthetic target lookup failure",
+            ));
+        }
+        Ok(self.targets.clone())
     }
 
     fn create_page(&mut self, url: Option<&str>, focus: bool) -> CdpTarget {
@@ -714,6 +736,9 @@ enum BrowserBackend {
 struct ManagedBrowserBackend {
     config: RuntimeConfig,
     client: Arc<AsyncMutex<Option<(String, CdpClient)>>>,
+    page_lifecycle: Arc<AsyncMutex<()>>,
+    synthetic_replacement_targets: Arc<AsyncMutex<HashSet<String>>>,
+    startup_targets: Arc<AsyncMutex<HashSet<String>>>,
 }
 
 impl ManagedBrowserBackend {
@@ -721,6 +746,9 @@ impl ManagedBrowserBackend {
         Self {
             config,
             client: Arc::new(AsyncMutex::new(None)),
+            page_lifecycle: Arc::new(AsyncMutex::new(())),
+            synthetic_replacement_targets: Arc::new(AsyncMutex::new(HashSet::new())),
+            startup_targets: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -735,6 +763,11 @@ impl ManagedBrowserBackend {
         {
             let cdp = CdpClient::new(&managed.cdp_endpoint)
                 .map_err(|error| BrowserToolError::chrome_unavailable(error.to_string()))?;
+            let targets = cdp.page_targets().await?;
+            let (synthetic_replacements, startup_targets) =
+                classify_managed_launch_targets(&targets, managed.reused);
+            *self.synthetic_replacement_targets.lock().await = synthetic_replacements;
+            *self.startup_targets.lock().await = startup_targets;
             *client = Some((managed.cdp_endpoint, cdp));
         }
         Ok(client
@@ -752,6 +785,61 @@ impl ManagedBrowserBackend {
             .map(|(endpoint, _)| endpoint.clone())
             .unwrap_or_default()
     }
+}
+
+fn is_managed_replacement_target(target: &CdpTarget) -> bool {
+    matches!(
+        target.url.as_str(),
+        "about:blank" | "chrome://newtab/" | "chrome://new-tab-page/"
+    )
+}
+
+fn is_managed_startup_target(target: &CdpTarget) -> bool {
+    target.url == STARTUP_PAGE
+}
+
+fn classify_managed_launch_targets(
+    targets: &[CdpTarget],
+    reused: bool,
+) -> (HashSet<String>, HashSet<String>) {
+    let startup_targets = targets
+        .iter()
+        .filter(|target| is_managed_startup_target(target))
+        .map(|target| target.id.clone())
+        .collect();
+    let synthetic_replacements = if reused {
+        // A blank target in an existing browser may be human-created. Only a
+        // fresh launch lets VBL attribute that placeholder to Chrome itself.
+        HashSet::new()
+    } else {
+        targets
+            .iter()
+            .filter(|target| is_managed_replacement_target(target))
+            .map(|target| target.id.clone())
+            .collect()
+    };
+    (synthetic_replacements, startup_targets)
+}
+
+fn managed_targets_are_disposable(
+    targets: &[CdpTarget],
+    synthetic_replacements: &HashSet<String>,
+    startup_targets: &HashSet<String>,
+) -> bool {
+    targets.iter().all(|target| {
+        (startup_targets.contains(&target.id) && is_managed_startup_target(target))
+            || (synthetic_replacements.contains(&target.id)
+                && is_managed_replacement_target(target))
+    })
+}
+
+fn mark_managed_target_claimed(
+    target_id: &str,
+    synthetic_replacements: &mut HashSet<String>,
+    startup_targets: &mut HashSet<String>,
+) {
+    synthetic_replacements.remove(target_id);
+    startup_targets.remove(target_id);
 }
 
 impl BrowserBackend {
@@ -794,8 +882,25 @@ impl BrowserBackend {
     async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(browser) => Ok(browser.lock().unwrap().page_targets()),
+            Self::Fake(browser) => browser.lock().unwrap().page_targets(),
             _ => self.cdp_client().await?.page_targets().await,
+        }
+    }
+
+    async fn mark_target_claimed(&self, target_id: &str) {
+        if let Self::Managed(browser) = self {
+            let mut synthetic = browser.synthetic_replacement_targets.lock().await;
+            let mut startup = browser.startup_targets.lock().await;
+            mark_managed_target_claimed(target_id, &mut synthetic, &mut startup);
+        }
+    }
+
+    async fn reserve_page_lifecycle(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match self {
+            Self::Managed(browser) => Some(Arc::clone(&browser.page_lifecycle).lock_owned().await),
+            Self::External(_) => None,
+            #[cfg(test)]
+            Self::Fake(_) => None,
         }
     }
 
@@ -809,8 +914,14 @@ impl BrowserBackend {
             Self::Fake(browser) => Ok(browser.lock().unwrap().create_page(url, focus)),
             Self::External(client) => client.create_page(url, focus).await,
             Self::Managed(browser) => {
+                let _page_lifecycle = browser.page_lifecycle.lock().await;
                 let client = browser.client().await?;
                 let target = client.create_page(url, false).await?;
+                browser
+                    .synthetic_replacement_targets
+                    .lock()
+                    .await
+                    .remove(&target.id);
                 if focus {
                     client.activate_target(&target.id).await?;
                     activate_managed_chrome_if_available(&browser.config);
@@ -866,7 +977,81 @@ impl BrowserBackend {
         match self {
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().close_target(target_id),
-            _ => self.cdp_client().await?.close_target(target_id).await,
+            Self::External(client) => client.close_target(target_id).await,
+            Self::Managed(browser) => {
+                let _page_lifecycle = browser.page_lifecycle.lock().await;
+                let client = browser.client().await?;
+                client.close_target(target_id).await?;
+
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let targets = loop {
+                    let targets = match client.page_targets().await {
+                        Ok(targets) => targets,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error.message,
+                                target_id,
+                                profile = %browser.config.chrome_profile_dir.display(),
+                                "managed target closed, but final browser inventory was unavailable"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    if targets.iter().all(|target| target.id != target_id)
+                        || Instant::now() >= deadline
+                    {
+                        break targets;
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                };
+
+                let current_ids = targets
+                    .iter()
+                    .map(|target| target.id.clone())
+                    .collect::<HashSet<_>>();
+                let mut synthetic = browser.synthetic_replacement_targets.lock().await;
+                let mut startup = browser.startup_targets.lock().await;
+                synthetic.remove(target_id);
+                synthetic.retain(|target| current_ids.contains(target));
+                startup.retain(|target| current_ids.contains(target));
+                let only_disposable_targets =
+                    managed_targets_are_disposable(&targets, &synthetic, &startup);
+                drop(synthetic);
+                drop(startup);
+
+                if only_disposable_targets {
+                    let managed_pid = managed_chrome_pid(&browser.config);
+                    if let Err(error) = client.close_browser().await {
+                        tracing::warn!(
+                            error = %error.message,
+                            profile = %browser.config.chrome_profile_dir.display(),
+                            "managed target closed, but final Browser.close did not complete"
+                        );
+                    }
+                    if let Some(pid) = managed_pid {
+                        wait_for_process_exit(pid, Duration::from_secs(2)).await;
+                        if process_is_running(pid) {
+                            tracing::warn!(
+                                pid,
+                                profile = %browser.config.chrome_profile_dir.display(),
+                                "managed Chrome remained alive after Browser.close; terminating its exact profile owner"
+                            );
+                            if let Err(error) = terminate_process(pid).await {
+                                tracing::warn!(
+                                    pid,
+                                    error = %format!("{error:#}"),
+                                    profile = %browser.config.chrome_profile_dir.display(),
+                                    "managed target closed, but its final Chrome process could not be stopped"
+                                );
+                            }
+                        }
+                    }
+                    *browser.client.lock().await = None;
+                    browser.synthetic_replacement_targets.lock().await.clear();
+                    browser.startup_targets.lock().await.clear();
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1606,7 +1791,14 @@ impl BrowserBackend {
     ) -> Result<Value, BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(_) => Ok(Value::Object(arguments.clone())),
+            Self::Fake(browser) => {
+                if operation == "reset" && browser.lock().unwrap().fail_emulation_reset {
+                    return Err(BrowserToolError::invalid_input(
+                        "fake emulation reset failed",
+                    ));
+                }
+                Ok(Value::Object(arguments.clone()))
+            }
             _ => {
                 self.cdp_client()
                     .await?
@@ -2431,16 +2623,16 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
                 .remove(&lease.target_id);
         }
         for lease in &session.closed {
-            close_expired_ambient_target(state, &session.session_id, lease).await;
+            close_expired_vbl_target(state, &session.session_id, lease).await;
         }
     }
 }
 
-/// Close a target created for an ambient session after the registry has
+/// Close a target created by VBL after the registry has
 /// reserved it against concurrent claims. This is best-effort maintenance:
 /// the session is already expired, and a close failure must leave the target
 /// claimable rather than permanently reserved.
-async fn close_expired_ambient_target(
+async fn close_expired_vbl_target(
     state: &BrokerState,
     session_id: &AgentSessionId,
     lease: &ExpiredLease,
@@ -2462,7 +2654,7 @@ async fn close_expired_ambient_target(
                 tracing::warn!(
                     target = %lease.target_id,
                     error = %error.message,
-                    "failed to reset emulation before ambient expiry close"
+                    "failed to reset emulation before VBL-created target expiry close"
                 );
             }
             match state.browser.close_target(&lease.target_id).await {
@@ -2472,7 +2664,7 @@ async fn close_expired_ambient_target(
                     tracing::warn!(
                         target = %lease.target_id,
                         error = %error.message,
-                        "failed to close ambient-created target on session expiry"
+                        "failed to close VBL-created target on session expiry"
                     );
                     false
                 }
@@ -2483,7 +2675,7 @@ async fn close_expired_ambient_target(
             tracing::warn!(
                 target = %lease.target_id,
                 error = %error.message,
-                "failed to inspect ambient-created target on session expiry"
+                "failed to inspect VBL-created target on session expiry"
             );
             false
         }
@@ -3133,6 +3325,10 @@ async fn broker_claim_tab(
     params: Result<ClaimTabParams, BrowserToolError>,
 ) -> Result<TabResult, BrowserToolError> {
     let params = params?;
+    // Serialize the target lookup, registry claim, and disposable-marker
+    // removal with managed create/close operations. Otherwise a claim can
+    // succeed after final-target disposal has decided to close the browser.
+    let page_lifecycle = state.browser.reserve_page_lifecycle().await;
     let target = target_by_id(state, &params.target_id).await?;
     if params.takeover {
         if let Some(capture) = state.traces.lock().await.remove(&target.id) {
@@ -3158,6 +3354,8 @@ async fn broker_claim_tab(
         params.takeover,
         params.user_instruction.as_deref(),
     )?;
+    state.browser.mark_target_claimed(&target.id).await;
+    drop(page_lifecycle);
     let old_monitor = state.diagnostics().lock().unwrap().reset_target(&target.id);
     state.references().lock().unwrap().reset_target(&target.id);
     if let Some(monitor) = old_monitor {
@@ -3172,42 +3370,69 @@ async fn broker_claim_tab(
 
 async fn broker_release_tab(
     state: &BrokerState,
-    params: Result<TabActionParams, BrowserToolError>,
+    params: Result<ReleaseTabParams, BrowserToolError>,
 ) -> Result<ReleaseTabResult, BrowserToolError> {
     let params = params?;
-    let active_target_id = state
+    let instruction = params.user_instruction.as_deref().map(str::trim);
+    if params.leave_visible {
+        if instruction.is_none_or(str::is_empty) {
+            return Err(BrowserToolError::invalid_input(
+                "leave_visible requires a non-empty user_instruction",
+            ));
+        }
+    } else if params.user_instruction.is_some() {
+        return Err(BrowserToolError::invalid_input(
+            "user_instruction is accepted only when leave_visible is true",
+        ));
+    }
+    let released_lease = state
         .registry()
         .lock()
         .unwrap()
-        .owned_lease(&params.agent_session_id, &params.tab_id)?
-        .target_id;
-    if state
-        .screencasts
-        .lock()
-        .await
-        .contains_key(&active_target_id)
-    {
+        .require_releasable_owned(&params.agent_session_id, &params.tab_id)?;
+    let released_target_id = released_lease.target_id;
+    if params.leave_visible && released_lease.state == LeaseState::Missing {
         return Err(BrowserToolError::invalid_input(
-            "stop the active screencast before releasing its tab",
+            "leave_visible requires a tab that is still visible",
         ));
     }
-    if state.traces.lock().await.contains_key(&active_target_id) {
-        return Err(BrowserToolError::invalid_input(
-            "stop the active performance trace before releasing its tab",
-        ));
+    if released_lease.state == LeaseState::Active {
+        if state
+            .screencasts
+            .lock()
+            .await
+            .contains_key(&released_target_id)
+        {
+            return Err(BrowserToolError::invalid_input(
+                "stop the active screencast before releasing its tab",
+            ));
+        }
+        if state.traces.lock().await.contains_key(&released_target_id) {
+            return Err(BrowserToolError::invalid_input(
+                "stop the active performance trace before releasing its tab",
+            ));
+        }
+        match target_by_id(state, &released_target_id).await {
+            Ok(target) => {
+                state
+                    .browser
+                    .emulate(&target, "reset", &serde_json::Map::new())
+                    .await?;
+            }
+            Err(error) if error.code == BrowserToolErrorCode::TargetMissing => {}
+            Err(error) => return Err(error),
+        }
     }
-    let lease = state
-        .registry()
+    let lease = state.registry().lock().unwrap().release_tab(
+        &params.agent_session_id,
+        &params.tab_id,
+        params.leave_visible,
+    )?;
+    state
+        .viewport_overrides
         .lock()
         .unwrap()
-        .release_tab(&params.agent_session_id, &params.tab_id)?;
-    if let Ok(target) = target_by_id(state, &lease.target_id).await {
-        state
-            .browser
-            .emulate(&target, "reset", &serde_json::Map::new())
-            .await?;
-        state.viewport_overrides.lock().unwrap().remove(&target.id);
-    }
+        .remove(&released_target_id);
     let old_monitor = state
         .diagnostics()
         .lock()
@@ -3220,7 +3445,10 @@ async fn broker_release_tab(
         // claim's monitor has enabled the same domains.
         monitor.shutdown().await;
     }
-    Ok(ReleaseTabResult { released: true })
+    Ok(ReleaseTabResult {
+        released: true,
+        leave_visible: params.leave_visible,
+    })
 }
 
 async fn broker_focus_tab(
@@ -6275,7 +6503,16 @@ async fn broker_close_tab(
         ));
     }
 
-    if matches!(lease.state, LeaseState::Active) {
+    let lease = state
+        .registry()
+        .lock()
+        .unwrap()
+        .reserve_owned_tab_close(&params.agent_session_id, &params.tab_id)?;
+
+    let close_result = async {
+        if !matches!(lease.state, LeaseState::Active) {
+            return Ok(());
+        }
         match target_by_id(state, &lease.target_id).await {
             Ok(target) => {
                 state
@@ -6287,6 +6524,16 @@ async fn broker_close_tab(
             Err(error) if error.code == crate::leases::BrowserToolErrorCode::TargetMissing => {}
             Err(error) => return Err(error),
         }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = close_result {
+        state
+            .registry()
+            .lock()
+            .unwrap()
+            .finish_owned_tab_close_reservation(&lease.target_id, &params.tab_id);
+        return Err(error);
     }
     state
         .viewport_overrides
@@ -6294,11 +6541,12 @@ async fn broker_close_tab(
         .unwrap()
         .remove(&lease.target_id);
 
-    let closed = state
-        .registry()
-        .lock()
-        .unwrap()
-        .close_tab_mark(&params.agent_session_id, &params.tab_id)?;
+    let closed = {
+        let mut registry = state.registry().lock().unwrap();
+        let result = registry.close_tab_mark(&params.agent_session_id, &params.tab_id);
+        registry.finish_owned_tab_close_reservation(&lease.target_id, &params.tab_id);
+        result?
+    };
     state.clear_focused_target(&closed.target_id);
     state
         .diagnostics()
@@ -6752,6 +7000,111 @@ mod tests {
     }
 
     #[test]
+    fn managed_replacement_target_classification_is_narrow() {
+        for url in ["about:blank", "chrome://newtab/", "chrome://new-tab-page/"] {
+            let mut target = fake_target("replacement");
+            target.url = url.to_string();
+            assert!(is_managed_replacement_target(&target), "{url}");
+        }
+
+        for url in [
+            "data:text/html,hello",
+            "https://example.com",
+            "chrome://settings/",
+        ] {
+            let mut target = fake_target("human");
+            target.url = url.to_string();
+            assert!(!is_managed_replacement_target(&target), "{url}");
+        }
+    }
+
+    #[test]
+    fn managed_launch_classification_preserves_blank_tabs_on_reuse() {
+        let mut startup = fake_target("startup");
+        startup.url = STARTUP_PAGE.to_string();
+        let mut blank = fake_target("blank");
+        blank.url = "about:blank".to_string();
+        let targets = vec![startup, blank];
+
+        let (fresh_synthetic, fresh_startup) = classify_managed_launch_targets(&targets, false);
+        assert_eq!(fresh_synthetic, HashSet::from(["blank".to_string()]));
+        assert_eq!(fresh_startup, HashSet::from(["startup".to_string()]));
+
+        let (reused_synthetic, reused_startup) = classify_managed_launch_targets(&targets, true);
+        assert!(
+            reused_synthetic.is_empty(),
+            "blank tabs in a reused browser have no safe VBL provenance"
+        );
+        assert_eq!(reused_startup, HashSet::from(["startup".to_string()]));
+        assert!(
+            !managed_targets_are_disposable(&targets, &reused_synthetic, &reused_startup),
+            "an unproven blank tab must prevent whole-browser disposal"
+        );
+    }
+
+    #[test]
+    fn managed_startup_target_is_disposable_only_when_launch_tracking_claims_it() {
+        let mut startup = fake_target("startup");
+        startup.url = STARTUP_PAGE.to_string();
+        let targets = vec![startup];
+
+        assert!(!managed_targets_are_disposable(
+            &targets,
+            &HashSet::new(),
+            &HashSet::new()
+        ));
+        assert!(managed_targets_are_disposable(
+            &targets,
+            &HashSet::new(),
+            &HashSet::from(["startup".to_string()])
+        ));
+
+        let mut navigated = targets[0].clone();
+        navigated.url = "https://example.com/human-state".to_string();
+        assert!(!managed_targets_are_disposable(
+            &[navigated],
+            &HashSet::new(),
+            &HashSet::from(["startup".to_string()])
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_page_lifecycle_reservations_serialize_claims_and_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let backend = BrowserBackend::Managed(Arc::new(ManagedBrowserBackend::new(
+            RuntimeConfig::managed(state.path().to_path_buf(), None),
+        )));
+        let first = backend.reserve_page_lifecycle().await.unwrap();
+        let contender = backend.clone();
+        let mut waiting = tokio::spawn(async move {
+            contender.reserve_page_lifecycle().await.unwrap();
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "a second managed target lifecycle operation must wait for the reservation"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the lifecycle reservation was not released")
+            .unwrap();
+    }
+
+    #[test]
+    fn claiming_a_managed_disposable_target_clears_its_markers() {
+        let mut synthetic = HashSet::from(["target".to_string()]);
+        let mut startup = HashSet::from(["target".to_string()]);
+
+        mark_managed_target_claimed("target", &mut synthetic, &mut startup);
+
+        assert!(synthetic.is_empty());
+        assert!(startup.is_empty());
+    }
+
+    #[test]
     fn normalized_endpoint_omits_the_url_root_slash() {
         let client = CdpClient::new("http://127.0.0.1:9222/").unwrap();
 
@@ -7015,7 +7368,7 @@ mod tests {
         assert!(
             expired_error
                 .message
-                .contains("1 ambient-created browser target closed")
+                .contains("1 VBL-created browser target closed")
         );
     }
 
@@ -7065,7 +7418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_expiry_keeps_vbl_created_targets_open() {
+    async fn explicit_expiry_closes_vbl_created_targets() {
         let state = fake_state(vec![fake_target("target-a")]);
         let explicit = state.registry.lock().unwrap().start_session(None);
         state
@@ -7085,11 +7438,11 @@ mod tests {
 
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
 
-        assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn ambient_expiry_keeps_an_explicitly_released_created_target_open() {
+    async fn ambient_expiry_closes_an_ordinarily_released_created_target() {
         let state = fake_state(vec![fake_target("target-a")]);
         let ambient = state.registry.lock().unwrap().ambient_session(
             ambient_identity("conversation"),
@@ -7109,7 +7462,7 @@ mod tests {
             .registry
             .lock()
             .unwrap()
-            .release_tab(&ambient.agent_session_id, &tab.tab_id)
+            .release_tab(&ambient.agent_session_id, &tab.tab_id, false)
             .unwrap();
         state
             .registry
@@ -7119,7 +7472,219 @@ mod tests {
 
         sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
 
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preserving_release_requires_user_instruction_and_survives_expiry() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let missing_instruction = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("  ".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_instruction.code, BrowserToolErrorCode::InvalidInput);
+
+        let stray_instruction = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: Some("keep this open".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stray_instruction.code, BrowserToolErrorCode::InvalidInput);
+
+        let released = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id,
+                leave_visible: true,
+                user_instruction: Some("Leave this page open for me".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(released.released);
+        assert!(released.leave_visible);
+
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
         assert_eq!(state.browser.page_targets().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_failure_does_not_apply_preservation_or_drop_ownership() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_emulation_reset(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("Leave this page open for me".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&session.agent_session_id, &tab.tab_id, true)
+                .is_ok(),
+            "a failed browser reset must leave the lease and cleanup ownership intact"
+        );
+
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .backdate_session(&session.agent_session_id, 3_600_000 * 2);
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+        assert!(state.browser.page_targets().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_propagates_target_lookup_failure_without_dropping_ownership() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_page_targets(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let session = state.registry.lock().unwrap().start_session(None);
+        let tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, BrowserToolErrorCode::ChromeUnavailable);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&session.agent_session_id, &tab.tab_id, true)
+                .is_ok(),
+            "a failed target lookup must leave the lease and cleanup ownership intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_released_handle_cannot_reset_successor_emulation() {
+        let fake = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_emulation_reset(),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(fake));
+        let former_owner = state.registry.lock().unwrap().start_session(None);
+        let former_tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &former_owner.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .release_tab(&former_owner.agent_session_id, &former_tab.tab_id, false)
+            .unwrap();
+
+        let successor = state.registry.lock().unwrap().start_session(None);
+        let successor_tab = state
+            .registry
+            .lock()
+            .unwrap()
+            .claim_tab(
+                &successor.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+                false,
+                None,
+            )
+            .unwrap();
+
+        let error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: former_owner.agent_session_id,
+                tab_id: former_tab.tab_id,
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::TabNotActive);
+        assert!(
+            state
+                .registry
+                .lock()
+                .unwrap()
+                .require_active_owned(&successor.agent_session_id, &successor_tab.tab_id, true)
+                .is_ok(),
+            "the stale release must not disturb the successor lease"
+        );
     }
 
     #[tokio::test]
@@ -8430,9 +8995,11 @@ mod tests {
 
         broker_release_tab(
             &state,
-            Ok(TabActionParams {
+            Ok(ReleaseTabParams {
                 agent_session_id: session.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
             }),
         )
         .await
@@ -8486,8 +9053,8 @@ mod tests {
         let missing_error = broker_focus_tab(
             &state,
             Ok(TabActionParams {
-                agent_session_id: session.agent_session_id,
-                tab_id: missing.tab_id,
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id.clone(),
             }),
         )
         .await
@@ -8495,6 +9062,44 @@ mod tests {
         assert_eq!(
             missing_error.code,
             crate::leases::BrowserToolErrorCode::TargetMissing
+        );
+        let missing_preservation_error = broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id.clone(),
+                leave_visible: true,
+                user_instruction: Some("Keep the visible tab open".to_string()),
+            }),
+        )
+        .await
+        .expect_err("leave_visible must reject a missing target");
+        assert_eq!(
+            missing_preservation_error.code,
+            crate::leases::BrowserToolErrorCode::InvalidInput
+        );
+        broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: session.agent_session_id.clone(),
+                tab_id: missing.tab_id,
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .expect("release_tab must clear a missing lease");
+        let owned_after_missing_release = broker_list_tabs(
+            &state,
+            Ok(ListTabsParams {
+                agent_session_id: session.agent_session_id,
+                scope: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(owned_after_missing_release, ListTabsResult::Owned { tabs } if tabs.is_empty())
         );
     }
 
@@ -8829,9 +9434,11 @@ mod tests {
 
         broker_release_tab(
             &state,
-            Ok(TabActionParams {
+            Ok(ReleaseTabParams {
                 agent_session_id: session.agent_session_id.clone(),
                 tab_id: tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
             }),
         )
         .await

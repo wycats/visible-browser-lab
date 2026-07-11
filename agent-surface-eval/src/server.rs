@@ -87,13 +87,19 @@ impl EvaluationServer {
                 .and_then(Value::as_str)
                 .is_some_and(|operation| allowed.contains(&operation))
         });
+        let release_validation_error = (name == "release_tab")
+            .then(|| validate_release_tab_arguments(&arguments))
+            .flatten();
         let call = LoggedCall {
             tool: name.to_string(),
             operation,
             css_fallback: contains_css(&Value::Object(arguments.clone())),
             evaluate_fallback: name == "evaluate",
             foreign_attempt,
-            backend_action: ownership_checked && !ownership_refused && operation_valid,
+            backend_action: ownership_checked
+                && !ownership_refused
+                && operation_valid
+                && release_validation_error.is_none(),
             ownership_refused,
         };
         if let Err(error) = self.append_call(&call) {
@@ -123,6 +129,12 @@ impl EvaluationServer {
             });
             return CallToolResult::structured_error(error);
         }
+        if let Some(message) = release_validation_error {
+            return CallToolResult::structured_error(json!({
+                "code": "invalid_input",
+                "message": message,
+            }));
+        }
         if name != "start_session" && name != "help" {
             let session = arguments.get("agent_session_id").and_then(Value::as_str);
             if session.is_some_and(|session| session != "session_eval") {
@@ -137,6 +149,27 @@ impl EvaluationServer {
             &self.fixture,
             include_result,
         ))
+    }
+}
+
+fn validate_release_tab_arguments(arguments: &Map<String, Value>) -> Option<&'static str> {
+    let leave_visible = arguments
+        .get("leave_visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let instruction = arguments
+        .get("user_instruction")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let instruction_present = arguments
+        .get("user_instruction")
+        .is_some_and(|value| !value.is_null());
+    if leave_visible && instruction.is_none_or(str::is_empty) {
+        Some("leave_visible requires a non-empty user_instruction")
+    } else if !leave_visible && instruction_present {
+        Some("user_instruction is accepted only when leave_visible is true")
+    } else {
+        None
     }
 }
 
@@ -220,7 +253,13 @@ fn tool_response(
         }),
         "new_tab" | "claim_tab" | "focus_tab" => json!({"tab":tab_summary()}),
         "navigate" => page_action_response(fixture, include_result),
-        "release_tab" => json!({"released":true}),
+        "release_tab" => json!({
+            "released": true,
+            "leave_visible": arguments
+                .get("leave_visible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }),
         "close_tab" => json!({"closed":true}),
         "wait_for" => {
             let mut response = page_action_response(fixture, include_result);
@@ -555,6 +594,75 @@ mod tests {
         let call: LoggedCall =
             serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
         assert!(!call.backend_action);
+    }
+
+    #[test]
+    fn release_tab_response_reflects_preservation_request() {
+        let temp = tempdir().unwrap();
+        let server = EvaluationServer::new(
+            "ownership-foreign-action-refusal",
+            temp.path().join("calls.jsonl"),
+        )
+        .unwrap();
+        let result = server.execute(
+            "release_tab",
+            Map::from_iter([
+                ("agent_session_id".to_string(), json!("session_eval")),
+                ("tab_id".to_string(), json!("tab_owned")),
+                ("leave_visible".to_string(), json!(true)),
+                (
+                    "user_instruction".to_string(),
+                    json!("Leave this tab visible for me."),
+                ),
+            ]),
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("leave_visible"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn release_tab_rejects_ambiguous_preservation_arguments() {
+        for arguments in [
+            Map::from_iter([
+                ("agent_session_id".to_string(), json!("session_eval")),
+                ("tab_id".to_string(), json!("tab_owned")),
+                ("leave_visible".to_string(), json!(true)),
+            ]),
+            Map::from_iter([
+                ("agent_session_id".to_string(), json!("session_eval")),
+                ("tab_id".to_string(), json!("tab_owned")),
+                (
+                    "user_instruction".to_string(),
+                    json!("Leave this tab visible for me."),
+                ),
+            ]),
+        ] {
+            let temp = tempdir().unwrap();
+            let log = temp.path().join("calls.jsonl");
+            let server =
+                EvaluationServer::new("ownership-foreign-action-refusal", log.clone()).unwrap();
+
+            let result = server.execute("release_tab", arguments);
+
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str),
+                Some("invalid_input")
+            );
+            let call: LoggedCall =
+                serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+            assert!(!call.backend_action);
+        }
     }
 
     #[test]

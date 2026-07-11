@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::o200k_base_singleton;
 
-pub const SERVER_INSTRUCTIONS: &str = "Call browser operations directly. Conversation-aware hosts select the browser session automatically. If a call returns session_required, call start_session once and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
+pub const COMMON_OPERATION_INSTRUCTIONS: &str = "Use only tab_id values owned by the selected session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. Ordinary release makes a target claimable but leaves VBL-created targets eligible for session-expiry cleanup; use leave_visible with the user's non-empty instruction only when the user explicitly requests a durable handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
+
+pub const SERVER_INSTRUCTIONS: &str = "Call browser operations directly. Conversation-aware hosts select the browser session automatically. Omit agent_session_id unless this conversation first received session_required, then called start_session, and is reusing the exact returned handle; never invent, request, or substitute a placeholder session ID. Use only tab_id values owned by the selected session. Inspect an unfamiliar page with snapshot, then act through its element references. Use fill for one ordinary field. Use fill_form for two or more controls, including combined select and checkbox updates. Use type_text for contenteditable controls and insertion at an established caret. Use press_key with a target for named keys or shortcuts against a resolved element. Use targetless press_key and interact click_at only after focus_tab has focused the owned document. Use wait_for for asynchronous state and screenshot for visual appearance. Use console and network for runtime diagnosis. Use help to select an operation in a specialized domain. Routine click, targeted key, and referenced pointer actions attach to the owned target, prepare the resolved element, and preserve the user's active application. Target activation, including CDP `Target.activateTarget`, is reserved for focus_tab and focus: true tab creation when the user asks to bring Chrome forward for manual inspection or handoff. Ordinary release makes a target claimable but leaves VBL-created targets eligible for session-expiry cleanup; use leave_visible with the user's non-empty instruction only when the user explicitly requests a durable handoff. CSS and evaluate are escape hatches only when snapshot and the named semantic tools cannot represent the required state; do not use them to verify a semantic action.";
 
 pub const DOMAIN_OPERATIONS: &[(&str, &[&str])] = &[
     (
@@ -173,9 +175,9 @@ pub fn hybrid_catalog() -> Vec<ToolDefinition> {
         tool(
             "release_tab",
             "Release Tab",
-            "Release an owned tab lease while leaving its browser target open and claimable.",
-            page_scope_schema(),
-            boolean_result("released"),
+            "Release an owned tab lease and make its browser target claimable. VBL-created targets remain eligible for session-expiry cleanup unless an explicit user instruction requests leave_visible.",
+            release_tab_schema(),
+            release_tab_result(),
             false,
             true,
             true,
@@ -489,6 +491,20 @@ fn tool(
     idempotent: bool,
     open_world: bool,
 ) -> ToolDefinition {
+    if let Some(session_property) = input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("agent_session_id"))
+        .and_then(Value::as_object_mut)
+    {
+        session_property.insert(
+            "description".to_string(),
+            Value::String(
+                "Explicit fallback handle. Omit this field unless this conversation received session_required, called start_session, and is reusing the exact returned value. Never invent, request, or substitute a placeholder value."
+                    .to_string(),
+            ),
+        );
+    }
     if let Some(required) = input_schema
         .get_mut("required")
         .and_then(Value::as_array_mut)
@@ -994,6 +1010,18 @@ fn claim_tab_schema() -> Value {
             ("user_instruction", string_schema()),
         ],
         &["agent_session_id", "target_id"],
+    )
+}
+
+fn release_tab_schema() -> Value {
+    object_schema(
+        vec![
+            ("agent_session_id", string_schema()),
+            ("tab_id", string_schema()),
+            ("leave_visible", json!({"type":"boolean"})),
+            ("user_instruction", string_schema()),
+        ],
+        &["agent_session_id", "tab_id"],
     )
 }
 
@@ -1648,6 +1676,16 @@ fn boolean_result(field: &str) -> Value {
     object_schema(vec![(field, json!({"const":true}))], &[field])
 }
 
+fn release_tab_result() -> Value {
+    object_schema(
+        vec![
+            ("released", json!({"const":true})),
+            ("leave_visible", json!({"type":"boolean"})),
+        ],
+        &["released", "leave_visible"],
+    )
+}
+
 fn list_tabs_result() -> Value {
     json!({"oneOf":[
         object_schema(
@@ -2200,6 +2238,12 @@ mod tests {
             let properties = tool.input_schema["properties"].as_object().unwrap();
             if properties.contains_key("agent_session_id") {
                 tools_with_session += 1;
+                assert_eq!(
+                    properties["agent_session_id"]["description"],
+                    "Explicit fallback handle. Omit this field unless this conversation received session_required, called start_session, and is reusing the exact returned value. Never invent, request, or substitute a placeholder value.",
+                    "{} does not explain explicit session provenance",
+                    tool.name
+                );
                 let required = tool.input_schema["required"].as_array().unwrap();
                 assert!(
                     required
@@ -2219,6 +2263,32 @@ mod tests {
         assert_eq!(
             start.output_schema["properties"]["mode"]["enum"],
             json!(["ambient", "explicit"])
+        );
+    }
+
+    #[test]
+    fn release_tab_declares_preservation_input_and_cleanup_disposition() {
+        let catalog = hybrid_catalog();
+        let release = catalog
+            .iter()
+            .find(|tool| tool.name == "release_tab")
+            .unwrap();
+
+        assert_eq!(
+            release.input_schema["properties"]["leave_visible"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            release.input_schema["properties"]["user_instruction"]["type"],
+            "string"
+        );
+        assert_eq!(
+            release.output_schema["properties"]["leave_visible"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            release.output_schema["properties"]["released"]["const"],
+            true
         );
     }
 

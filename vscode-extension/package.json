@@ -18,12 +18,12 @@
     "format:check": "oxfmt --check package.json tsconfig.json src test unit",
     "lint": "oxlint --type-aware --type-check --tsconfig tsconfig.json --deny-warnings src",
     "test:extension-host": "pnpm run build:test && node dist-test/runner.js",
-    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js",
+    "test:unit": "tsc -p unit/tsconfig.json && node --test dist-unit/unit/invocation_context.test.js dist-unit/unit/confirmation.test.js dist-unit/unit/model_result.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p unit/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "@types/vscode": "^1.105.0",
+    "@types/vscode": "^1.120.0",
     "@vscode/test-electron": "^2.5.2",
     "oxfmt": "^0.56.0",
     "oxlint": "^1.71.0",
@@ -83,7 +83,7 @@
           "required": [],
           "type": "object"
         },
-        "modelDescription": "Start one lease-scoped browser session and optionally create its first background tab. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Start one lease-scoped browser session and optionally create its first background tab. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band, so this compatibility entry point reuses the current ambient session; its model-visible schema and result never accept or expose a session handle. For normal work, call browser operations directly. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_start_session",
         "userDescription": "Start one lease-scoped browser session and optionally create its first background tab."
       },
@@ -93,10 +93,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "scope": {
               "enum": [
                 "owned",
@@ -108,7 +104,7 @@
           "required": [],
           "type": "object"
         },
-        "modelDescription": "List caller-owned tab leases, or request the read-only target inventory without foreign action handles. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "List caller-owned tab leases, or request the read-only target inventory without foreign action handles. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_list_tabs",
         "userDescription": "List caller-owned tab leases, or request the read-only target inventory without foreign action handles."
       },
@@ -118,10 +114,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "focus": {
               "type": "boolean"
             },
@@ -133,7 +125,7 @@
           "required": [],
           "type": "object"
         },
-        "modelDescription": "Create a background browser tab and lease it to the caller's session. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Create a background browser tab and lease it to the caller's session. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_new_tab",
         "userDescription": "Create a background browser tab and lease it to the caller's session."
       },
@@ -143,10 +135,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "takeover": {
               "type": "boolean"
             },
@@ -164,7 +152,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Claim an unowned target, or perform an explicitly instructed ownership transfer. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Claim an unowned target, or perform an explicitly instructed ownership transfer. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_claim_tab",
         "userDescription": "Claim an unowned target, or perform an explicitly instructed ownership transfer."
       },
@@ -174,11 +162,14 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
+            "leave_visible": {
+              "type": "boolean"
+            },
+            "tab_id": {
               "minLength": 1,
               "type": "string"
             },
-            "tab_id": {
+            "user_instruction": {
               "minLength": 1,
               "type": "string"
             }
@@ -188,9 +179,9 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Release an owned tab lease while leaving its browser target open and claimable. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Release an owned tab lease and make its browser target claimable. VBL-created targets remain eligible for session-expiry cleanup unless an explicit user instruction requests leave_visible. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_release_tab",
-        "userDescription": "Release an owned tab lease while leaving its browser target open and claimable."
+        "userDescription": "Release an owned tab lease and make its browser target claimable. VBL-created targets remain eligible for session-expiry cleanup unless an explicit user instruction requests leave_visible."
       },
       {
         "displayName": "Focus Tab",
@@ -198,10 +189,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "tab_id": {
               "minLength": 1,
               "type": "string"
@@ -212,7 +199,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Bring an owned tab and its browser window to the foreground for explicit user handoff or manual inspection. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Bring an owned tab and its browser window to the foreground for explicit user handoff or manual inspection. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_focus_tab",
         "userDescription": "Bring an owned tab and its browser window to the foreground for explicit user handoff or manual inspection."
       },
@@ -222,10 +209,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "tab_id": {
               "minLength": 1,
               "type": "string"
@@ -236,7 +219,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Close an owned browser target and complete its lease. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Close an owned browser target and complete its lease. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_close_tab",
         "userDescription": "Close an owned browser target and complete its lease."
       },
@@ -247,10 +230,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "depth": {
               "type": "integer"
             },
@@ -315,7 +294,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Inspect the compact accessibility tree and obtain lease-scoped element references for semantic actions. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Inspect the compact accessibility tree and obtain lease-scoped element references for semantic actions. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_snapshot",
         "toolReferenceName": "vbl_snapshot",
         "userDescription": "Inspect the compact accessibility tree and obtain lease-scoped element references for semantic actions."
@@ -334,10 +313,6 @@
                 "forward",
                 "reload"
               ],
-              "type": "string"
-            },
-            "agent_session_id": {
-              "minLength": 1,
               "type": "string"
             },
             "before_unload": {
@@ -389,7 +364,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Navigate an owned tab by URL, history, or reload while preserving application focus. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Navigate an owned tab by URL, history, or reload while preserving application focus. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_navigate",
         "toolReferenceName": "vbl_navigate",
         "userDescription": "Navigate an owned tab by URL, history, or reload while preserving application focus."
@@ -400,10 +375,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "condition": {
               "oneOf": [
                 {
@@ -601,7 +572,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Wait for semantic text, element state, URL, page load, or JavaScript state in an owned tab. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Wait for semantic text, element state, URL, page load, or JavaScript state in an owned tab. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_wait_for",
         "userDescription": "Wait for semantic text, element state, URL, page load, or JavaScript state in an owned tab."
       },
@@ -611,10 +582,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "button": {
               "enum": [
                 "left",
@@ -698,7 +665,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_click",
         "userDescription": "Click one accessibility reference after ownership and actionability checks, returning delivery and effect evidence for quiet submit flows. Use CSS only as an explicit fallback."
       },
@@ -708,10 +675,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "observe": {
               "enum": [
                 "none",
@@ -772,7 +735,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Replace the value of one referenced editable control and return a compact accessibility observation. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Replace the value of one referenced editable control and return a compact accessibility observation. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_fill",
         "userDescription": "Replace the value of one referenced editable control and return a compact accessibility observation."
       },
@@ -782,10 +745,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "fields": {
               "items": {
                 "oneOf": [
@@ -975,7 +934,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Fill two or more referenced form controls sequentially and report completed fields. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Fill two or more referenced form controls sequentially and report completed fields. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_fill_form",
         "userDescription": "Fill two or more referenced form controls sequentially and report completed fields."
       },
@@ -985,10 +944,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "delay_ms": {
               "type": "integer"
             },
@@ -1052,7 +1007,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Insert text at the selection of one referenced editable element while preserving application focus. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Insert text at the selection of one referenced editable element while preserving application focus. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_type_text",
         "userDescription": "Insert text at the selection of one referenced editable element while preserving application focus."
       },
@@ -1062,10 +1017,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "key": {
               "minLength": 1,
               "type": "string"
@@ -1138,7 +1089,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Dispatch one key to a referenced element, or to the focused owned document after explicit handoff. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Dispatch one key to a referenced element, or to the focused owned document after explicit handoff. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_press_key",
         "userDescription": "Dispatch one key to a referenced element, or to the focused owned document after explicit handoff."
       },
@@ -1149,10 +1100,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "format": {
               "enum": [
                 "png",
@@ -1211,7 +1158,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Capture an owned page or referenced element as a renderable image artifact. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Capture an owned page or referenced element as a renderable image artifact. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_screenshot",
         "toolReferenceName": "vbl_screenshot",
         "userDescription": "Capture an owned page or referenced element as a renderable image artifact."
@@ -1222,10 +1169,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "args": {
               "items": {},
               "type": "array"
@@ -1289,7 +1232,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Evaluate JavaScript for page state that semantic snapshots and diagnostics do not expose. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Evaluate JavaScript for page state that semantic snapshots and diagnostics do not expose. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_evaluate",
         "userDescription": "Evaluate JavaScript for page state that semantic snapshots and diagnostics do not expose."
       },
@@ -1304,10 +1247,6 @@
                 "accept",
                 "dismiss"
               ],
-              "type": "string"
-            },
-            "agent_session_id": {
-              "minLength": 1,
               "type": "string"
             },
             "button": {
@@ -1512,7 +1451,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Perform select, checkbox, hover, drag, drop, upload, dialog, scroll, or coordinate interaction. Set `operation` to one of: select_options, set_checked, hover, drag, drop, upload_files, handle_dialog, scroll, click_at. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Perform select, checkbox, hover, drag, drop, upload, dialog, scroll, or coordinate interaction. Set `operation` to one of: select_options, set_checked, hover, drag, drop, upload_files, handle_dialog, scroll, click_at. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_interact",
         "userDescription": "Perform select, checkbox, hover, drag, drop, upload, dialog, scroll, or coordinate interaction. Set `operation` to one of: select_options, set_checked, hover, drag, drop, upload_files, handle_dialog, scroll, click_at."
       },
@@ -1522,10 +1461,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "levels": {
               "items": {
                 "enum": [
@@ -1568,7 +1503,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "List, inspect, or clear lease-scoped console diagnostics. Set `operation` to one of: list, get, clear. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "List, inspect, or clear lease-scoped console diagnostics. Set `operation` to one of: list, get, clear. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_console",
         "userDescription": "List, inspect, or clear lease-scoped console diagnostics. Set `operation` to one of: list, get, clear."
       },
@@ -1578,10 +1513,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "body_limit_bytes": {
               "type": "integer"
             },
@@ -1639,7 +1570,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "List, inspect, or clear lease-scoped network diagnostics. Set `operation` to one of: list, get, clear. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "List, inspect, or clear lease-scoped network diagnostics. Set `operation` to one of: list, get, clear. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_network",
         "userDescription": "List, inspect, or clear lease-scoped network diagnostics. Set `operation` to one of: list, get, clear."
       },
@@ -1655,10 +1586,6 @@
             },
             "accuracy_meters": {
               "type": "number"
-            },
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
             },
             "color_scheme": {
               "enum": [
@@ -1773,7 +1700,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Configure viewport, network, CPU, geolocation, media, user agent, or headers for an owned target. Set `operation` to one of: set_viewport, set_network, set_cpu, set_geolocation, set_media, set_user_agent, set_headers, reset. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Configure viewport, network, CPU, geolocation, media, user agent, or headers for an owned target. Set `operation` to one of: set_viewport, set_network, set_cpu, set_geolocation, set_media, set_user_agent, set_headers, reset. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_emulation",
         "userDescription": "Configure viewport, network, CPU, geolocation, media, user agent, or headers for an owned target. Set `operation` to one of: set_viewport, set_network, set_cpu, set_geolocation, set_media, set_user_agent, set_headers, reset."
       },
@@ -1783,10 +1710,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "artifact_id": {
               "minLength": 1,
               "type": "string"
@@ -1833,7 +1756,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Capture traces, read web vitals, and analyze broker-produced performance artifacts. Set `operation` to one of: start_trace, stop_trace, vitals, analyze. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Capture traces, read web vitals, and analyze broker-produced performance artifacts. Set `operation` to one of: start_trace, stop_trace, vitals, analyze. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_performance",
         "userDescription": "Capture traces, read web vitals, and analyze broker-produced performance artifacts. Set `operation` to one of: start_trace, stop_trace, vitals, analyze."
       },
@@ -1843,10 +1766,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "categories": {
               "items": {
                 "enum": [
@@ -1890,7 +1809,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Run accessibility, best-practices, SEO, or agentic-browsing audits against an owned tab. Set `operation` to one of: run. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Run accessibility, best-practices, SEO, or agentic-browsing audits against an owned tab. Set `operation` to one of: run. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_audit",
         "userDescription": "Run accessibility, best-practices, SEO, or agentic-browsing audits against an owned tab. Set `operation` to one of: run."
       },
@@ -1900,10 +1819,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "artifact_id": {
               "minLength": 1,
               "type": "string"
@@ -1961,7 +1876,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Capture and inspect bounded heap-snapshot artifacts for an owned tab. Set `operation` to one of: capture, summary, classes, node, dominators, retainers, retaining_paths, edges, close. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Capture and inspect bounded heap-snapshot artifacts for an owned tab. Set `operation` to one of: capture, summary, classes, node, dominators, retainers, retaining_paths, edges, close. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_memory",
         "userDescription": "Capture and inspect bounded heap-snapshot artifacts for an owned tab. Set `operation` to one of: capture, summary, classes, node, dominators, retainers, retaining_paths, edges, close."
       },
@@ -1971,10 +1886,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "fps": {
               "type": "integer"
             },
@@ -2003,7 +1914,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Start, stop, or inspect an owned-tab screencast recording. Set `operation` to one of: start, stop, status. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Start, stop, or inspect an owned-tab screencast recording. Set `operation` to one of: start, stop, status. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_screencast",
         "userDescription": "Start, stop, or inspect an owned-tab screencast recording. Set `operation` to one of: start, stop, status."
       },
@@ -2013,10 +1924,6 @@
         "inputSchema": {
           "additionalProperties": false,
           "properties": {
-            "agent_session_id": {
-              "minLength": 1,
-              "type": "string"
-            },
             "artifact_id": {
               "minLength": 1,
               "type": "string"
@@ -2067,7 +1974,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "List, inspect, read, export, or delete browser artifacts owned by the session. Set `operation` to one of: list, metadata, read, export, delete. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "List, inspect, read, export, or delete browser artifacts owned by the session. Set `operation` to one of: list, metadata, read, export, delete. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_artifacts",
         "userDescription": "List, inspect, read, export, or delete browser artifacts owned by the session. Set `operation` to one of: list, metadata, read, export, delete."
       },
@@ -2106,7 +2013,7 @@
           ],
           "type": "object"
         },
-        "modelDescription": "Choose the preferred explicit tool or specialized-domain operation for a browser task. Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "modelDescription": "Choose the preferred explicit tool or specialized-domain operation for a browser task. Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         "name": "visible_browser_lab_help",
         "toolReferenceName": "vbl",
         "userDescription": "Choose the preferred explicit tool or specialized-domain operation for a browser task."
@@ -2143,7 +2050,7 @@
     "onLanguageModelTool:visible_browser_lab_wait_for"
   ],
   "engines": {
-    "vscode": "^1.105.0"
+    "vscode": "^1.120.0"
   },
   "visibleBrowserLab": {
     "runtimeBinary": "bin/visible-browser-lab-mcp",

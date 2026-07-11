@@ -3,10 +3,15 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 
 import {
-  extractInvocationContext,
+  globalStartSessionError,
+  resolveInvocationContext,
+  supportsUnsupportedTokenInvocation,
+  unsupportedInvocationTokenError,
   withWorkspaceFallback,
   type SurfaceRequestContext,
 } from "./invocation_context";
+import { confirmationFor } from "./confirmation";
+import { modelVisibleResult } from "./model_result";
 
 interface ToolContribution {
   name: string;
@@ -60,20 +65,27 @@ class BrowserLanguageModelTool implements vscode.LanguageModelTool<Record<string
     token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelToolResult> {
     const method = browserMethod(this.contribution.name);
+    const invocation = resolveInvocationContext(options);
+    if (invocation.kind === "unsupported" && !supportsUnsupportedTokenInvocation(method)) {
+      throw new Error(unsupportedInvocationTokenError(method));
+    }
+    if (invocation.kind === "global" && method === "start_session") {
+      throw new Error(globalStartSessionError());
+    }
     const output = await invokeSurfaceCall(
       this.context,
       method,
       options.input ?? {},
-      extractInvocationContext(options),
+      invocation.kind === "ambient" ? invocation.context : undefined,
       token,
     );
     if (!output.ok) {
       throw new Error(formatToolError(method, output.error));
     }
 
-    // LanguageModelTextPart is stable at the declared engine floor (1.105).
+    // LanguageModelTextPart is stable at the declared engine floor.
     return new vscode.LanguageModelToolResult([
-      new vscode.LanguageModelTextPart(JSON.stringify(output.result ?? null)),
+      new vscode.LanguageModelTextPart(JSON.stringify(modelVisibleResult(output.result ?? null))),
     ]);
   }
 }
@@ -136,41 +148,6 @@ function invocationMessageFor(method: string, displayName: string): string {
     default:
       return `Running ${displayName}`;
   }
-}
-
-function confirmationFor(
-  method: string,
-  input: Record<string, unknown>,
-): vscode.LanguageModelToolConfirmationMessages | undefined {
-  switch (method) {
-    case "claim_tab":
-      return {
-        title: "Claim browser tab?",
-        message: `Claim target ${stringInput(input, "target_id") ?? "(unknown target)"} for this agent session.`,
-      };
-    case "close_tab":
-      return {
-        title: "Close browser tab?",
-        message: `Close owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"}.`,
-      };
-    case "release_tab":
-      return {
-        title: "Release browser tab?",
-        message: `Release owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"} without closing it.`,
-      };
-    case "focus_tab":
-      return {
-        title: "Bring Chrome forward?",
-        message: `Focus owned tab ${stringInput(input, "tab_id") ?? "(unknown tab)"} for manual inspection or handoff.`,
-      };
-    default:
-      return undefined;
-  }
-}
-
-function stringInput(input: Record<string, unknown>, key: string): string | undefined {
-  const value = input[key];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 async function invokeSurfaceCall(
