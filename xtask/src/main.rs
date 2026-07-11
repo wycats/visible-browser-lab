@@ -829,7 +829,7 @@ fn vscode_extension_manifest(version: &str) -> Result<Value> {
             }
         },
         "visibleBrowserLab": {
-            "serverInstructions": agent_surface_contract::SERVER_INSTRUCTIONS,
+            "serverInstructions": vscode_server_instructions(),
             "runtimeBinary": "bin/visible-browser-lab-mcp"
         }
     }))
@@ -868,13 +868,24 @@ fn vscode_language_model_tool(tool: &ToolDefinition) -> Value {
         "userDescription": tool.description,
         "modelDescription": vscode_model_description(tool),
         "icon": "$(browser)",
-        "inputSchema": tool.input_schema,
+        "inputSchema": vscode_input_schema(tool),
     });
     if let Some(reference) = vscode_tool_reference_name(&tool.name) {
         contribution["canBeReferencedInPrompt"] = Value::Bool(true);
         contribution["toolReferenceName"] = Value::String(reference.to_string());
     }
     contribution
+}
+
+fn vscode_input_schema(tool: &ToolDefinition) -> Value {
+    let mut schema = tool.input_schema.clone();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.remove("agent_session_id");
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|field| field.as_str() != Some("agent_session_id"));
+    }
+    schema
 }
 
 fn vscode_tool_name(tool_name: &str) -> String {
@@ -890,8 +901,15 @@ fn vscode_tool_reference_name(tool_name: &str) -> Option<&'static str> {
 
 fn vscode_model_description(tool: &ToolDefinition) -> String {
     format!(
-        "{} Backed by Visible Browser Lab's shared broker surface. Call browser operations directly; if the host returns session_required, call start_session and pass its agent_session_id on later calls. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
+        "{} Backed by Visible Browser Lab's shared broker surface. VS Code chat supplies conversation identity out of band; never call start_session or invent, request, or pass a session handle. If the host returns session_required, report its recovery guidance. Use only tab_id values owned by the selected session. The tool returns structured JSON success values or structured browser errors with recovery guidance.",
         tool.description
+    )
+}
+
+fn vscode_server_instructions() -> String {
+    format!(
+        "VS Code chat supplies conversation identity out of band. Never call start_session or invent, request, or pass a session handle; if a call returns session_required, report its recovery guidance. {}",
+        agent_surface_contract::SERVER_INSTRUCTIONS
     )
 }
 
@@ -919,8 +937,8 @@ fn validate_vscode_extension_manifest(manifest: &Value) -> Result<()> {
             .iter()
             .find(|candidate| candidate["name"].as_str() == Some(&expected_name))
             .with_context(|| format!("VS Code manifest omitted tool `{expected_name}`"))?;
-        if contribution["inputSchema"] != tool.input_schema {
-            bail!("VS Code input schema for `{expected_name}` does not match the shared catalog");
+        if contribution["inputSchema"] != vscode_input_schema(tool) {
+            bail!("VS Code input schema for `{expected_name}` does not match its host projection");
         }
         if contribution["displayName"].as_str() != Some(tool.title.as_str()) {
             bail!("VS Code displayName for `{expected_name}` does not match the shared catalog");
@@ -2910,6 +2928,30 @@ mod tests {
         }
         assert_eq!(vscode_tool_reference_name("help"), Some("vbl"));
         assert_eq!(vscode_tool_reference_name("claim_tab"), None);
+    }
+
+    #[test]
+    fn vscode_model_schema_uses_only_ambient_session_identity() {
+        for tool in production_tool_definitions().unwrap() {
+            let canonical_properties = tool.input_schema["properties"].as_object().unwrap();
+            let vscode_schema = vscode_input_schema(&tool);
+            let vscode_properties = vscode_schema["properties"].as_object().unwrap();
+
+            assert!(
+                !vscode_properties.contains_key("agent_session_id"),
+                "{} exposes an explicit session handle to the VS Code model",
+                tool.name
+            );
+            if canonical_properties.contains_key("agent_session_id") {
+                assert!(
+                    tool.input_schema["properties"]["agent_session_id"]["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("exact returned value")),
+                    "{} lost the canonical explicit-fallback contract",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]
