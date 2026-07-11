@@ -802,6 +802,15 @@ fn managed_targets_are_disposable(
     })
 }
 
+fn mark_managed_target_claimed(
+    target_id: &str,
+    synthetic_replacements: &mut HashSet<String>,
+    startup_targets: &mut HashSet<String>,
+) {
+    synthetic_replacements.remove(target_id);
+    startup_targets.remove(target_id);
+}
+
 impl BrowserBackend {
     fn new(config: &RuntimeConfig) -> Result<Self> {
         match config.runtime_mode {
@@ -844,6 +853,14 @@ impl BrowserBackend {
             #[cfg(test)]
             Self::Fake(browser) => Ok(browser.lock().unwrap().page_targets()),
             _ => self.cdp_client().await?.page_targets().await,
+        }
+    }
+
+    async fn mark_target_claimed(&self, target_id: &str) {
+        if let Self::Managed(browser) = self {
+            let mut synthetic = browser.synthetic_replacement_targets.lock().await;
+            let mut startup = browser.startup_targets.lock().await;
+            mark_managed_target_claimed(target_id, &mut synthetic, &mut startup);
         }
     }
 
@@ -3268,6 +3285,7 @@ async fn broker_claim_tab(
         params.takeover,
         params.user_instruction.as_deref(),
     )?;
+    state.browser.mark_target_claimed(&target.id).await;
     let old_monitor = state.diagnostics().lock().unwrap().reset_target(&target.id);
     state.references().lock().unwrap().reset_target(&target.id);
     if let Some(monitor) = old_monitor {
@@ -6925,6 +6943,17 @@ mod tests {
             &HashSet::new(),
             &HashSet::from(["startup".to_string()])
         ));
+    }
+
+    #[test]
+    fn claiming_a_managed_disposable_target_clears_its_markers() {
+        let mut synthetic = HashSet::from(["target".to_string()]);
+        let mut startup = HashSet::from(["target".to_string()]);
+
+        mark_managed_target_claimed("target", &mut synthetic, &mut startup);
+
+        assert!(synthetic.is_empty());
+        assert!(startup.is_empty());
     }
 
     #[test]

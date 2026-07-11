@@ -357,6 +357,7 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
         let original_href = if before_unload == Some("accept") {
             let value = page
@@ -375,7 +376,7 @@ impl CdpClient {
             self.clear_beforeunload_handlers(&page, &connection).await?;
         }
         let navigation = async {
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .start_page_navigation(&page, &connection, url)
                     .await
@@ -400,9 +401,7 @@ impl CdpClient {
                     )
                     .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("navigation wait state was validated before navigation"),
             }
         };
         let result = self
@@ -644,16 +643,8 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
-        let wait_until = wait_until.unwrap_or("load");
-        if !matches!(
-            wait_until,
-            "none" | "dom_content_loaded" | "load" | "network_idle"
-        ) {
-            return Err(BrowserToolError::invalid_input(format!(
-                "unknown navigation wait state `{wait_until}`"
-            )));
-        }
         let history = self
             .runtime
             .page_command(
@@ -769,6 +760,7 @@ impl CdpClient {
         timeout_ms: u64,
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
+        let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
         if before_unload == Some("accept") {
             self.clear_beforeunload_handlers(&page, &connection).await?;
@@ -776,7 +768,7 @@ impl CdpClient {
         let navigation = async {
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
-            match wait_until.unwrap_or("load") {
+            match wait_until {
                 "none" => self
                     .runtime
                     .page_command(&connection, command(), "reload page")
@@ -802,9 +794,7 @@ impl CdpClient {
                     self.wait_for_lifecycle_event(&mut events, timeout_ms, "load")
                         .await
                 }
-                wait_until => Err(BrowserToolError::invalid_input(format!(
-                    "unknown navigation wait state `{wait_until}`"
-                ))),
+                _ => unreachable!("reload wait state was validated before navigation"),
             }
         };
         self.with_navigation_timeout(&page, &connection, before_unload, timeout_ms, navigation)
@@ -3401,6 +3391,20 @@ fn map_cdp_error(operation: &str, error: &CdpError) -> BrowserToolError {
             "{operation} failed because Chrome no longer exposes the target"
         )),
         _ => BrowserToolError::chrome_unavailable(format!("{operation} failed: {error}")),
+    }
+}
+
+fn validated_navigation_wait_state(wait_until: Option<&str>) -> Result<&str, BrowserToolError> {
+    let wait_until = wait_until.unwrap_or("load");
+    if matches!(
+        wait_until,
+        "none" | "dom_content_loaded" | "load" | "network_idle"
+    ) {
+        Ok(wait_until)
+    } else {
+        Err(BrowserToolError::invalid_input(format!(
+            "unknown navigation wait state `{wait_until}`"
+        )))
     }
 }
 

@@ -550,6 +550,38 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        for invalid_wait_request in [
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "url",
+                "url": fixture.url("/invalid-wait"),
+                "wait_until": "loaded",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "action": "reload",
+                "wait_until": "loaded",
+                "timeout_ms": 5000,
+                "before_unload": "accept",
+                "observe": "none"
+            }),
+        ] {
+            let invalid_wait = client.call_tool(
+                "navigate",
+                invalid_wait_request,
+                Duration::from_secs(10),
+                true,
+            )?;
+            assert_eq!(
+                invalid_wait.get("code").and_then(|value| value.as_str()),
+                Some("invalid_input")
+            );
+        }
         let invalid_forward = client.call_tool(
             "navigate",
             json!({
