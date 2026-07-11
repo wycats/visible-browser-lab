@@ -1775,6 +1775,12 @@ fn extension_dist_dir(root: &Path, override_dir: Option<&Path>) -> Result<PathBu
             dist.join("extension.js").display()
         );
     }
+    if !dist.join("confirmation.js").is_file() {
+        bail!(
+            "extension confirmation module not found at `{}`. Run `pnpm build` first.",
+            dist.join("confirmation.js").display()
+        );
+    }
     if !dist.join("invocation_context.js").is_file() {
         bail!(
             "extension invocation-context module not found at `{}`. Run `pnpm build` first.",
@@ -2945,6 +2951,7 @@ mod tests {
         let dist = output.path().join("dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(dist.join("extension.js"), b"// bundle").unwrap();
+        fs::write(dist.join("confirmation.js"), b"// confirmation module").unwrap();
         fs::write(dist.join("invocation_context.js"), b"// context module").unwrap();
         let vsix = output.path().join(format!(
             "visible-browser-lab-vscode-{version}-{target}.vsix"
