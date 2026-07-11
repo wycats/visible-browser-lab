@@ -9,7 +9,7 @@ test("removes explicit session handles from model-visible results", () => {
     mode: "ambient",
     tab: {
       tab_id: "tab-visible",
-      nested: [{ agent_session_id: "nested-secret", value: 1 }],
+      nested: [{ agent_session_id: "page-controlled-value", value: 1 }],
     },
   });
 
@@ -17,9 +17,18 @@ test("removes explicit session handles from model-visible results", () => {
     mode: "ambient",
     tab: {
       tab_id: "tab-visible",
-      nested: [{ value: 1 }],
+      nested: [{ agent_session_id: "page-controlled-value", value: 1 }],
     },
   });
+});
+
+test("preserves page-controlled fields in nested evaluate results", () => {
+  const value = {
+    value: {
+      user: { agent_session_id: "application-data" },
+    },
+  };
+  assert.deepEqual(modelVisibleResult(value), value);
 });
 
 test("does not mutate the broker result", () => {

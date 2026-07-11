@@ -450,7 +450,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": tab.tab_id,
-                "source": "history.pushState(null, '', '/chat/pending'); window.__vblGuard = event => { event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblBeforeUnloadSideEffects = 0; localStorage.setItem('vbl-beforeunload-side-effects', '0'); window.__vblGuard = event => { window.__vblBeforeUnloadSideEffects += 1; localStorage.setItem('vbl-beforeunload-side-effects', String(Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0') + 1)); event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
             }),
             Duration::from_secs(20),
             false,
@@ -524,7 +524,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": sibling.tab_id,
-                "source": "history.pushState(null, '', '/chat/pending'); window.__vblGuard = event => { event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
+                "source": "history.pushState(null, '', '/chat/pending'); window.__vblBeforeUnloadSideEffects = 0; localStorage.setItem('vbl-beforeunload-side-effects', '0'); window.__vblGuard = event => { window.__vblBeforeUnloadSideEffects += 1; localStorage.setItem('vbl-beforeunload-side-effects', String(Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0') + 1)); event.preventDefault(); event.returnValue = ''; }; window.addEventListener('beforeunload', window.__vblGuard); window.__pending = new Promise(() => {}); true"
             }),
             Duration::from_secs(10),
             false,
@@ -639,7 +639,7 @@ mod macos {
             json!({
                 "agent_session_id": session_id,
                 "tab_id": sibling.tab_id,
-                "source": "(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return { prevented: event.defaultPrevented, href: location.href, stash: Boolean(window.__io_github_wycats_visible_browser_lab_beforeunload_stash_v1) }; })()"
+                "source": "(() => { const sideEffects = window.__vblBeforeUnloadSideEffects; const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return { prevented: event.defaultPrevented, href: location.href, sideEffects, stash: Boolean(window.__io_github_wycats_visible_browser_lab_beforeunload_stash_v1) }; })()"
             }),
             Duration::from_secs(10),
             false,
@@ -651,6 +651,15 @@ mod macos {
                 .and_then(|value| value.as_bool()),
             Some(true),
             "a same-document accepted navigation must restore the page's unload guard: {same_document_guard}"
+        );
+        let side_effects_before_cross_document = same_document_guard
+            .get("value")
+            .and_then(|value| value.get("sideEffects"))
+            .and_then(|value| value.as_u64())
+            .context("same-document guard result omitted sideEffects")?;
+        assert_eq!(
+            side_effects_before_cross_document, 1,
+            "a same-document accept must not duplicate Chrome's own beforeunload side effect: {same_document_guard}"
         );
         let rejected_navigation = client.call_tool(
             "navigate",
@@ -693,6 +702,20 @@ mod macos {
             Some(true),
             "a rejected navigation must restore the current document's unload guard"
         );
+        let side_effects_before_cross_document = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0')"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        let side_effects_before_cross_document = side_effects_before_cross_document
+            .get("value")
+            .and_then(|value| value.as_u64())
+            .context("pre-navigation side-effect count was not numeric")?;
         client
             .call_tool(
                 "navigate",
@@ -723,6 +746,23 @@ mod macos {
         assert_eq!(
             title.get("value").and_then(|value| value.as_str()),
             Some("VBL Fixture")
+        );
+        let unload_side_effects = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": sibling.tab_id,
+                "source": "Number(localStorage.getItem('vbl-beforeunload-side-effects') || '0')"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+        assert_eq!(
+            unload_side_effects
+                .get("value")
+                .and_then(|value| value.as_u64()),
+            Some(side_effects_before_cross_document + 1),
+            "accepting a cross-document beforeunload must add exactly one persisted side effect: {unload_side_effects}"
         );
 
         client.call_tool(

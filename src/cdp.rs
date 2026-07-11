@@ -360,6 +360,9 @@ impl CdpClient {
         before_unload: Option<&str>,
     ) -> Result<(), BrowserToolError> {
         let wait_until = validated_navigation_wait_state(wait_until)?;
+        Url::parse(url).map_err(|error| {
+            BrowserToolError::invalid_input(format!("invalid navigation URL `{url}`: {error}"))
+        })?;
         let (page, connection) = self.page(&target.id).await?;
         let original_href = if before_unload == Some("accept") {
             let value = page
@@ -374,8 +377,13 @@ impl CdpClient {
         } else {
             None
         };
-        if original_href.is_some() {
-            self.clear_beforeunload_handlers(&page, &connection).await?;
+        if let Some(original_href) = original_href.as_deref() {
+            self.clear_beforeunload_handlers(
+                &page,
+                &connection,
+                !same_document_url_change(original_href, url),
+            )
+            .await?;
         }
         let navigation = async {
             match wait_until {
@@ -589,13 +597,18 @@ impl CdpClient {
         &self,
         page: &Page,
         connection: &RuntimeConnection,
+        dispatch_side_effects: bool,
     ) -> Result<(), BrowserToolError> {
-        // An explicit accept authorizes VBL to remove page-owned guards before
-        // navigating. This avoids Chromium leaving the target session wedged
-        // after acknowledging a native beforeunload dialog.
+        // For cross-document accepts, run the page's unload side effects once;
+        // then temporarily remove its guards. This preserves application
+        // cleanup while avoiding Chromium leaving the target session wedged
+        // after a native dialog acceptance.
         let expression = format!(
             r#"(() => {{
             const stashKey = {stash_key};
+            if ({dispatch_side_effects}) {{
+                window.dispatchEvent(new Event('beforeunload', {{ cancelable: true }}));
+            }}
             const listeners = typeof getEventListeners === 'function'
                 ? (getEventListeners(window).beforeunload ?? [])
                 : [];
@@ -613,7 +626,8 @@ impl CdpClient {
             }}
             window.onbeforeunload = null;
         }})()"#,
-            stash_key = serde_json::to_string(BEFOREUNLOAD_STASH_KEY).unwrap()
+            stash_key = serde_json::to_string(BEFOREUNLOAD_STASH_KEY).unwrap(),
+            dispatch_side_effects = dispatch_side_effects
         );
         let response = self
             .runtime
@@ -836,7 +850,15 @@ impl CdpClient {
             })?;
         let entry_id = entry.id;
         if before_unload == Some("accept") {
-            self.clear_beforeunload_handlers(&page, &connection).await?;
+            let current_url = history
+                .result
+                .entries
+                .get(history.result.current_index.max(0) as usize)
+                .map(|current| current.url.as_str());
+            let dispatch_side_effects =
+                current_url.is_none_or(|current| !same_document_url_change(current, &entry.url));
+            self.clear_beforeunload_handlers(&page, &connection, dispatch_side_effects)
+                .await?;
         }
         let navigation = async {
             match wait_until {
@@ -941,7 +963,8 @@ impl CdpClient {
         let wait_until = validated_navigation_wait_state(wait_until)?;
         let (page, connection) = self.page(&target.id).await?;
         if before_unload == Some("accept") {
-            self.clear_beforeunload_handlers(&page, &connection).await?;
+            self.clear_beforeunload_handlers(&page, &connection, true)
+                .await?;
         }
         let navigation = async {
             let command =
@@ -3638,6 +3661,15 @@ fn validated_navigation_wait_state(wait_until: Option<&str>) -> Result<&str, Bro
     }
 }
 
+fn same_document_url_change(current: &str, requested: &str) -> bool {
+    let (Ok(mut current), Ok(mut requested)) = (Url::parse(current), Url::parse(requested)) else {
+        return false;
+    };
+    current.set_fragment(None);
+    requested.set_fragment(None);
+    current == requested
+}
+
 fn committed_navigation_reached_wait_state(
     expected_loader_id: &str,
     committed_loader_id: &str,
@@ -4358,6 +4390,18 @@ mod tests {
             Duration::from_secs(10),
             "no-wait navigation has no lifecycle wait that needs recovery grace"
         );
+    }
+
+    #[test]
+    fn fragment_only_navigation_is_same_document() {
+        assert!(same_document_url_change(
+            "https://example.test/chat/pending#old",
+            "https://example.test/chat/pending#accepted"
+        ));
+        assert!(!same_document_url_change(
+            "https://example.test/chat/pending",
+            "https://example.test/after"
+        ));
     }
 
     #[test]
