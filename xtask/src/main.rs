@@ -1902,6 +1902,12 @@ fn write_vsix_archive(
     )?;
     add_file(
         &mut zip,
+        "extension/dist/confirmation.js",
+        &extension_dist.join("confirmation.js"),
+        0o644,
+    )?;
+    add_file(
+        &mut zip,
         "extension/dist/invocation_context.js",
         &extension_dist.join("invocation_context.js"),
         0o644,
@@ -1964,6 +1970,7 @@ fn validate_vsix_archive(path: &Path) -> Result<()> {
         "extension.vsixmanifest",
         "extension/package.json",
         "extension/dist/extension.js",
+        "extension/dist/confirmation.js",
         "extension/dist/invocation_context.js",
         "extension/skills/visible-browser-lab/SKILL.md",
     ] {
