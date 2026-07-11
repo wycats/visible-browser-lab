@@ -70,6 +70,8 @@ The expiry sweep closes every cleanup-owned target associated with the expiring 
 
 Before an asynchronous close, the registry reserves the target. Claims fail while the reservation exists. A successful close or an already-missing target clears provenance and records the existing closed-target tombstone. A failed close releases the reservation and cleanup provenance so the surviving target is claimable rather than permanently stranded or repeatedly retried without a session owner.
 
+Closing the final VBL-created page in a VBL-managed Chrome instance closes that managed browser when only Chrome-synthesized replacement targets remain, rather than leaving replacement New Tab windows behind. The next browser operation relaunches Chrome lazily. External CDP runtimes retain their existing lifecycle, and VBL does not close a managed browser while another independently created page target remains.
+
 ## Compatibility
 
 Existing `release_tab` calls remain schema-valid and still leave the target visible immediately. Their longer-term behavior changes: a VBL-created target may close when its session expires unless the caller supplies the explicit preservation signal. This is the intended bug fix.

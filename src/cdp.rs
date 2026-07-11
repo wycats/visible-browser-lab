@@ -17,6 +17,7 @@ use chromiumoxide::{
             accessibility::{
                 AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
             },
+            browser::CloseParams as BrowserCloseParams,
             dom::{
                 BackendNodeId, DescribeNodeParams, GetBoxModelParams, GetContentQuadsParams,
                 GetDocumentParams, PushNodesByBackendIdsToFrontendParams, QuerySelectorAllParams,
@@ -331,6 +332,18 @@ impl CdpClient {
                     .browser
                     .execute(CloseTargetParams::new(TargetId::new(target_id))),
                 "close Chrome target",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn close_browser(&self) -> Result<(), BrowserToolError> {
+        let connection = self.runtime.connection().await?;
+        self.runtime
+            .browser_command(
+                &connection,
+                connection.browser.execute(BrowserCloseParams::default()),
+                "close Chrome",
             )
             .await?;
         Ok(())

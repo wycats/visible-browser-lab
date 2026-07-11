@@ -50,8 +50,6 @@ mod macos {
     };
 
     use anyhow::{Context, Result, bail};
-    use chromiumoxide::Browser;
-    use futures_util::StreamExt;
     use serde_json::json;
     use visible_browser_lab_test_support::{
         FixtureServer, McpClient, OpenTab, chrome_for_testing_executable, field_str,
@@ -281,6 +279,7 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
+        wait_until_unhealthy(&first_endpoint)?;
 
         client.shutdown();
         terminate_broker(state.path())?;
@@ -294,11 +293,8 @@ mod macos {
             false,
         )?;
         let restarted_session_id = field_str(&restarted_session, "agent_session_id")?;
-        assert_eq!(read_active_endpoint(state.path())?, first_endpoint);
         assert_frontmost(&original_frontmost, "broker restart and browser reuse")?;
 
-        close_browser(&first_endpoint)?;
-        wait_until_unhealthy(&first_endpoint)?;
         let replacement = restarted.call_tool(
             "new_tab",
             json!({
@@ -329,8 +325,74 @@ mod macos {
             Duration::from_secs(20),
             false,
         )?;
-        close_browser(&replacement_endpoint)?;
+        wait_until_unhealthy(&replacement_endpoint)?;
         restarted.shutdown();
+        drop(cleanup);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "launches visible managed Chrome to verify final-window cleanup"]
+    fn closing_all_managed_tabs_does_not_leave_replacement_windows() -> Result<()> {
+        let original_frontmost = frontmost_application()?;
+        let state = tempfile::Builder::new()
+            .prefix("vbl-managed-close-")
+            .tempdir_in("/tmp")?;
+        let cleanup = Cleanup {
+            state_dir: state.path().to_path_buf(),
+            original_frontmost,
+        };
+        let chrome = chrome_for_testing_executable()?;
+        let mut client =
+            McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &chrome)?;
+        client.initialize("visible-browser-lab-managed-close")?;
+
+        let session = client.call_tool(
+            "start_session",
+            json!({
+                "label": "managed-close",
+                "start_url": "about:blank",
+                "focus": false
+            }),
+            Duration::from_secs(45),
+            false,
+        )?;
+        let session_id = field_str(&session, "agent_session_id")?;
+        let first = OpenTab::from_summary(
+            &session_id,
+            session.get("tab").context("start_session omitted tab")?,
+        )?;
+        let second_result = client.call_tool(
+            "new_tab",
+            json!({
+                "agent_session_id": session_id,
+                "url": "about:blank",
+                "focus": false
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let second = OpenTab::from_summary(
+            &session_id,
+            second_result.get("tab").context("new_tab omitted tab")?,
+        )?;
+        let endpoint = read_active_endpoint(state.path())?;
+
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": first.tab_id }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        client.call_tool(
+            "close_tab",
+            json!({ "agent_session_id": session_id, "tab_id": second.tab_id }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        wait_until_unhealthy(&endpoint)?;
+
+        client.shutdown();
         drop(cleanup);
         Ok(())
     }
@@ -419,22 +481,6 @@ mod macos {
             thread::sleep(Duration::from_millis(50));
         }
         Ok(())
-    }
-
-    fn close_browser(endpoint: &str) -> Result<()> {
-        tokio::runtime::Runtime::new()?.block_on(async {
-            let (mut browser, mut handler) = Browser::connect(endpoint).await?;
-            let handler_task = tokio::spawn(async move {
-                while let Some(result) = handler.next().await {
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            });
-            let _ = browser.close().await;
-            let _ = tokio::time::timeout(Duration::from_secs(5), handler_task).await;
-            Ok::<(), anyhow::Error>(())
-        })
     }
 
     fn wait_until_unhealthy(endpoint: &str) -> Result<()> {

@@ -721,6 +721,8 @@ enum BrowserBackend {
 struct ManagedBrowserBackend {
     config: RuntimeConfig,
     client: Arc<AsyncMutex<Option<(String, CdpClient)>>>,
+    page_lifecycle: Arc<AsyncMutex<()>>,
+    synthetic_replacement_targets: Arc<AsyncMutex<HashSet<String>>>,
 }
 
 impl ManagedBrowserBackend {
@@ -728,6 +730,8 @@ impl ManagedBrowserBackend {
         Self {
             config,
             client: Arc::new(AsyncMutex::new(None)),
+            page_lifecycle: Arc::new(AsyncMutex::new(())),
+            synthetic_replacement_targets: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -759,6 +763,13 @@ impl ManagedBrowserBackend {
             .map(|(endpoint, _)| endpoint.clone())
             .unwrap_or_default()
     }
+}
+
+fn is_managed_replacement_target(target: &CdpTarget) -> bool {
+    matches!(
+        target.url.as_str(),
+        "about:blank" | "chrome://newtab/" | "chrome://new-tab-page/"
+    )
 }
 
 impl BrowserBackend {
@@ -816,8 +827,14 @@ impl BrowserBackend {
             Self::Fake(browser) => Ok(browser.lock().unwrap().create_page(url, focus)),
             Self::External(client) => client.create_page(url, focus).await,
             Self::Managed(browser) => {
+                let _page_lifecycle = browser.page_lifecycle.lock().await;
                 let client = browser.client().await?;
                 let target = client.create_page(url, false).await?;
+                browser
+                    .synthetic_replacement_targets
+                    .lock()
+                    .await
+                    .remove(&target.id);
                 if focus {
                     client.activate_target(&target.id).await?;
                     activate_managed_chrome_if_available(&browser.config);
@@ -873,7 +890,53 @@ impl BrowserBackend {
         match self {
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().close_target(target_id),
-            _ => self.cdp_client().await?.close_target(target_id).await,
+            Self::External(client) => client.close_target(target_id).await,
+            Self::Managed(browser) => {
+                let _page_lifecycle = browser.page_lifecycle.lock().await;
+                let client = browser.client().await?;
+                let before = client
+                    .page_targets()
+                    .await?
+                    .into_iter()
+                    .map(|target| target.id)
+                    .collect::<HashSet<_>>();
+                client.close_target(target_id).await?;
+
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let targets = loop {
+                    let targets = client.page_targets().await?;
+                    if targets.iter().all(|target| target.id != target_id)
+                        || Instant::now() >= deadline
+                    {
+                        break targets;
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                };
+
+                let current_ids = targets
+                    .iter()
+                    .map(|target| target.id.clone())
+                    .collect::<HashSet<_>>();
+                let mut synthetic = browser.synthetic_replacement_targets.lock().await;
+                synthetic.remove(target_id);
+                for target in &targets {
+                    if !before.contains(&target.id) && is_managed_replacement_target(target) {
+                        synthetic.insert(target.id.clone());
+                    }
+                }
+                synthetic.retain(|target| current_ids.contains(target));
+                let only_synthetic_replacements = targets.iter().all(|target| {
+                    synthetic.contains(&target.id) && is_managed_replacement_target(target)
+                });
+                drop(synthetic);
+
+                if only_synthetic_replacements {
+                    client.close_browser().await?;
+                    *browser.client.lock().await = None;
+                    browser.synthetic_replacement_targets.lock().await.clear();
+                }
+                Ok(())
+            }
         }
     }
 
@@ -6782,6 +6845,25 @@ mod tests {
         BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(
             FakeBrowser::with_targets(targets),
         ))))
+    }
+
+    #[test]
+    fn managed_replacement_target_classification_is_narrow() {
+        for url in ["about:blank", "chrome://newtab/", "chrome://new-tab-page/"] {
+            let mut target = fake_target("replacement");
+            target.url = url.to_string();
+            assert!(is_managed_replacement_target(&target), "{url}");
+        }
+
+        for url in [
+            "data:text/html,hello",
+            "https://example.com",
+            "chrome://settings/",
+        ] {
+            let mut target = fake_target("human");
+            target.url = url.to_string();
+            assert!(!is_managed_replacement_target(&target), "{url}");
+        }
     }
 
     #[test]
