@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -292,6 +292,31 @@ mod tests {
         assert!(
             response.contains(r#"{"ok":true}"#),
             "real request must be served while silent sockets are open: {response}"
+        );
+    }
+
+    #[test]
+    fn fixture_server_stop_rejects_requests_from_preconnected_sockets() {
+        let mut server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+        let mut stream = TcpStream::connect(&address).expect("preconnect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        thread::sleep(Duration::from_millis(100));
+
+        server.stop();
+        stream
+            .write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n")
+            .expect("write request after stop");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("stopped preconnect closes");
+
+        assert!(
+            !response.contains("200 OK"),
+            "a stopped fixture must not serve an accepted preconnect: {response}"
         );
     }
 
@@ -1291,6 +1316,7 @@ pub fn wait_for_network_event(
 pub struct FixtureServer {
     address: std::net::SocketAddr,
     base_url: String,
+    accepting: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -1308,6 +1334,8 @@ impl FixtureServer {
         let address = listener
             .local_addr()
             .context("failed to read fixture server address")?;
+        let accepting = Arc::new(AtomicBool::new(true));
+        let accepting_connections = Arc::clone(&accepting);
         let (stop_tx, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
             loop {
@@ -1321,7 +1349,8 @@ impl FixtureServer {
                         // speculative preconnect sockets that never send a request;
                         // handling connections serially lets one silent socket wedge
                         // the accept loop and time out every navigation.
-                        thread::spawn(move || handle_fixture_connection(stream));
+                        let accepting = Arc::clone(&accepting_connections);
+                        thread::spawn(move || handle_fixture_connection(stream, accepting));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
@@ -1334,6 +1363,7 @@ impl FixtureServer {
         Ok(Self {
             address,
             base_url: format!("http://{address}"),
+            accepting,
             stop: Some(stop_tx),
             thread: Some(thread),
         })
@@ -1344,6 +1374,7 @@ impl FixtureServer {
     }
 
     pub fn stop(&mut self) {
+        self.accepting.store(false, Ordering::Release);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -1368,7 +1399,7 @@ impl Drop for FixtureServer {
     }
 }
 
-fn handle_fixture_connection(mut stream: TcpStream) {
+fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) {
     // Accepted sockets inherit the listener's non-blocking flag on some
     // platforms; switch to blocking reads with a timeout so speculative
     // preconnect sockets that never send bytes release the thread.
@@ -1459,6 +1490,9 @@ document.querySelector('#prompt-form').addEventListener('submit', async (event) 
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    if !accepting.load(Ordering::Acquire) {
+        return;
+    }
     let _ = stream.write_all(response.as_bytes());
 }
 
