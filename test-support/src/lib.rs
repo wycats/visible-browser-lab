@@ -311,7 +311,9 @@ mod tests {
         let accepts_closed_connection = |error: &std::io::Error| {
             matches!(
                 error.kind(),
-                std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
             )
         };
         let write_result = stream.write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n");
