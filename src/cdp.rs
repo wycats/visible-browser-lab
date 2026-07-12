@@ -69,7 +69,7 @@ use chromiumoxide::{
         js_protocol::runtime::{
             CallArgument, CallFunctionOnParams, DisableParams as RuntimeDisableParams,
             DiscardConsoleEntriesParams, EnableParams as RuntimeEnableParams,
-            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled,
+            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled, ExecutionContextId,
             ReleaseObjectGroupParams, RemoteObjectId,
         },
     },
@@ -281,11 +281,15 @@ impl CdpClient {
     }
 
     pub async fn page_target(&self, target_id: &str) -> Result<CdpTarget, BrowserToolError> {
-        self.page_targets()
+        let target = self
+            .page_targets()
             .await?
             .into_iter()
-            .find(|target| target.id == target_id)
-            .ok_or_else(|| BrowserToolError::target_missing_for_target(target_id))
+            .find(|target| target.id == target_id);
+        if target.is_none() {
+            self.runtime.forget_stale_page_context(target_id);
+        }
+        target.ok_or_else(|| BrowserToolError::target_missing_for_target(target_id))
     }
 
     pub async fn activate_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
@@ -336,6 +340,7 @@ impl CdpClient {
                 "close Chrome target",
             )
             .await?;
+        self.runtime.forget_stale_page_context(target_id);
         Ok(())
     }
 
@@ -1317,14 +1322,27 @@ impl CdpClient {
         expression: &str,
     ) -> Result<EvaluateResult, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let result = match page.evaluate_expression(expression).await {
+        let context_id = match page.execution_context().await {
+            Ok(context_id) => context_id,
+            Err(error) => {
+                return Err(self
+                    .runtime
+                    .page_error(&connection, "read evaluate execution context", error)
+                    .await);
+            }
+        };
+        let mut params = RuntimeEvaluateParams::new(expression);
+        params.context_id = context_id;
+        let result = match page.evaluate_expression(params).await {
             Ok(result) => result,
             Err(error) => {
                 if stale_execution_context(&error) {
+                    self.runtime.mark_stale_page_context(&target.id, context_id);
                     tracing::warn!(
                         target_id = %target.id,
                         generation = connection.generation,
-                        "Chrome discarded the page execution context; preserving the shared CDP connection without replaying the caller expression"
+                        context_id = ?context_id,
+                        "Chrome discarded the page execution context; requiring a fresh context for this target while preserving the shared CDP connection and not replaying the caller expression"
                     );
                 }
                 return Err(self
@@ -3268,17 +3286,61 @@ impl CdpClient {
         let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
         loop {
             match connection.browser.get_page(TargetId::new(target_id)).await {
-                Ok(page) => return Ok((page, connection)),
+                Ok(page) => {
+                    self.wait_for_fresh_page_context(target_id, &page, &connection)
+                        .await?;
+                    return Ok((page, connection));
+                }
                 Err(CdpError::NotFound) if Instant::now() < deadline => {
                     sleep(PAGE_DISCOVERY_RETRY).await;
                 }
                 Err(CdpError::NotFound) => {
+                    self.runtime.forget_stale_page_context(target_id);
                     return Err(BrowserToolError::target_missing_for_target(target_id));
                 }
                 Err(error) => {
                     return Err(self
                         .runtime
                         .page_error(&connection, "open Chrome target session", error)
+                        .await);
+                }
+            }
+        }
+    }
+
+    async fn wait_for_fresh_page_context(
+        &self,
+        target_id: &str,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<(), BrowserToolError> {
+        let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
+        loop {
+            let Some(stale) = self.runtime.stale_page_context(target_id) else {
+                return Ok(());
+            };
+            match page.execution_context().await {
+                Ok(context_id) if fresh_page_context_observed(&stale, context_id) => {
+                    if self
+                        .runtime
+                        .clear_stale_page_context_if_unchanged(target_id, stale.revision)
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(_) if Instant::now() < deadline => sleep(PAGE_DISCOVERY_RETRY).await,
+                Ok(_) => {
+                    return Err(BrowserToolError::chrome_unavailable(format!(
+                        "Chrome target `{target_id}` did not expose a fresh execution context after page churn"
+                    )));
+                }
+                Err(error) if stale_execution_context(&error) && Instant::now() < deadline => {
+                    sleep(PAGE_DISCOVERY_RETRY).await;
+                }
+                Err(error) => {
+                    return Err(self
+                        .runtime
+                        .page_error(connection, "wait for fresh page execution context", error)
                         .await);
                 }
             }
@@ -3575,6 +3637,27 @@ struct CdpRuntime {
     /// consult this registry instead of trusting the page while a cast's
     /// override is engaged.
     screencast_focus_overrides: Arc<StdMutex<HashSet<String>>>,
+    /// Main-world contexts that Chrome discarded during a caller evaluation,
+    /// keyed by target so page churn in one tab cannot abort other tabs'
+    /// event streams. The next page-scoped call for that target must observe a
+    /// different context before it can proceed.
+    stale_page_contexts: StdMutex<BTreeMap<String, StalePageContext>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StalePageContext {
+    ids: HashSet<ExecutionContextId>,
+    saw_missing: bool,
+    revision: u64,
+}
+
+fn fresh_page_context_observed(
+    stale: &StalePageContext,
+    context_id: Option<ExecutionContextId>,
+) -> bool {
+    context_id.is_some_and(|context_id| {
+        (stale.saw_missing || !stale.ids.is_empty()) && !stale.ids.contains(&context_id)
+    })
 }
 
 #[derive(Debug, Default)]
@@ -3602,7 +3685,44 @@ impl CdpRuntime {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
             screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
+            stale_page_contexts: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    fn mark_stale_page_context(&self, target_id: &str, context_id: Option<ExecutionContextId>) {
+        let mut contexts = self.stale_page_contexts.lock().unwrap();
+        let stale = contexts.entry(target_id.to_string()).or_default();
+        stale.revision = stale.revision.wrapping_add(1);
+        if let Some(context_id) = context_id {
+            stale.ids.insert(context_id);
+        } else {
+            stale.saw_missing = true;
+        }
+    }
+
+    fn stale_page_context(&self, target_id: &str) -> Option<StalePageContext> {
+        self.stale_page_contexts
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()
+    }
+
+    fn clear_stale_page_context_if_unchanged(&self, target_id: &str, revision: u64) -> bool {
+        let mut contexts = self.stale_page_contexts.lock().unwrap();
+        if contexts
+            .get(target_id)
+            .is_some_and(|stale| stale.revision == revision)
+        {
+            contexts.remove(target_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn forget_stale_page_context(&self, target_id: &str) {
+        self.stale_page_contexts.lock().unwrap().remove(target_id);
     }
 
     async fn connection(&self) -> Result<RuntimeConnection, BrowserToolError> {
@@ -4584,6 +4704,56 @@ mod tests {
         let transport = CdpError::NoResponse;
         assert!(retryable_page_error(&transport));
         assert!(invalidates_connection(&transport));
+    }
+
+    #[test]
+    fn stale_page_context_markers_are_target_local() {
+        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
+        runtime.mark_stale_page_context("target-a", Some(ExecutionContextId::new(7)));
+
+        let marker = runtime.stale_page_context("target-a").unwrap();
+        assert!(marker.ids.contains(&ExecutionContextId::new(7)));
+        assert!(runtime.stale_page_context("target-b").is_none());
+    }
+
+    #[test]
+    fn stale_page_context_requires_a_different_main_world() {
+        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
+        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(7)));
+        let marker = runtime.stale_page_context("target").unwrap();
+
+        assert!(!fresh_page_context_observed(
+            &marker,
+            Some(ExecutionContextId::new(7))
+        ));
+        assert!(fresh_page_context_observed(
+            &marker,
+            Some(ExecutionContextId::new(8))
+        ));
+        assert!(!fresh_page_context_observed(&marker, None));
+
+        runtime.mark_stale_page_context("missing", None);
+        let missing = runtime.stale_page_context("missing").unwrap();
+        assert!(fresh_page_context_observed(
+            &missing,
+            Some(ExecutionContextId::new(7))
+        ));
+        assert!(!fresh_page_context_observed(&missing, None));
+    }
+
+    #[test]
+    fn newer_stale_page_context_prevents_an_old_barrier_from_clearing() {
+        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
+        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(7)));
+        let first = runtime.stale_page_context("target").unwrap();
+        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(8)));
+
+        assert!(!runtime.clear_stale_page_context_if_unchanged("target", first.revision));
+        let latest = runtime.stale_page_context("target").unwrap();
+        assert!(latest.ids.contains(&ExecutionContextId::new(7)));
+        assert!(latest.ids.contains(&ExecutionContextId::new(8)));
+        assert!(runtime.clear_stale_page_context_if_unchanged("target", latest.revision));
+        assert!(runtime.stale_page_context("target").is_none());
     }
 
     #[test]
