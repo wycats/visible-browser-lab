@@ -344,9 +344,14 @@ mod tests {
         let _silent = TcpStream::connect(&address).expect("silent preconnect");
         thread::sleep(Duration::from_millis(100));
 
+        let started = Instant::now();
         server
             .restart()
             .expect("fixture server rebinds its original address");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "fixture restart must wake silent preconnect handlers promptly"
+        );
         assert_eq!(server.base_url, format!("http://{address}"));
     }
 
@@ -1448,7 +1453,7 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
         return;
     }
     if stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(100)))
         .is_err()
     {
         return;
@@ -1457,6 +1462,9 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0; 2048];
     let request = loop {
+        if !accepting.load(Ordering::Acquire) {
+            return;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return,
             Ok(bytes) => {
@@ -1467,6 +1475,14 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
                 if buffer.len() > 16 * 1024 {
                     return;
                 }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
             }
             Err(_) => return,
         }

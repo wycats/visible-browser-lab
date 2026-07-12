@@ -70,7 +70,7 @@ pub async fn ensure_managed_chrome(
     }
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
-    if let Some(endpoint) = healthy_active_endpoint(config).await {
+    if let Some(endpoint) = healthy_owned_active_endpoint(config).await? {
         let executable = discover_chrome(config.chrome_path.as_deref())
             .ok()
             .map(|installation| installation.executable);
@@ -296,6 +296,17 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
         .then_some(endpoint.http_url)
 }
 
+async fn healthy_owned_active_endpoint(config: &RuntimeConfig) -> Result<Option<String>> {
+    let Some(endpoint) = healthy_active_endpoint(config).await else {
+        return Ok(None);
+    };
+    let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+    if profile_is_available(&profile_lock).await? {
+        return Ok(None);
+    }
+    Ok(Some(endpoint))
+}
+
 async fn wait_for_active_endpoint_or_profile_release(
     config: &RuntimeConfig,
 ) -> Result<Option<String>> {
@@ -306,14 +317,11 @@ async fn wait_for_active_endpoint_or_profile_release(
 
     let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
     loop {
-        if let Some(endpoint) = healthy_active_endpoint(config).await {
+        if let Some(endpoint) = healthy_owned_active_endpoint(config).await? {
             // The endpoint can answer during browser shutdown or after a
             // rapid port reuse. Only reuse it while the managed profile is
             // still demonstrably owned; a released profile must follow the
             // stale-port cleanup and fresh-launch path instead.
-            if profile_is_available(&profile_lock).await? {
-                return Ok(None);
-            }
             tracing::info!(
                 endpoint,
                 profile = %config.chrome_profile_dir.display(),
@@ -1245,6 +1253,53 @@ mod tests {
                 .unwrap(),
             None
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declines_an_initial_healthy_endpoint_after_its_profile_is_released() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        tokio::fs::write(&profile_lock, b"active").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/initial-shutdown\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            tokio::fs::remove_file(profile_lock).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/initial-shutdown"}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(healthy_owned_active_endpoint(&config).await.unwrap(), None);
         server.await.unwrap();
     }
 
