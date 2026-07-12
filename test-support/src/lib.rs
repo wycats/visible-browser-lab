@@ -310,14 +310,21 @@ mod tests {
             .write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n")
             .expect("write request after stop");
         let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("stopped preconnect closes");
+        let read_result = stream.read_to_string(&mut response);
 
         assert!(
             !response.contains("200 OK"),
             "a stopped fixture must not serve an accepted preconnect: {response}"
         );
+        if let Err(error) = read_result {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                ),
+                "stopped preconnect must close cleanly or reset: {error}"
+            );
+        }
     }
 
     #[test]
