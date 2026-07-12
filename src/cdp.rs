@@ -70,7 +70,8 @@ use chromiumoxide::{
             CallArgument, CallFunctionOnParams, DisableParams as RuntimeDisableParams,
             DiscardConsoleEntriesParams, EnableParams as RuntimeEnableParams,
             EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled,
-            ReleaseObjectGroupParams, RemoteObjectId,
+            EventExecutionContextCreated, ExecutionContextDescription, ReleaseObjectGroupParams,
+            RemoteObjectId,
         },
     },
     error::CdpError,
@@ -281,11 +282,15 @@ impl CdpClient {
     }
 
     pub async fn page_target(&self, target_id: &str) -> Result<CdpTarget, BrowserToolError> {
-        self.page_targets()
+        let target = self
+            .page_targets()
             .await?
             .into_iter()
-            .find(|target| target.id == target_id)
-            .ok_or_else(|| BrowserToolError::target_missing_for_target(target_id))
+            .find(|target| target.id == target_id);
+        if target.is_none() {
+            self.runtime.forget_stale_page_context(target_id);
+        }
+        target.ok_or_else(|| BrowserToolError::target_missing_for_target(target_id))
     }
 
     pub async fn activate_target(&self, target_id: &str) -> Result<(), BrowserToolError> {
@@ -336,6 +341,7 @@ impl CdpClient {
                 "close Chrome target",
             )
             .await?;
+        self.runtime.forget_stale_page_context(target_id);
         Ok(())
     }
 
@@ -365,10 +371,14 @@ impl CdpClient {
         })?;
         let (page, connection) = self.page(&target.id).await?;
         let original_href = if before_unload == Some("accept") {
-            let value = page
-                .evaluate_expression("location.href")
-                .await
-                .map_err(|error| map_cdp_error("read pre-navigation URL", &error))?;
+            let value = self
+                .runtime
+                .page_command(
+                    &connection,
+                    page.evaluate_expression("location.href"),
+                    "read pre-navigation URL",
+                )
+                .await?;
             Some(value.into_value::<String>().map_err(|error| {
                 BrowserToolError::chrome_unavailable(format!(
                     "Chrome returned an invalid pre-navigation URL: {error}"
@@ -551,10 +561,14 @@ impl CdpClient {
                     .loader_id
                     .as_ref()
                     .to_string();
-                let ready_state = page
-                    .evaluate_expression("document.readyState")
-                    .await
-                    .map_err(|cdp_error| map_cdp_error("read document readiness", &cdp_error))?
+                let ready_state = self
+                    .runtime
+                    .page_command(
+                        connection,
+                        page.evaluate_expression("document.readyState"),
+                        "read document readiness",
+                    )
+                    .await?
                     .into_value::<String>()
                     .map_err(|value_error| {
                         BrowserToolError::chrome_unavailable(format!(
@@ -746,13 +760,17 @@ impl CdpClient {
         // a fresh attachment proves both a changed URL and a usable document.
         let recovery = async {
             loop {
-                let (page, _) = self.page(target_id).await?;
-                let value = page
-                    .evaluate_expression(
-                        "({ href: location.href, readyState: document.readyState })",
+                let (page, connection) = self.page(target_id).await?;
+                let value = self
+                    .runtime
+                    .page_command(
+                        &connection,
+                        page.evaluate_expression(
+                            "({ href: location.href, readyState: document.readyState })",
+                        ),
+                        "verify recovered navigation",
                     )
-                    .await
-                    .map_err(|error| map_cdp_error("verify recovered navigation", &error))?
+                    .await?
                     .into_value::<Value>()
                     .map_err(|error| {
                         BrowserToolError::chrome_unavailable(format!(
@@ -879,7 +897,7 @@ impl CdpClient {
                             "navigate browser history",
                         )
                         .await?;
-                    self.wait_for_history_entry(&page, &connection, index, wait_until, timeout_ms)
+                    self.wait_for_history_entry(&target.id, index, wait_until, timeout_ms)
                         .await
                 }
                 _ => unreachable!("history wait state was validated before navigation"),
@@ -901,22 +919,29 @@ impl CdpClient {
 
     async fn wait_for_history_entry(
         &self,
-        page: &Page,
-        connection: &RuntimeConnection,
+        target_id: &str,
         expected_index: i64,
         wait_until: &str,
         timeout_ms: u64,
     ) -> Result<(), BrowserToolError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let history = self
-                .runtime
-                .page_command(
-                    connection,
-                    page.execute(GetNavigationHistoryParams::default()),
-                    "observe browser history navigation",
-                )
-                .await?;
+            let (page, connection) = self.page(target_id).await?;
+            let history = match page.execute(GetNavigationHistoryParams::default()).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let retry = retryable_page_error(&error) && Instant::now() < deadline;
+                    let mapped = self
+                        .runtime
+                        .page_error(&connection, "observe browser history navigation", error)
+                        .await;
+                    if retry {
+                        sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return Err(mapped);
+                }
+            };
             if history.result.current_index == expected_index {
                 let ready_state = match page.evaluate_expression("document.readyState").await {
                     Ok(value) => value.into_value::<String>().map_err(|error| {
@@ -924,12 +949,30 @@ impl CdpClient {
                             "Chrome returned an invalid document state: {error}"
                         ))
                     })?,
+                    Err(error) if retryable_page_error(&error) => {
+                        if stale_execution_context(&error) {
+                            self.runtime.mark_stale_page_context(target_id);
+                        }
+                        let retry = Instant::now() < deadline;
+                        let mapped = self
+                            .runtime
+                            .page_error(&connection, "read history document state", error)
+                            .await;
+                        if retry {
+                            sleep(Duration::from_millis(25)).await;
+                            continue;
+                        }
+                        return Err(mapped);
+                    }
                     Err(_) if Instant::now() < deadline => {
                         sleep(Duration::from_millis(25)).await;
                         continue;
                     }
                     Err(error) => {
-                        return Err(map_cdp_error("read history document state", &error));
+                        return Err(self
+                            .runtime
+                            .page_error(&connection, "read history document state", error)
+                            .await);
                     }
                 };
                 let ready = match wait_until {
@@ -967,6 +1010,15 @@ impl CdpClient {
                 .await?;
         }
         let navigation = async {
+            // Keep the loader preflight inside the navigation watchdog and
+            // dialog-policy scope. A stale target must honor timeout_ms, and a
+            // preflight failure after temporarily clearing beforeunload
+            // handlers must flow through the normal restoration path.
+            let original_loader_id = if wait_until == "none" {
+                None
+            } else {
+                Some(self.main_frame_loader_id(&page, &connection).await?)
+            };
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
             match wait_until {
@@ -982,8 +1034,16 @@ impl CdpClient {
                     self.runtime
                         .page_command(&connection, command(), "reload page")
                         .await?;
-                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "DOMContentLoaded")
-                        .await
+                    let result = self
+                        .wait_for_lifecycle_event(&mut events, timeout_ms, "DOMContentLoaded")
+                        .await;
+                    self.recover_completed_reload(
+                        &target.id,
+                        original_loader_id.as_deref().unwrap(),
+                        "DOMContentLoaded",
+                        result,
+                    )
+                    .await
                 }
                 "load" | "network_idle" => {
                     let mut events = self
@@ -992,8 +1052,16 @@ impl CdpClient {
                     self.runtime
                         .page_command(&connection, command(), "reload page")
                         .await?;
-                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "load")
-                        .await
+                    let result = self
+                        .wait_for_lifecycle_event(&mut events, timeout_ms, "load")
+                        .await;
+                    self.recover_completed_reload(
+                        &target.id,
+                        original_loader_id.as_deref().unwrap(),
+                        "load",
+                        result,
+                    )
+                    .await
                 }
                 _ => unreachable!("reload wait state was validated before navigation"),
             }
@@ -1010,6 +1078,52 @@ impl CdpClient {
             .await;
         self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
+    }
+
+    async fn recover_completed_reload(
+        &self,
+        target_id: &str,
+        original_loader_id: &str,
+        event_name: &str,
+        result: Result<(), BrowserToolError>,
+    ) -> Result<(), BrowserToolError> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if error.code != crate::leases::BrowserToolErrorCode::OperationTimeout {
+            return Err(error);
+        }
+
+        // Chrome can commit a reload while its lifecycle event is lost during
+        // target or renderer churn. Do not replay Page.reload. Reattach to the
+        // target and accept the original command only when Chrome proves a new
+        // loader reached the requested document state.
+        let (page, connection) = self.page(target_id).await?;
+        let committed_loader_id = self.main_frame_loader_id(&page, &connection).await?;
+        let ready_state = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression("document.readyState"),
+                "verify reloaded document readiness",
+            )
+            .await?
+            .into_value::<String>()
+            .map_err(|value_error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid reloaded document state: {value_error}"
+                ))
+            })?;
+        if completed_reload_reached_wait_state(
+            original_loader_id,
+            &committed_loader_id,
+            &ready_state,
+            event_name,
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     async fn finish_beforeunload_navigation(
@@ -1156,6 +1270,7 @@ impl CdpClient {
                 &format!(
                     r#"(() => {{ const matches=document.querySelectorAll({selector_json}); if(matches.length===0)return {{state:"not_found"}}; if(matches.length>1)return {{state:"ambiguous",count:matches.length}}; const e=matches[0]; e.scrollIntoView({{block:"center",inline:"center"}}); const r=e.getBoundingClientRect(),s=getComputedStyle(e); if(r.width<=0||r.height<=0||s.visibility==="hidden"||s.display==="none")return {{state:"hidden"}}; return {{state:"ready",x:r.left,y:r.top,width:r.width,height:r.height}}; }})()"#
                 ),
+                true,
             )
             .await?
             .value
@@ -1210,18 +1325,52 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
         expression: &str,
+        await_promise: bool,
     ) -> Result<EvaluateResult, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
-        let result = match page.evaluate_expression(expression).await {
-            Ok(result) => result,
+        let action_lock = self.runtime.target_action_lock(&target.id);
+        let _action = action_lock.lock().await;
+        let context = self
+            .refresh_main_world_context(
+                &target.id,
+                &page,
+                &connection,
+                Instant::now() + PAGE_DISCOVERY_TIMEOUT,
+            )
+            .await?;
+        let mut params = RuntimeEvaluateParams::new(expression);
+        params.unique_context_id = Some(context.unique_id.clone());
+        params.await_promise = Some(await_promise);
+        params.return_by_value = Some(true);
+        let result = match page.execute(params).await {
+            Ok(result) => result.result,
             Err(error) => {
+                if stale_execution_context(&error) {
+                    self.runtime.mark_stale_page_context(&target.id);
+                    tracing::warn!(
+                        target_id = %target.id,
+                        generation = connection.generation,
+                        context_unique_id = %context.unique_id,
+                        "Chrome discarded the page execution context; requiring a fresh context for this target while preserving the shared CDP connection and not replaying the caller expression"
+                    );
+                }
                 return Err(self
                     .runtime
                     .page_error(&connection, "evaluate", error)
                     .await);
             }
         };
-        let remote = result.object();
+        if let Some(details) = result.exception_details {
+            return Err(self
+                .runtime
+                .page_error(
+                    &connection,
+                    "evaluate",
+                    CdpError::JavascriptException(Box::new(details)),
+                )
+                .await);
+        }
+        let remote = result.result;
         Ok(EvaluateResult {
             value: remote.value.clone(),
             preview: remote
@@ -1380,10 +1529,16 @@ impl CdpClient {
         let (page, connection) = self.page(&target.id).await?;
         let selector_json = serde_json::to_string(selector)
             .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
-        let count = page
-            .evaluate_expression(format!("document.querySelectorAll({selector_json}).length"))
-            .await
-            .map_err(|error| map_cdp_error("resolve evaluation CSS target", &error))?
+        let count = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression(format!(
+                    "document.querySelectorAll({selector_json}).length"
+                )),
+                "resolve evaluation CSS target",
+            )
+            .await?
             .value()
             .and_then(Value::as_u64)
             .unwrap_or(0);
@@ -1833,7 +1988,7 @@ impl CdpClient {
 }})()"#
         );
         let result = self
-            .evaluate(target, &expression)
+            .evaluate(target, &expression, true)
             .await?
             .value
             .ok_or_else(|| {
@@ -2270,7 +2425,7 @@ impl CdpClient {
         expression: &str,
     ) -> Result<(), BrowserToolError> {
         let result = self
-            .evaluate(target, expression)
+            .evaluate(target, expression, true)
             .await?
             .value
             .ok_or_else(|| BrowserToolError::chrome_unavailable("CSS operation omitted result"))?;
@@ -2319,11 +2474,15 @@ impl CdpClient {
   return {{ state: "ready" }};
 }})()"#
         );
-        let (page, _connection) = self.page(&target.id).await?;
-        let result = page
-            .evaluate_expression(expression)
-            .await
-            .map_err(|error| map_cdp_error("fill CSS target", &error))?;
+        let (page, connection) = self.page(&target.id).await?;
+        let result = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression(expression),
+                "fill CSS target",
+            )
+            .await?;
         let result = result.value().cloned().ok_or_else(|| {
             BrowserToolError::chrome_unavailable("fill CSS target omitted result")
         })?;
@@ -3146,11 +3305,16 @@ impl CdpClient {
         let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
         loop {
             match connection.browser.get_page(TargetId::new(target_id)).await {
-                Ok(page) => return Ok((page, connection)),
+                Ok(page) => {
+                    self.wait_for_fresh_page_context(target_id, &page, &connection)
+                        .await?;
+                    return Ok((page, connection));
+                }
                 Err(CdpError::NotFound) if Instant::now() < deadline => {
                     sleep(PAGE_DISCOVERY_RETRY).await;
                 }
                 Err(CdpError::NotFound) => {
+                    self.runtime.forget_stale_page_context(target_id);
                     return Err(BrowserToolError::target_missing_for_target(target_id));
                 }
                 Err(error) => {
@@ -3161,6 +3325,93 @@ impl CdpClient {
                 }
             }
         }
+    }
+
+    async fn wait_for_fresh_page_context(
+        &self,
+        target_id: &str,
+        page: &Page,
+        connection: &RuntimeConnection,
+    ) -> Result<(), BrowserToolError> {
+        let action_lock = self.runtime.target_action_lock(target_id);
+        let _action = action_lock.lock().await;
+        let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
+        loop {
+            let Some(stale) = self.runtime.stale_page_context(target_id) else {
+                return Ok(());
+            };
+            self.refresh_main_world_context(target_id, page, connection, deadline)
+                .await?;
+            if self
+                .runtime
+                .clear_stale_page_context_if_unchanged(target_id, stale.revision)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn refresh_main_world_context(
+        &self,
+        target_id: &str,
+        page: &Page,
+        connection: &RuntimeConnection,
+        deadline: Instant,
+    ) -> Result<ExecutionContextDescription, BrowserToolError> {
+        let main_frame_id = self
+            .runtime
+            .page_command(
+                connection,
+                page.execute(GetFrameTreeParams::default()),
+                "read main frame before refreshing its execution context",
+            )
+            .await?
+            .result
+            .frame_tree
+            .frame
+            .id
+            .as_ref()
+            .to_string();
+        let mut contexts = self
+            .event_listener::<EventExecutionContextCreated>(page, connection)
+            .await?;
+        self.runtime
+            .page_command(
+                connection,
+                page.execute(RuntimeDisableParams::default()),
+                "disable target runtime before refreshing its execution context",
+            )
+            .await?;
+        self.runtime
+            .page_command(
+                connection,
+                page.execute(RuntimeEnableParams::default()),
+                "re-enable target runtime to refresh its execution context",
+            )
+            .await?;
+
+        let context = timeout(deadline.saturating_duration_since(Instant::now()), async {
+            while let Some(event) = contexts.next().await {
+                if is_main_world_context(&event, &main_frame_id) {
+                    return Some(event.context.clone());
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            BrowserToolError::chrome_unavailable(format!(
+                "Chrome target `{target_id}` did not report a current main-world execution context"
+            ))
+        })?;
+        tracing::debug!(
+            target_id,
+            context_unique_id = %context.unique_id,
+            "refreshed the target's main-world execution context"
+        );
+        Ok(context)
     }
 
     async fn event_listener<T>(
@@ -3453,6 +3704,29 @@ struct CdpRuntime {
     /// consult this registry instead of trusting the page while a cast's
     /// override is engaged.
     screencast_focus_overrides: Arc<StdMutex<HashSet<String>>>,
+    /// Main-world contexts that Chrome discarded during a caller evaluation,
+    /// keyed by target so page churn in one tab cannot abort other tabs'
+    /// event streams. The next page-scoped call for that target must observe a
+    /// different context before it can proceed.
+    stale_page_contexts: StdMutex<BTreeMap<String, StalePageContext>>,
+    /// Monotonic across marker removal and recreation so an older waiter can
+    /// never clear a newer stale-context report for the same target.
+    stale_page_context_revision: AtomicU64,
+    /// Serializes Runtime-domain refreshes and public evaluations within one
+    /// target without blocking operations or event streams on other targets.
+    target_action_locks: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StalePageContext {
+    revision: u64,
+}
+
+fn is_main_world_context(event: &EventExecutionContextCreated, main_frame_id: &str) -> bool {
+    event.context.aux_data.as_ref().is_some_and(|aux_data| {
+        aux_data.get("isDefault").and_then(Value::as_bool) == Some(true)
+            && aux_data.get("frameId").and_then(Value::as_str) == Some(main_frame_id)
+    })
 }
 
 #[derive(Debug, Default)]
@@ -3480,7 +3754,54 @@ impl CdpRuntime {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
             screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
+            stale_page_contexts: StdMutex::new(BTreeMap::new()),
+            stale_page_context_revision: AtomicU64::new(0),
+            target_action_locks: StdMutex::new(BTreeMap::new()),
         }
+    }
+
+    fn mark_stale_page_context(&self, target_id: &str) {
+        let revision = self
+            .stale_page_context_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let mut contexts = self.stale_page_contexts.lock().unwrap();
+        contexts.insert(target_id.to_string(), StalePageContext { revision });
+    }
+
+    fn target_action_lock(&self, target_id: &str) -> Arc<Mutex<()>> {
+        self.target_action_locks
+            .lock()
+            .unwrap()
+            .entry(target_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn stale_page_context(&self, target_id: &str) -> Option<StalePageContext> {
+        self.stale_page_contexts
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned()
+    }
+
+    fn clear_stale_page_context_if_unchanged(&self, target_id: &str, revision: u64) -> bool {
+        let mut contexts = self.stale_page_contexts.lock().unwrap();
+        if contexts
+            .get(target_id)
+            .is_some_and(|stale| stale.revision == revision)
+        {
+            contexts.remove(target_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn forget_stale_page_context(&self, target_id: &str) {
+        self.stale_page_contexts.lock().unwrap().remove(target_id);
+        self.target_action_locks.lock().unwrap().remove(target_id);
     }
 
     async fn connection(&self) -> Result<RuntimeConnection, BrowserToolError> {
@@ -3634,6 +3955,27 @@ fn invalidates_connection(error: &CdpError) -> bool {
     )
 }
 
+fn retryable_page_error(error: &CdpError) -> bool {
+    invalidates_connection(error) || stale_execution_context(error)
+}
+
+fn stale_execution_context(error: &CdpError) -> bool {
+    match error {
+        CdpError::Chrome(error) => {
+            error.code == -32000
+                && (error
+                    .message
+                    .contains("Cannot find context with specified id")
+                    || error.message.contains("Execution context was destroyed"))
+        }
+        CdpError::ChromeMessage(message) => {
+            message.contains("Cannot find context with specified id")
+                || message.contains("Execution context was destroyed")
+        }
+        _ => false,
+    }
+}
+
 fn map_cdp_error(operation: &str, error: &CdpError) -> BrowserToolError {
     match error {
         CdpError::JavascriptException(details) => {
@@ -3684,6 +4026,20 @@ fn committed_navigation_reached_wait_state(
         "load" => ready_state == "complete",
         _ => false,
     }
+}
+
+fn completed_reload_reached_wait_state(
+    original_loader_id: &str,
+    committed_loader_id: &str,
+    ready_state: &str,
+    event_name: &str,
+) -> bool {
+    original_loader_id != committed_loader_id
+        && match event_name {
+            "DOMContentLoaded" => matches!(ready_state, "interactive" | "complete"),
+            "load" => ready_state == "complete",
+            _ => false,
+        }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4379,6 +4735,106 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_reload_requires_a_new_ready_document_loader() {
+        assert!(completed_reload_reached_wait_state(
+            "old-loader",
+            "new-loader",
+            "complete",
+            "load"
+        ));
+        assert!(completed_reload_reached_wait_state(
+            "old-loader",
+            "new-loader",
+            "interactive",
+            "DOMContentLoaded"
+        ));
+        assert!(!completed_reload_reached_wait_state(
+            "same-loader",
+            "same-loader",
+            "complete",
+            "load"
+        ));
+        assert!(!completed_reload_reached_wait_state(
+            "old-loader",
+            "new-loader",
+            "loading",
+            "DOMContentLoaded"
+        ));
+    }
+
+    #[test]
+    fn stale_execution_context_is_page_local_and_retryable() {
+        let error = CdpError::Chrome(chromiumoxide::types::Error {
+            code: -32000,
+            message: "Cannot find context with specified id".to_string(),
+        });
+        assert!(stale_execution_context(&error));
+        assert!(retryable_page_error(&error));
+        assert!(!invalidates_connection(&error));
+
+        let ordinary = CdpError::Chrome(chromiumoxide::types::Error {
+            code: -32000,
+            message: "No node with given id found".to_string(),
+        });
+        assert!(!stale_execution_context(&ordinary));
+        assert!(!retryable_page_error(&ordinary));
+        assert!(!invalidates_connection(&ordinary));
+
+        let transport = CdpError::NoResponse;
+        assert!(retryable_page_error(&transport));
+        assert!(invalidates_connection(&transport));
+    }
+
+    #[test]
+    fn stale_page_context_markers_are_target_local() {
+        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
+        runtime.mark_stale_page_context("target-a");
+
+        assert!(runtime.stale_page_context("target-a").is_some());
+        assert!(runtime.stale_page_context("target-b").is_none());
+    }
+
+    #[test]
+    fn refreshed_context_must_be_the_main_frames_default_world() {
+        use chromiumoxide::cdp::js_protocol::runtime::{
+            ExecutionContextDescription, ExecutionContextId,
+        };
+
+        let event = |is_default: bool, frame_id: &str| {
+            let mut context = ExecutionContextDescription::new(
+                ExecutionContextId::new(7),
+                "https://example.test",
+                "",
+                "system-unique-context",
+            );
+            context.aux_data = Some(json!({
+                "isDefault": is_default,
+                "frameId": frame_id,
+            }));
+            EventExecutionContextCreated { context }
+        };
+
+        assert!(is_main_world_context(&event(true, "main"), "main"));
+        assert!(!is_main_world_context(&event(false, "main"), "main"));
+        assert!(!is_main_world_context(&event(true, "child"), "main"));
+    }
+
+    #[test]
+    fn newer_stale_page_context_prevents_an_old_barrier_from_clearing() {
+        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
+        runtime.mark_stale_page_context("target");
+        let first = runtime.stale_page_context("target").unwrap();
+        assert!(runtime.clear_stale_page_context_if_unchanged("target", first.revision));
+        runtime.mark_stale_page_context("target");
+
+        assert!(!runtime.clear_stale_page_context_if_unchanged("target", first.revision));
+        let latest = runtime.stale_page_context("target").unwrap();
+        assert_ne!(latest.revision, first.revision);
+        assert!(runtime.clear_stale_page_context_if_unchanged("target", latest.revision));
+        assert!(runtime.stale_page_context("target").is_none());
+    }
+
+    #[test]
     fn navigation_watchdog_leaves_time_for_lifecycle_recovery() {
         assert_eq!(
             navigation_timeout_budget(10_000, true),
@@ -4583,11 +5039,122 @@ mod tests {
             .find(|target| target.id == target_id)
             .expect("Chromiumoxide should register the pre-existing target");
         let result = client
-            .evaluate(&target, "document.location.href")
+            .evaluate(&target, "document.location.href", true)
             .await
             .unwrap();
 
         assert!(result.value.is_some());
+        chrome.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refreshes_one_targets_context_without_reconnecting_other_targets() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+        let stale_target = client
+            .create_page(Some("about:blank"), false)
+            .await
+            .unwrap();
+        let other_target = client
+            .create_page(Some("about:blank"), false)
+            .await
+            .unwrap();
+        let generation = client.runtime.connection().await.unwrap().generation;
+
+        client.runtime.mark_stale_page_context(&stale_target.id);
+        let refreshed = client
+            .evaluate(&stale_target, "'refreshed'", true)
+            .await
+            .unwrap();
+        let unaffected = client
+            .evaluate(&other_target, "'unaffected'", true)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.value, Some(json!("refreshed")));
+        assert_eq!(unaffected.value, Some(json!("unaffected")));
+        assert_eq!(
+            client.runtime.connection().await.unwrap().generation,
+            generation
+        );
+
+        let first = client.evaluate(&stale_target, "Promise.resolve('first')", true);
+        let second = client.evaluate(&stale_target, "Promise.resolve('second')", true);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().value, Some(json!("first")));
+        assert_eq!(second.unwrap().value, Some(json!("second")));
+
+        let non_awaiting = timeout(
+            Duration::from_secs(2),
+            client.evaluate(&stale_target, "new Promise(() => {})", false),
+        )
+        .await
+        .expect("await_promise=false must not wait for a pending promise")
+        .unwrap();
+        assert!(non_awaiting.value.is_some());
+        chrome.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "launches isolated headless Chrome to stress localhost server churn"]
+    async fn keeps_a_target_usable_across_localhost_server_restarts() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fixture = visible_browser_lab_test_support::FixtureServer::start().unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+        let target = client
+            .create_page(Some(&fixture.url("/managed")), false)
+            .await
+            .unwrap();
+        let target_id = target.id.clone();
+
+        for iteration in 0..20 {
+            fixture.stop();
+            let _ = client
+                .navigate(
+                    &target,
+                    &fixture.url(&format!("/offline-{iteration}")),
+                    Some("none"),
+                    5_000,
+                    None,
+                )
+                .await;
+            fixture.restart().unwrap();
+            client
+                .navigate(
+                    &target,
+                    &fixture.url(&format!("/online-{iteration}")),
+                    Some("dom_content_loaded"),
+                    10_000,
+                    None,
+                )
+                .await
+                .unwrap();
+            let result = client
+                .evaluate(&target, "document.title", true)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.value.as_ref().and_then(Value::as_str),
+                Some("VBL Fixture")
+            );
+            assert!(
+                client
+                    .page_targets()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| candidate.id == target_id),
+                "target changed during localhost restart iteration {iteration}"
+            );
+        }
+
+        client.close_target(&target_id).await.unwrap();
         chrome.shutdown();
     }
 }

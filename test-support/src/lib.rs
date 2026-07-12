@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -27,6 +27,8 @@ pub const BROWSER_MODE_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_BROWSER_MODE";
 pub const CFT_CACHE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_CFT_CACHE_DIR";
 
 static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
+const FIXTURE_CONNECTION_POLL: Duration = Duration::from_millis(100);
+const FIXTURE_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RealBrowserPermit;
 
@@ -293,6 +295,68 @@ mod tests {
             response.contains(r#"{"ok":true}"#),
             "real request must be served while silent sockets are open: {response}"
         );
+    }
+
+    #[test]
+    fn fixture_server_stop_rejects_requests_from_preconnected_sockets() {
+        let mut server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+        let mut stream = TcpStream::connect(&address).expect("preconnect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        thread::sleep(Duration::from_millis(100));
+
+        server.stop();
+        let accepts_closed_connection = |error: &std::io::Error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            )
+        };
+        let write_result = stream.write_all(b"GET /data.json HTTP/1.1\r\nHost: fixture\r\n\r\n");
+        let mut response = String::new();
+        let read_result = match write_result {
+            Ok(()) => Some(stream.read_to_string(&mut response)),
+            Err(error) => {
+                assert!(
+                    accepts_closed_connection(&error),
+                    "stopped preconnect write must close cleanly or reset: {error}"
+                );
+                None
+            }
+        };
+
+        assert!(
+            !response.contains("200 OK"),
+            "a stopped fixture must not serve an accepted preconnect: {response}"
+        );
+        if let Some(Err(error)) = read_result {
+            assert!(
+                accepts_closed_connection(&error),
+                "stopped preconnect must close cleanly or reset: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_server_restart_rebinds_after_silent_preconnect() {
+        let mut server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+        let _silent = TcpStream::connect(&address).expect("silent preconnect");
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        server
+            .restart()
+            .expect("fixture server rebinds its original address");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "fixture restart must wake silent preconnect handlers promptly"
+        );
+        assert_eq!(server.base_url, format!("http://{address}"));
     }
 
     /// Requests split across multiple TCP segments must still be served; a
@@ -1289,7 +1353,9 @@ pub fn wait_for_network_event(
 }
 
 pub struct FixtureServer {
+    address: std::net::SocketAddr,
     base_url: String,
+    accepting: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -1297,14 +1363,21 @@ pub struct FixtureServer {
 impl FixtureServer {
     pub fn start() -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind fixture server")?;
+        Self::from_listener(listener)
+    }
+
+    fn from_listener(listener: TcpListener) -> Result<Self> {
         listener
             .set_nonblocking(true)
             .context("failed to configure fixture server")?;
         let address = listener
             .local_addr()
             .context("failed to read fixture server address")?;
+        let accepting = Arc::new(AtomicBool::new(true));
+        let accepting_connections = Arc::clone(&accepting);
         let (stop_tx, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
+            let mut connection_threads = Vec::new();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -1316,7 +1389,10 @@ impl FixtureServer {
                         // speculative preconnect sockets that never send a request;
                         // handling connections serially lets one silent socket wedge
                         // the accept loop and time out every navigation.
-                        thread::spawn(move || handle_fixture_connection(stream));
+                        let accepting = Arc::clone(&accepting_connections);
+                        connection_threads.push(thread::spawn(move || {
+                            handle_fixture_connection(stream, accepting)
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
@@ -1324,10 +1400,20 @@ impl FixtureServer {
                     Err(_) => break,
                 }
             }
+
+            // A stopped listener is not enough to make its address reusable on
+            // every platform: accepted speculative connections can still own
+            // the local port until their handlers exit. Join them before
+            // restart() attempts to bind the same address.
+            for connection_thread in connection_threads {
+                let _ = connection_thread.join();
+            }
         });
 
         Ok(Self {
+            address,
             base_url: format!("http://{address}"),
+            accepting,
             stop: Some(stop_tx),
             thread: Some(thread),
         })
@@ -1336,10 +1422,9 @@ impl FixtureServer {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
-}
 
-impl Drop for FixtureServer {
-    fn drop(&mut self) {
+    pub fn stop(&mut self) {
+        self.accepting.store(false, Ordering::Release);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -1347,9 +1432,24 @@ impl Drop for FixtureServer {
             let _ = thread.join();
         }
     }
+
+    pub fn restart(&mut self) -> Result<()> {
+        self.stop();
+        let replacement = Self::from_listener(
+            TcpListener::bind(self.address).context("failed to rebind fixture server")?,
+        )?;
+        *self = replacement;
+        Ok(())
+    }
 }
 
-fn handle_fixture_connection(mut stream: TcpStream) {
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) {
     // Accepted sockets inherit the listener's non-blocking flag on some
     // platforms; switch to blocking reads with a timeout so speculative
     // preconnect sockets that never send bytes release the thread.
@@ -1357,7 +1457,7 @@ fn handle_fixture_connection(mut stream: TcpStream) {
         return;
     }
     if stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(FIXTURE_CONNECTION_POLL))
         .is_err()
     {
         return;
@@ -1365,10 +1465,15 @@ fn handle_fixture_connection(mut stream: TcpStream) {
 
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0; 2048];
+    let mut idle_deadline = Instant::now() + FIXTURE_CONNECTION_IDLE_TIMEOUT;
     let request = loop {
+        if !accepting.load(Ordering::Acquire) {
+            return;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return,
             Ok(bytes) => {
+                idle_deadline = Instant::now() + FIXTURE_CONNECTION_IDLE_TIMEOUT;
                 buffer.extend_from_slice(&chunk[..bytes]);
                 if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
                     break String::from_utf8_lossy(&buffer).into_owned();
@@ -1376,6 +1481,17 @@ fn handle_fixture_connection(mut stream: TcpStream) {
                 if buffer.len() > 16 * 1024 {
                     return;
                 }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= idle_deadline {
+                    return;
+                }
+                continue;
             }
             Err(_) => return,
         }
@@ -1440,6 +1556,9 @@ document.querySelector('#prompt-form').addEventListener('submit', async (event) 
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    if !accepting.load(Ordering::Acquire) {
+        return;
+    }
     let _ = stream.write_all(response.as_bytes());
 }
 

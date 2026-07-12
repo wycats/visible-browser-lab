@@ -70,7 +70,7 @@ pub async fn ensure_managed_chrome(
     }
 
     let _lock = acquire_launch_lock(&config.chrome_lock_path).await?;
-    if let Some(endpoint) = healthy_active_endpoint(config).await {
+    if let Some(endpoint) = healthy_owned_active_endpoint(config).await? {
         let executable = discover_chrome(config.chrome_path.as_deref())
             .ok()
             .map(|installation| installation.executable);
@@ -81,7 +81,17 @@ pub async fn ensure_managed_chrome(
             pid: managed_chrome_pid(config),
         });
     }
-    wait_for_profile_release(config).await?;
+    if let Some(endpoint) = wait_for_active_endpoint_or_profile_release(config).await? {
+        let executable = discover_chrome(config.chrome_path.as_deref())
+            .ok()
+            .map(|installation| installation.executable);
+        return Ok(ManagedChrome {
+            cdp_endpoint: endpoint,
+            reused: true,
+            executable,
+            pid: managed_chrome_pid(config),
+        });
+    }
 
     remove_stale_active_port(&config.devtools_active_port_path).await?;
     let installation = discover_chrome(config.chrome_path.as_deref())?;
@@ -281,24 +291,52 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
         .await
         .ok()?;
     let endpoint = parse_active_port(&active_port).ok()?;
-    validate_endpoint(&endpoint).await.then_some(endpoint)
+    validate_endpoint(&endpoint)
+        .await
+        .then_some(endpoint.http_url)
 }
 
-async fn wait_for_profile_release(config: &RuntimeConfig) -> Result<()> {
+async fn healthy_owned_active_endpoint(config: &RuntimeConfig) -> Result<Option<String>> {
+    let Some(endpoint) = healthy_active_endpoint(config).await else {
+        return Ok(None);
+    };
     let profile_lock = config.chrome_profile_dir.join("SingletonLock");
     if profile_is_available(&profile_lock).await? {
-        return Ok(());
+        return Ok(None);
+    }
+    Ok(Some(endpoint))
+}
+
+async fn wait_for_active_endpoint_or_profile_release(
+    config: &RuntimeConfig,
+) -> Result<Option<String>> {
+    let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+    if profile_is_available(&profile_lock).await? {
+        return Ok(None);
     }
 
     let deadline = Instant::now() + CHROME_PROFILE_RELEASE_TIMEOUT;
     loop {
+        if let Some(endpoint) = healthy_owned_active_endpoint(config).await? {
+            // The endpoint can answer during browser shutdown or after a
+            // rapid port reuse. Only reuse it while the managed profile is
+            // still demonstrably owned; a released profile must follow the
+            // stale-port cleanup and fresh-launch path instead.
+            tracing::info!(
+                endpoint,
+                profile = %config.chrome_profile_dir.display(),
+                "recovered the existing managed Chrome CDP endpoint"
+            );
+            return Ok(Some(endpoint));
+        }
         if profile_is_available(&profile_lock).await? {
-            return Ok(());
+            return Ok(None);
         }
         if Instant::now() >= deadline {
             bail!(
-                "managed Chrome profile `{}` remained locked by a running Chrome process after its CDP endpoint stopped responding",
-                config.chrome_profile_dir.display()
+                "managed Chrome profile `{}` remains owned by a running Chrome process whose CDP endpoint did not recover within {} seconds",
+                config.chrome_profile_dir.display(),
+                CHROME_PROFILE_RELEASE_TIMEOUT.as_secs()
             );
         }
         sleep(CHROME_START_RETRY).await;
@@ -372,15 +410,33 @@ async fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn parse_active_port(contents: &str) -> Result<String> {
-    let port = contents
-        .lines()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveDevToolsEndpoint {
+    http_url: String,
+    port: u16,
+    websocket_path: String,
+}
+
+fn parse_active_port(contents: &str) -> Result<ActiveDevToolsEndpoint> {
+    let mut lines = contents.lines();
+    let port = lines
         .next()
         .context("DevToolsActivePort omitted the port")?
         .trim()
         .parse::<u16>()
         .context("DevToolsActivePort contained an invalid port")?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let websocket_path = lines
+        .next()
+        .context("DevToolsActivePort omitted the browser WebSocket path")?
+        .trim();
+    if !websocket_path.starts_with("/devtools/browser/") || websocket_path == "/devtools/browser/" {
+        bail!("DevToolsActivePort contained an invalid browser WebSocket path");
+    }
+    Ok(ActiveDevToolsEndpoint {
+        http_url: format!("http://127.0.0.1:{port}"),
+        port,
+        websocket_path: websocket_path.to_string(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,7 +447,28 @@ struct BrowserVersion {
     websocket_url: String,
 }
 
-async fn validate_endpoint(endpoint: &str) -> bool {
+async fn validate_endpoint(endpoint: &ActiveDevToolsEndpoint) -> bool {
+    let Some(version) = browser_version(&endpoint.http_url).await else {
+        return false;
+    };
+    let Ok(websocket_url) = url::Url::parse(&version.websocket_url) else {
+        return false;
+    };
+    let loopback_host = match websocket_url.host_str() {
+        Some("localhost" | "::1") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    };
+    !version.browser.is_empty()
+        && websocket_url.scheme() == "ws"
+        && loopback_host
+        && websocket_url.port() == Some(endpoint.port)
+        && websocket_url.path() == endpoint.websocket_path
+}
+
+async fn browser_version(endpoint: &str) -> Option<BrowserVersion> {
     let url = format!("{}/json/version", endpoint.trim_end_matches('/'));
     let Ok(response) = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
@@ -401,15 +478,12 @@ async fn validate_endpoint(endpoint: &str) -> bool {
         .send()
         .await
     else {
-        return false;
+        return None;
     };
     if !response.status().is_success() {
-        return false;
+        return None;
     }
-    let Ok(version) = response.json::<BrowserVersion>().await else {
-        return false;
-    };
-    !version.browser.is_empty() && !version.websocket_url.is_empty()
+    response.json::<BrowserVersion>().await.ok()
 }
 
 async fn remove_stale_active_port(path: &Path) -> Result<()> {
@@ -811,14 +885,21 @@ mod tests {
     fn parses_dynamic_devtools_port() {
         assert_eq!(
             parse_active_port("49321\n/devtools/browser/test\n").unwrap(),
-            "http://127.0.0.1:49321"
+            ActiveDevToolsEndpoint {
+                http_url: "http://127.0.0.1:49321".to_string(),
+                port: 49321,
+                websocket_path: "/devtools/browser/test".to_string(),
+            }
         );
     }
 
     #[test]
     fn rejects_invalid_devtools_port() {
-        assert!(parse_active_port("not-a-port\n").is_err());
+        assert!(parse_active_port("not-a-port\n/devtools/browser/test\n").is_err());
         assert!(parse_active_port("").is_err());
+        assert!(parse_active_port("49321\n").is_err());
+        assert!(parse_active_port("49321\n/devtools/browser/\n").is_err());
+        assert!(parse_active_port("49321\n/devtools/page/test\n").is_err());
     }
 
     #[test]
@@ -991,7 +1072,12 @@ mod tests {
             tokio::fs::remove_file(lock_to_release).await.unwrap();
         });
 
-        wait_for_profile_release(&config).await.unwrap();
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            None
+        );
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
     }
 
@@ -1008,8 +1094,213 @@ mod tests {
         let profile_lock = config.chrome_profile_dir.join("SingletonLock");
         symlink("test-host-2147483647", &profile_lock).unwrap();
 
-        wait_for_profile_release(&config).await.unwrap();
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            None
+        );
         assert!(!path_entry_exists(&profile_lock).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reuses_a_live_profile_when_its_endpoint_recovers_after_one_timeout() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(config.chrome_profile_dir.join("SingletonLock"), b"active")
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/recovered\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = first.read(&mut request).await.unwrap();
+            sleep(Duration::from_millis(1_100)).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = second.read(&mut request).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/recovered"}}"#
+            );
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            Some(format!("http://127.0.0.1:{port}"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_an_endpoint_with_a_different_browser_websocket_identity() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/expected\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/unrelated"}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(healthy_active_endpoint(&config).await, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declines_a_recovered_endpoint_after_its_profile_is_released() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        tokio::fs::write(&profile_lock, b"active").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/shutting-down\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            tokio::fs::remove_file(profile_lock).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/shutting-down"}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_for_active_endpoint_or_profile_release(&config)
+                .await
+                .unwrap(),
+            None
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declines_an_initial_healthy_endpoint_after_its_profile_is_released() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let profile_lock = config.chrome_profile_dir.join("SingletonLock");
+        tokio::fs::write(&profile_lock, b"active").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/initial-shutdown\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            tokio::fs::remove_file(profile_lock).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/initial-shutdown"}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(healthy_owned_active_endpoint(&config).await.unwrap(), None);
+        server.await.unwrap();
     }
 
     #[test]
@@ -1112,7 +1403,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!replacement.reused);
-        assert!(validate_endpoint(&replacement.cdp_endpoint).await);
+        assert_eq!(
+            healthy_active_endpoint(&config).await.as_deref(),
+            Some(replacement.cdp_endpoint.as_str())
+        );
 
         terminate_managed_browser(&config, &replacement).await;
         wait_until_unhealthy(&replacement.cdp_endpoint).await;
@@ -1140,7 +1434,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn wait_until_unhealthy(endpoint: &str) {
         let deadline = Instant::now() + CHROME_START_TIMEOUT;
-        while validate_endpoint(endpoint).await {
+        while browser_version(endpoint).await.is_some() {
             assert!(Instant::now() < deadline, "managed Chrome did not stop");
             sleep(Duration::from_millis(50)).await;
         }

@@ -32,7 +32,12 @@ async fn main() -> Result<()> {
 
 fn install_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "visible_browser_lab=info,warn".into());
+        // Chromiumoxide logs every forward-compatible CDP event it cannot
+        // decode at WARN. Modern Chrome can emit hundreds per minute, hiding
+        // the actionable VBL recovery diagnostics and growing broker logs
+        // without bound. Keep transport failures at ERROR by default; an
+        // explicit RUST_LOG can still opt into the raw protocol warnings.
+        .unwrap_or_else(|_| "visible_browser_lab=info,chromiumoxide::handler=error,warn".into());
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
