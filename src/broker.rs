@@ -1219,11 +1219,17 @@ impl BrowserBackend {
         &self,
         target: &CdpTarget,
         expression: &str,
+        await_promise: bool,
     ) -> Result<EvaluateResult, BrowserToolError> {
         match self {
             #[cfg(test)]
             Self::Fake(browser) => browser.lock().unwrap().evaluate(target, expression),
-            _ => self.cdp_client().await?.evaluate(target, expression).await,
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .evaluate(target, expression, await_promise)
+                    .await
+            }
         }
     }
 
@@ -3718,9 +3724,10 @@ async fn wait_condition_matches(
                         .browser
                         .evaluate(
                             target,
-                            &format!(
+                        &format!(
                                 "(() => {{ const e = document.querySelector({selector}); if (!e) return {{attached:false,visible:false}}; const r=e.getBoundingClientRect(),s=getComputedStyle(e),d=e.matches(':disabled')||e.getAttribute('aria-disabled')==='true'; return {{attached:e.isConnected,visible:r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none',enabled:!d,editable:!d&&(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement||e.isContentEditable),checked:Boolean(e.checked||e.getAttribute('aria-checked')==='true')}}; }})()"
-                            ),
+                        ),
+                        true,
                         )
                         .await?
                         .value
@@ -3815,7 +3822,7 @@ async fn evaluate_truthy(
 ) -> Result<bool, BrowserToolError> {
     Ok(state
         .browser
-        .evaluate(target, expression)
+        .evaluate(target, expression, true)
         .await?
         .value
         .is_some_and(|value| match value {
@@ -3904,7 +3911,10 @@ async fn broker_evaluate(
     let params = params?;
     let target = active_owned_target(state, &params.agent_session_id, &params.tab_id).await?;
     ensure_diagnostics_monitor(state, &target).await?;
-    state.browser.evaluate(&target, &params.expression).await
+    state
+        .browser
+        .evaluate(&target, &params.expression, true)
+        .await
 }
 
 async fn broker_evaluate_v3(
@@ -3954,7 +3964,10 @@ async fn broker_evaluate_v3(
             )));
         }
     };
-    state.browser.evaluate(&target, &expression).await
+    state
+        .browser
+        .evaluate(&target, &expression, params.await_promise)
+        .await
 }
 
 async fn broker_snapshot(
@@ -4952,6 +4965,7 @@ async fn broker_interact(
                     .evaluate(
                         &target,
                         &format!("window.scrollBy({delta_x}, {delta_y}); true"),
+                        true,
                     )
                     .await?;
             }
@@ -5856,7 +5870,7 @@ async fn broker_performance(
     Load: navigation ? navigation.loadEventEnd : null,
     resource_count: entries.filter(e => e.entryType === 'resource').length
   };
-})()"#).await?;
+})()"#, true).await?;
             Ok(json!({"operation":"vitals", "metrics":result.value.unwrap_or_else(|| json!({}))}))
         }
         "analyze" => {
@@ -6117,7 +6131,7 @@ async fn broker_audit(
             },
         )
         .await?;
-        let result = state.browser.evaluate(&target, &expression).await?;
+        let result = state.browser.evaluate(&target, &expression, true).await?;
         Ok::<_, BrowserToolError>((snapshot.document_revision, result))
     }
     .await;

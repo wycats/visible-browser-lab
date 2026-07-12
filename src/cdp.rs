@@ -1270,6 +1270,7 @@ impl CdpClient {
                 &format!(
                     r#"(() => {{ const matches=document.querySelectorAll({selector_json}); if(matches.length===0)return {{state:"not_found"}}; if(matches.length>1)return {{state:"ambiguous",count:matches.length}}; const e=matches[0]; e.scrollIntoView({{block:"center",inline:"center"}}); const r=e.getBoundingClientRect(),s=getComputedStyle(e); if(r.width<=0||r.height<=0||s.visibility==="hidden"||s.display==="none")return {{state:"hidden"}}; return {{state:"ready",x:r.left,y:r.top,width:r.width,height:r.height}}; }})()"#
                 ),
+                true,
             )
             .await?
             .value
@@ -1324,8 +1325,11 @@ impl CdpClient {
         &self,
         target: &CdpTarget,
         expression: &str,
+        await_promise: bool,
     ) -> Result<EvaluateResult, BrowserToolError> {
         let (page, connection) = self.page(&target.id).await?;
+        let action_lock = self.runtime.target_action_lock(&target.id);
+        let _action = action_lock.lock().await;
         let context = self
             .refresh_main_world_context(
                 &target.id,
@@ -1336,7 +1340,7 @@ impl CdpClient {
             .await?;
         let mut params = RuntimeEvaluateParams::new(expression);
         params.unique_context_id = Some(context.unique_id.clone());
-        params.await_promise = Some(true);
+        params.await_promise = Some(await_promise);
         params.return_by_value = Some(true);
         let result = match page.execute(params).await {
             Ok(result) => result.result,
@@ -1984,7 +1988,7 @@ impl CdpClient {
 }})()"#
         );
         let result = self
-            .evaluate(target, &expression)
+            .evaluate(target, &expression, true)
             .await?
             .value
             .ok_or_else(|| {
@@ -2421,7 +2425,7 @@ impl CdpClient {
         expression: &str,
     ) -> Result<(), BrowserToolError> {
         let result = self
-            .evaluate(target, expression)
+            .evaluate(target, expression, true)
             .await?
             .value
             .ok_or_else(|| BrowserToolError::chrome_unavailable("CSS operation omitted result"))?;
@@ -3329,6 +3333,8 @@ impl CdpClient {
         page: &Page,
         connection: &RuntimeConnection,
     ) -> Result<(), BrowserToolError> {
+        let action_lock = self.runtime.target_action_lock(target_id);
+        let _action = action_lock.lock().await;
         let deadline = Instant::now() + PAGE_DISCOVERY_TIMEOUT;
         loop {
             let Some(stale) = self.runtime.stale_page_context(target_id) else {
@@ -3706,6 +3712,9 @@ struct CdpRuntime {
     /// Monotonic across marker removal and recreation so an older waiter can
     /// never clear a newer stale-context report for the same target.
     stale_page_context_revision: AtomicU64,
+    /// Serializes Runtime-domain refreshes and public evaluations within one
+    /// target without blocking operations or event streams on other targets.
+    target_action_locks: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3747,6 +3756,7 @@ impl CdpRuntime {
             screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
             stale_page_contexts: StdMutex::new(BTreeMap::new()),
             stale_page_context_revision: AtomicU64::new(0),
+            target_action_locks: StdMutex::new(BTreeMap::new()),
         }
     }
 
@@ -3757,6 +3767,15 @@ impl CdpRuntime {
             .wrapping_add(1);
         let mut contexts = self.stale_page_contexts.lock().unwrap();
         contexts.insert(target_id.to_string(), StalePageContext { revision });
+    }
+
+    fn target_action_lock(&self, target_id: &str) -> Arc<Mutex<()>> {
+        self.target_action_locks
+            .lock()
+            .unwrap()
+            .entry(target_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     fn stale_page_context(&self, target_id: &str) -> Option<StalePageContext> {
@@ -3782,6 +3801,7 @@ impl CdpRuntime {
 
     fn forget_stale_page_context(&self, target_id: &str) {
         self.stale_page_contexts.lock().unwrap().remove(target_id);
+        self.target_action_locks.lock().unwrap().remove(target_id);
     }
 
     async fn connection(&self) -> Result<RuntimeConnection, BrowserToolError> {
@@ -5019,7 +5039,7 @@ mod tests {
             .find(|target| target.id == target_id)
             .expect("Chromiumoxide should register the pre-existing target");
         let result = client
-            .evaluate(&target, "document.location.href")
+            .evaluate(&target, "document.location.href", true)
             .await
             .unwrap();
 
@@ -5045,9 +5065,12 @@ mod tests {
         let generation = client.runtime.connection().await.unwrap().generation;
 
         client.runtime.mark_stale_page_context(&stale_target.id);
-        let refreshed = client.evaluate(&stale_target, "'refreshed'").await.unwrap();
+        let refreshed = client
+            .evaluate(&stale_target, "'refreshed'", true)
+            .await
+            .unwrap();
         let unaffected = client
-            .evaluate(&other_target, "'unaffected'")
+            .evaluate(&other_target, "'unaffected'", true)
             .await
             .unwrap();
 
@@ -5057,6 +5080,21 @@ mod tests {
             client.runtime.connection().await.unwrap().generation,
             generation
         );
+
+        let first = client.evaluate(&stale_target, "Promise.resolve('first')", true);
+        let second = client.evaluate(&stale_target, "Promise.resolve('second')", true);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().value, Some(json!("first")));
+        assert_eq!(second.unwrap().value, Some(json!("second")));
+
+        let non_awaiting = timeout(
+            Duration::from_secs(2),
+            client.evaluate(&stale_target, "new Promise(() => {})", false),
+        )
+        .await
+        .expect("await_promise=false must not wait for a pending promise")
+        .unwrap();
+        assert!(non_awaiting.value.is_some());
         chrome.shutdown();
     }
 
@@ -5097,7 +5135,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let result = client.evaluate(&target, "document.title").await.unwrap();
+            let result = client
+                .evaluate(&target, "document.title", true)
+                .await
+                .unwrap();
             assert_eq!(
                 result.value.as_ref().and_then(Value::as_str),
                 Some("VBL Fixture")
