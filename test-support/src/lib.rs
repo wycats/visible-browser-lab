@@ -27,6 +27,8 @@ pub const BROWSER_MODE_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_BROWSER_MODE";
 pub const CFT_CACHE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_CFT_CACHE_DIR";
 
 static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
+const FIXTURE_CONNECTION_POLL: Duration = Duration::from_millis(100);
+const FIXTURE_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RealBrowserPermit;
 
@@ -1453,7 +1455,7 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
         return;
     }
     if stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
+        .set_read_timeout(Some(FIXTURE_CONNECTION_POLL))
         .is_err()
     {
         return;
@@ -1461,6 +1463,7 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
 
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0; 2048];
+    let mut idle_deadline = Instant::now() + FIXTURE_CONNECTION_IDLE_TIMEOUT;
     let request = loop {
         if !accepting.load(Ordering::Acquire) {
             return;
@@ -1468,6 +1471,7 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
         match stream.read(&mut chunk) {
             Ok(0) => return,
             Ok(bytes) => {
+                idle_deadline = Instant::now() + FIXTURE_CONNECTION_IDLE_TIMEOUT;
                 buffer.extend_from_slice(&chunk[..bytes]);
                 if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
                     break String::from_utf8_lossy(&buffer).into_owned();
@@ -1482,6 +1486,9 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
+                if Instant::now() >= idle_deadline {
+                    return;
+                }
                 continue;
             }
             Err(_) => return,
