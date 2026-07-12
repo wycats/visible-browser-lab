@@ -924,7 +924,7 @@ impl CdpClient {
             let history = match page.execute(GetNavigationHistoryParams::default()).await {
                 Ok(history) => history,
                 Err(error) => {
-                    let retry = invalidates_connection(&error) && Instant::now() < deadline;
+                    let retry = retryable_page_error(&error) && Instant::now() < deadline;
                     let mapped = self
                         .runtime
                         .page_error(&connection, "observe browser history navigation", error)
@@ -943,7 +943,7 @@ impl CdpClient {
                             "Chrome returned an invalid document state: {error}"
                         ))
                     })?,
-                    Err(error) if invalidates_connection(&error) => {
+                    Err(error) if retryable_page_error(&error) => {
                         let retry = Instant::now() < deadline;
                         let mapped = self
                             .runtime
@@ -1324,7 +1324,7 @@ impl CdpClient {
                     tracing::warn!(
                         target_id = %target.id,
                         generation = connection.generation,
-                        "invalidating the CDP connection after Chrome discarded the page execution context"
+                        "Chrome discarded the page execution context; preserving the shared CDP connection without replaying the caller expression"
                     );
                 }
                 return Err(self
@@ -3753,7 +3753,11 @@ fn invalidates_connection(error: &CdpError) -> bool {
             | CdpError::NoResponse
             | CdpError::ChannelSendError(_)
             | CdpError::UnexpectedWsMessage(_)
-    ) || stale_execution_context(error)
+    )
+}
+
+fn retryable_page_error(error: &CdpError) -> bool {
+    invalidates_connection(error) || stale_execution_context(error)
 }
 
 fn stale_execution_context(error: &CdpError) -> bool {
@@ -4560,20 +4564,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_execution_context_invalidates_the_browser_generation() {
+    fn stale_execution_context_is_page_local_and_retryable() {
         let error = CdpError::Chrome(chromiumoxide::types::Error {
             code: -32000,
             message: "Cannot find context with specified id".to_string(),
         });
         assert!(stale_execution_context(&error));
-        assert!(invalidates_connection(&error));
+        assert!(retryable_page_error(&error));
+        assert!(!invalidates_connection(&error));
 
         let ordinary = CdpError::Chrome(chromiumoxide::types::Error {
             code: -32000,
             message: "No node with given id found".to_string(),
         });
         assert!(!stale_execution_context(&ordinary));
+        assert!(!retryable_page_error(&ordinary));
         assert!(!invalidates_connection(&ordinary));
+
+        let transport = CdpError::NoResponse;
+        assert!(retryable_page_error(&transport));
+        assert!(invalidates_connection(&transport));
     }
 
     #[test]
