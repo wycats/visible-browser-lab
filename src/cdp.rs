@@ -1000,12 +1000,16 @@ impl CdpClient {
             self.clear_beforeunload_handlers(&page, &connection, true)
                 .await?;
         }
-        let original_loader_id = if wait_until == "none" {
-            None
-        } else {
-            Some(self.main_frame_loader_id(&page, &connection).await?)
-        };
         let navigation = async {
+            // Keep the loader preflight inside the navigation watchdog and
+            // dialog-policy scope. A stale target must honor timeout_ms, and a
+            // preflight failure after temporarily clearing beforeunload
+            // handlers must flow through the normal restoration path.
+            let original_loader_id = if wait_until == "none" {
+                None
+            } else {
+                Some(self.main_frame_loader_id(&page, &connection).await?)
+            };
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
             match wait_until {
