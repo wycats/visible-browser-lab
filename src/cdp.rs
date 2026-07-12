@@ -69,8 +69,8 @@ use chromiumoxide::{
         js_protocol::runtime::{
             CallArgument, CallFunctionOnParams, DisableParams as RuntimeDisableParams,
             DiscardConsoleEntriesParams, EnableParams as RuntimeEnableParams,
-            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled, ExecutionContextId,
-            ReleaseObjectGroupParams, RemoteObjectId,
+            EvaluateParams as RuntimeEvaluateParams, EventConsoleApiCalled,
+            EventExecutionContextCreated, ReleaseObjectGroupParams, RemoteObjectId,
         },
     },
     error::CdpError,
@@ -1326,7 +1326,7 @@ impl CdpClient {
             Ok(context_id) => context_id,
             Err(error) => {
                 if stale_execution_context(&error) {
-                    self.runtime.mark_stale_page_context(&target.id, None);
+                    self.runtime.mark_stale_page_context(&target.id);
                     tracing::warn!(
                         target_id = %target.id,
                         generation = connection.generation,
@@ -1345,7 +1345,7 @@ impl CdpClient {
             Ok(result) => result,
             Err(error) => {
                 if stale_execution_context(&error) {
-                    self.runtime.mark_stale_page_context(&target.id, context_id);
+                    self.runtime.mark_stale_page_context(&target.id);
                     tracing::warn!(
                         target_id = %target.id,
                         generation = connection.generation,
@@ -3327,30 +3327,63 @@ impl CdpClient {
             let Some(stale) = self.runtime.stale_page_context(target_id) else {
                 return Ok(());
             };
-            match page.execution_context().await {
-                Ok(context_id) if fresh_page_context_observed(&stale, context_id) => {
-                    if self
-                        .runtime
-                        .clear_stale_page_context_if_unchanged(target_id, stale.revision)
-                    {
-                        return Ok(());
+            let main_frame_id = self
+                .runtime
+                .page_command(
+                    connection,
+                    page.execute(GetFrameTreeParams::default()),
+                    "read main frame before refreshing its execution context",
+                )
+                .await?
+                .result
+                .frame_tree
+                .frame
+                .id
+                .as_ref()
+                .to_string();
+            let mut contexts = self
+                .event_listener::<EventExecutionContextCreated>(page, connection)
+                .await?;
+            self.runtime
+                .page_command(
+                    connection,
+                    page.execute(RuntimeDisableParams::default()),
+                    "disable target runtime before refreshing its execution context",
+                )
+                .await?;
+            self.runtime
+                .page_command(
+                    connection,
+                    page.execute(RuntimeEnableParams::default()),
+                    "re-enable target runtime to refresh its execution context",
+                )
+                .await?;
+
+            let observed = timeout(deadline.saturating_duration_since(Instant::now()), async {
+                while let Some(event) = contexts.next().await {
+                    if is_main_world_context(&event, &main_frame_id) {
+                        tracing::debug!(
+                            target_id,
+                            context_unique_id = %event.context.unique_id,
+                            "refreshed the target's main-world execution context"
+                        );
+                        return true;
                     }
                 }
-                Ok(_) if Instant::now() < deadline => sleep(PAGE_DISCOVERY_RETRY).await,
-                Ok(_) => {
-                    return Err(BrowserToolError::chrome_unavailable(format!(
-                        "Chrome target `{target_id}` did not expose a fresh execution context after page churn"
-                    )));
-                }
-                Err(error) if stale_execution_context(&error) && Instant::now() < deadline => {
-                    sleep(PAGE_DISCOVERY_RETRY).await;
-                }
-                Err(error) => {
-                    return Err(self
-                        .runtime
-                        .page_error(connection, "wait for fresh page execution context", error)
-                        .await);
-                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            if !observed {
+                return Err(BrowserToolError::chrome_unavailable(format!(
+                    "Chrome target `{target_id}` did not report a fresh main-world execution context after page churn"
+                )));
+            }
+            if self
+                .runtime
+                .clear_stale_page_context_if_unchanged(target_id, stale.revision)
+            {
+                return Ok(());
             }
         }
     }
@@ -3654,17 +3687,13 @@ struct CdpRuntime {
 
 #[derive(Debug, Clone, Default)]
 struct StalePageContext {
-    ids: HashSet<ExecutionContextId>,
-    saw_missing: bool,
     revision: u64,
 }
 
-fn fresh_page_context_observed(
-    stale: &StalePageContext,
-    context_id: Option<ExecutionContextId>,
-) -> bool {
-    context_id.is_some_and(|context_id| {
-        (stale.saw_missing || !stale.ids.is_empty()) && !stale.ids.contains(&context_id)
+fn is_main_world_context(event: &EventExecutionContextCreated, main_frame_id: &str) -> bool {
+    event.context.aux_data.as_ref().is_some_and(|aux_data| {
+        aux_data.get("isDefault").and_then(Value::as_bool) == Some(true)
+            && aux_data.get("frameId").and_then(Value::as_str) == Some(main_frame_id)
     })
 }
 
@@ -3697,15 +3726,10 @@ impl CdpRuntime {
         }
     }
 
-    fn mark_stale_page_context(&self, target_id: &str, context_id: Option<ExecutionContextId>) {
+    fn mark_stale_page_context(&self, target_id: &str) {
         let mut contexts = self.stale_page_contexts.lock().unwrap();
         let stale = contexts.entry(target_id.to_string()).or_default();
         stale.revision = stale.revision.wrapping_add(1);
-        if let Some(context_id) = context_id {
-            stale.ids.insert(context_id);
-        } else {
-            stale.saw_missing = true;
-        }
     }
 
     fn stale_page_context(&self, target_id: &str) -> Option<StalePageContext> {
@@ -4717,49 +4741,46 @@ mod tests {
     #[test]
     fn stale_page_context_markers_are_target_local() {
         let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
-        runtime.mark_stale_page_context("target-a", Some(ExecutionContextId::new(7)));
+        runtime.mark_stale_page_context("target-a");
 
-        let marker = runtime.stale_page_context("target-a").unwrap();
-        assert!(marker.ids.contains(&ExecutionContextId::new(7)));
+        assert!(runtime.stale_page_context("target-a").is_some());
         assert!(runtime.stale_page_context("target-b").is_none());
     }
 
     #[test]
-    fn stale_page_context_requires_a_different_main_world() {
-        let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
-        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(7)));
-        let marker = runtime.stale_page_context("target").unwrap();
+    fn refreshed_context_must_be_the_main_frames_default_world() {
+        use chromiumoxide::cdp::js_protocol::runtime::{
+            ExecutionContextDescription, ExecutionContextId,
+        };
 
-        assert!(!fresh_page_context_observed(
-            &marker,
-            Some(ExecutionContextId::new(7))
-        ));
-        assert!(fresh_page_context_observed(
-            &marker,
-            Some(ExecutionContextId::new(8))
-        ));
-        assert!(!fresh_page_context_observed(&marker, None));
+        let event = |is_default: bool, frame_id: &str| {
+            let mut context = ExecutionContextDescription::new(
+                ExecutionContextId::new(7),
+                "https://example.test",
+                "",
+                "system-unique-context",
+            );
+            context.aux_data = Some(json!({
+                "isDefault": is_default,
+                "frameId": frame_id,
+            }));
+            EventExecutionContextCreated { context }
+        };
 
-        runtime.mark_stale_page_context("missing", None);
-        let missing = runtime.stale_page_context("missing").unwrap();
-        assert!(fresh_page_context_observed(
-            &missing,
-            Some(ExecutionContextId::new(7))
-        ));
-        assert!(!fresh_page_context_observed(&missing, None));
+        assert!(is_main_world_context(&event(true, "main"), "main"));
+        assert!(!is_main_world_context(&event(false, "main"), "main"));
+        assert!(!is_main_world_context(&event(true, "child"), "main"));
     }
 
     #[test]
     fn newer_stale_page_context_prevents_an_old_barrier_from_clearing() {
         let runtime = CdpRuntime::new(CdpEndpoint::parse("http://127.0.0.1:9222").unwrap());
-        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(7)));
+        runtime.mark_stale_page_context("target");
         let first = runtime.stale_page_context("target").unwrap();
-        runtime.mark_stale_page_context("target", Some(ExecutionContextId::new(8)));
+        runtime.mark_stale_page_context("target");
 
         assert!(!runtime.clear_stale_page_context_if_unchanged("target", first.revision));
         let latest = runtime.stale_page_context("target").unwrap();
-        assert!(latest.ids.contains(&ExecutionContextId::new(7)));
-        assert!(latest.ids.contains(&ExecutionContextId::new(8)));
         assert!(runtime.clear_stale_page_context_if_unchanged("target", latest.revision));
         assert!(runtime.stale_page_context("target").is_none());
     }
@@ -4974,6 +4995,39 @@ mod tests {
             .unwrap();
 
         assert!(result.value.is_some());
+        chrome.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refreshes_one_targets_context_without_reconnecting_other_targets() {
+        let mut chrome = tokio::task::spawn_blocking(|| RealBrowser::launch(BrowserMode::Headless))
+            .await
+            .unwrap()
+            .unwrap();
+        let client = CdpClient::new(chrome.cdp_endpoint()).unwrap();
+        let stale_target = client
+            .create_page(Some("about:blank"), false)
+            .await
+            .unwrap();
+        let other_target = client
+            .create_page(Some("about:blank"), false)
+            .await
+            .unwrap();
+        let generation = client.runtime.connection().await.unwrap().generation;
+
+        client.runtime.mark_stale_page_context(&stale_target.id);
+        let refreshed = client.evaluate(&stale_target, "'refreshed'").await.unwrap();
+        let unaffected = client
+            .evaluate(&other_target, "'unaffected'")
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.value, Some(json!("refreshed")));
+        assert_eq!(unaffected.value, Some(json!("unaffected")));
+        assert_eq!(
+            client.runtime.connection().await.unwrap().generation,
+            generation
+        );
         chrome.shutdown();
     }
 
