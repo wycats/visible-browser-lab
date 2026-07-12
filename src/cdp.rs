@@ -1325,6 +1325,14 @@ impl CdpClient {
         let context_id = match page.execution_context().await {
             Ok(context_id) => context_id,
             Err(error) => {
+                if stale_execution_context(&error) {
+                    self.runtime.mark_stale_page_context(&target.id, None);
+                    tracing::warn!(
+                        target_id = %target.id,
+                        generation = connection.generation,
+                        "Chrome discarded the page execution context before evaluation; requiring a fresh context for this target without replaying the caller expression"
+                    );
+                }
                 return Err(self
                     .runtime
                     .page_error(&connection, "read evaluate execution context", error)
