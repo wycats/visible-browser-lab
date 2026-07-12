@@ -2384,8 +2384,13 @@ fn validate_source_package_contract(root: &Path) -> Result<()> {
         bail!("source MCP config must preserve plugin-root and runtime environment contracts");
     }
 
-    let codex_config_source = fs::read_to_string(root.join(".codex/config.toml"))
-        .context("failed to read Codex development config")?;
+    let codex_config_path = root.join(".codex/config.toml");
+    let codex_config_source = fs::read_to_string(&codex_config_path).with_context(|| {
+        format!(
+            "failed to read Codex development config {}",
+            codex_config_path.display()
+        )
+    })?;
     validate_codex_development_config(&codex_config_source)?;
     Ok(())
 }
