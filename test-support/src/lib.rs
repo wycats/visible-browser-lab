@@ -320,6 +320,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixture_server_restart_rebinds_after_silent_preconnect() {
+        let mut server = FixtureServer::start().expect("fixture server starts");
+        let address = server.base_url.trim_start_matches("http://").to_string();
+        let _silent = TcpStream::connect(&address).expect("silent preconnect");
+        thread::sleep(Duration::from_millis(100));
+
+        server
+            .restart()
+            .expect("fixture server rebinds its original address");
+        assert_eq!(server.base_url, format!("http://{address}"));
+    }
+
     /// Requests split across multiple TCP segments must still be served; a
     /// single read may return before the full request line has arrived. The
     /// split lands mid-path so a truncated read parses the wrong path.
@@ -1338,6 +1351,7 @@ impl FixtureServer {
         let accepting_connections = Arc::clone(&accepting);
         let (stop_tx, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
+            let mut connection_threads = Vec::new();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -1350,13 +1364,23 @@ impl FixtureServer {
                         // handling connections serially lets one silent socket wedge
                         // the accept loop and time out every navigation.
                         let accepting = Arc::clone(&accepting_connections);
-                        thread::spawn(move || handle_fixture_connection(stream, accepting));
+                        connection_threads.push(thread::spawn(move || {
+                            handle_fixture_connection(stream, accepting)
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
                     }
                     Err(_) => break,
                 }
+            }
+
+            // A stopped listener is not enough to make its address reusable on
+            // every platform: accepted speculative connections can still own
+            // the local port until their handlers exit. Join them before
+            // restart() attempts to bind the same address.
+            for connection_thread in connection_threads {
+                let _ = connection_thread.join();
             }
         });
 
