@@ -2402,13 +2402,20 @@ fn validate_codex_development_config(source: &str) -> Result<()> {
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
         .and_then(|servers| servers.get("visible-browser-lab"))
-        .context("Codex development config omitted the visible-browser-lab server")?;
+        .and_then(toml::Value::as_table)
+        .context("Codex development config omitted or malformed the visible-browser-lab server")?;
     let expected_args = CODEX_MCP_ARGS
         .iter()
         .map(|argument| toml::Value::String((*argument).to_string()))
         .collect::<Vec<_>>();
-    if development_server["command"].as_str() != Some("./scripts/visible-browser-lab-mcp.sh")
-        || development_server["args"].as_array() != Some(&expected_args)
+    if development_server
+        .get("command")
+        .and_then(toml::Value::as_str)
+        != Some("./scripts/visible-browser-lab-mcp.sh")
+        || development_server
+            .get("args")
+            .and_then(toml::Value::as_array)
+            != Some(&expected_args)
     {
         bail!(
             "Codex development config must use the source facade with trusted Codex compatibility"
@@ -3076,7 +3083,17 @@ args = []
             validate_codex_development_config("")
                 .unwrap_err()
                 .to_string()
-                .contains("omitted the visible-browser-lab server")
+                .contains("omitted or malformed the visible-browser-lab server")
+        );
+        assert!(
+            validate_codex_development_config(
+                r#"[mcp_servers]
+visible-browser-lab = "not a server table"
+"#,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("omitted or malformed the visible-browser-lab server")
         );
     }
 
