@@ -291,7 +291,9 @@ async fn healthy_active_endpoint(config: &RuntimeConfig) -> Option<String> {
         .await
         .ok()?;
     let endpoint = parse_active_port(&active_port).ok()?;
-    validate_endpoint(&endpoint).await.then_some(endpoint)
+    validate_endpoint(&endpoint)
+        .await
+        .then_some(endpoint.http_url)
 }
 
 async fn wait_for_active_endpoint_or_profile_release(
@@ -400,15 +402,33 @@ async fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn parse_active_port(contents: &str) -> Result<String> {
-    let port = contents
-        .lines()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveDevToolsEndpoint {
+    http_url: String,
+    port: u16,
+    websocket_path: String,
+}
+
+fn parse_active_port(contents: &str) -> Result<ActiveDevToolsEndpoint> {
+    let mut lines = contents.lines();
+    let port = lines
         .next()
         .context("DevToolsActivePort omitted the port")?
         .trim()
         .parse::<u16>()
         .context("DevToolsActivePort contained an invalid port")?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let websocket_path = lines
+        .next()
+        .context("DevToolsActivePort omitted the browser WebSocket path")?
+        .trim();
+    if !websocket_path.starts_with("/devtools/browser/") || websocket_path == "/devtools/browser/" {
+        bail!("DevToolsActivePort contained an invalid browser WebSocket path");
+    }
+    Ok(ActiveDevToolsEndpoint {
+        http_url: format!("http://127.0.0.1:{port}"),
+        port,
+        websocket_path: websocket_path.to_string(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,8 +439,8 @@ struct BrowserVersion {
     websocket_url: String,
 }
 
-async fn validate_endpoint(endpoint: &str) -> bool {
-    let url = format!("{}/json/version", endpoint.trim_end_matches('/'));
+async fn validate_endpoint(endpoint: &ActiveDevToolsEndpoint) -> bool {
+    let url = format!("{}/json/version", endpoint.http_url.trim_end_matches('/'));
     let Ok(response) = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -437,7 +457,21 @@ async fn validate_endpoint(endpoint: &str) -> bool {
     let Ok(version) = response.json::<BrowserVersion>().await else {
         return false;
     };
-    !version.browser.is_empty() && !version.websocket_url.is_empty()
+    let Ok(websocket_url) = url::Url::parse(&version.websocket_url) else {
+        return false;
+    };
+    let loopback_host = match websocket_url.host_str() {
+        Some("localhost" | "::1") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    };
+    !version.browser.is_empty()
+        && websocket_url.scheme() == "ws"
+        && loopback_host
+        && websocket_url.port() == Some(endpoint.port)
+        && websocket_url.path() == endpoint.websocket_path
 }
 
 async fn remove_stale_active_port(path: &Path) -> Result<()> {
@@ -839,14 +873,21 @@ mod tests {
     fn parses_dynamic_devtools_port() {
         assert_eq!(
             parse_active_port("49321\n/devtools/browser/test\n").unwrap(),
-            "http://127.0.0.1:49321"
+            ActiveDevToolsEndpoint {
+                http_url: "http://127.0.0.1:49321".to_string(),
+                port: 49321,
+                websocket_path: "/devtools/browser/test".to_string(),
+            }
         );
     }
 
     #[test]
     fn rejects_invalid_devtools_port() {
-        assert!(parse_active_port("not-a-port\n").is_err());
+        assert!(parse_active_port("not-a-port\n/devtools/browser/test\n").is_err());
         assert!(parse_active_port("").is_err());
+        assert!(parse_active_port("49321\n").is_err());
+        assert!(parse_active_port("49321\n/devtools/browser/\n").is_err());
+        assert!(parse_active_port("49321\n/devtools/page/test\n").is_err());
     }
 
     #[test]
@@ -1104,6 +1145,50 @@ mod tests {
                 .unwrap(),
             Some(format!("http://127.0.0.1:{port}"))
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_an_endpoint_with_a_different_browser_websocket_identity() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let state = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(state.path().to_path_buf(), None);
+        tokio::fs::create_dir_all(&config.chrome_profile_dir)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::fs::write(
+            &config.devtools_active_port_path,
+            format!("{port}\n/devtools/browser/expected\n"),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = format!(
+                r#"{{"Browser":"Chrome/Test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/unrelated"}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(healthy_active_endpoint(&config).await, None);
         server.await.unwrap();
     }
 
