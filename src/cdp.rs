@@ -1000,6 +1000,11 @@ impl CdpClient {
             self.clear_beforeunload_handlers(&page, &connection, true)
                 .await?;
         }
+        let original_loader_id = if wait_until == "none" {
+            None
+        } else {
+            Some(self.main_frame_loader_id(&page, &connection).await?)
+        };
         let navigation = async {
             let command =
                 || page.execute(ReloadParams::builder().ignore_cache(ignore_cache).build());
@@ -1016,8 +1021,16 @@ impl CdpClient {
                     self.runtime
                         .page_command(&connection, command(), "reload page")
                         .await?;
-                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "DOMContentLoaded")
-                        .await
+                    let result = self
+                        .wait_for_lifecycle_event(&mut events, timeout_ms, "DOMContentLoaded")
+                        .await;
+                    self.recover_completed_reload(
+                        &target.id,
+                        original_loader_id.as_deref().unwrap(),
+                        "DOMContentLoaded",
+                        result,
+                    )
+                    .await
                 }
                 "load" | "network_idle" => {
                     let mut events = self
@@ -1026,8 +1039,16 @@ impl CdpClient {
                     self.runtime
                         .page_command(&connection, command(), "reload page")
                         .await?;
-                    self.wait_for_lifecycle_event(&mut events, timeout_ms, "load")
-                        .await
+                    let result = self
+                        .wait_for_lifecycle_event(&mut events, timeout_ms, "load")
+                        .await;
+                    self.recover_completed_reload(
+                        &target.id,
+                        original_loader_id.as_deref().unwrap(),
+                        "load",
+                        result,
+                    )
+                    .await
                 }
                 _ => unreachable!("reload wait state was validated before navigation"),
             }
@@ -1044,6 +1065,52 @@ impl CdpClient {
             .await;
         self.finish_beforeunload_navigation(&target.id, before_unload, result)
             .await
+    }
+
+    async fn recover_completed_reload(
+        &self,
+        target_id: &str,
+        original_loader_id: &str,
+        event_name: &str,
+        result: Result<(), BrowserToolError>,
+    ) -> Result<(), BrowserToolError> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if error.code != crate::leases::BrowserToolErrorCode::OperationTimeout {
+            return Err(error);
+        }
+
+        // Chrome can commit a reload while its lifecycle event is lost during
+        // target or renderer churn. Do not replay Page.reload. Reattach to the
+        // target and accept the original command only when Chrome proves a new
+        // loader reached the requested document state.
+        let (page, connection) = self.page(target_id).await?;
+        let committed_loader_id = self.main_frame_loader_id(&page, &connection).await?;
+        let ready_state = self
+            .runtime
+            .page_command(
+                &connection,
+                page.evaluate_expression("document.readyState"),
+                "verify reloaded document readiness",
+            )
+            .await?
+            .into_value::<String>()
+            .map_err(|value_error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid reloaded document state: {value_error}"
+                ))
+            })?;
+        if completed_reload_reached_wait_state(
+            original_loader_id,
+            &committed_loader_id,
+            &ready_state,
+            event_name,
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     async fn finish_beforeunload_navigation(
@@ -3754,6 +3821,20 @@ fn committed_navigation_reached_wait_state(
     }
 }
 
+fn completed_reload_reached_wait_state(
+    original_loader_id: &str,
+    committed_loader_id: &str,
+    ready_state: &str,
+    event_name: &str,
+) -> bool {
+    original_loader_id != committed_loader_id
+        && match event_name {
+            "DOMContentLoaded" => matches!(ready_state, "interactive" | "complete"),
+            "load" => ready_state == "complete",
+            _ => false,
+        }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CdpDiagnosticEvent {
     Console {
@@ -4440,6 +4521,34 @@ mod tests {
         ));
         assert!(!committed_navigation_reached_wait_state(
             "new-loader",
+            "new-loader",
+            "loading",
+            "DOMContentLoaded"
+        ));
+    }
+
+    #[test]
+    fn timed_out_reload_requires_a_new_ready_document_loader() {
+        assert!(completed_reload_reached_wait_state(
+            "old-loader",
+            "new-loader",
+            "complete",
+            "load"
+        ));
+        assert!(completed_reload_reached_wait_state(
+            "old-loader",
+            "new-loader",
+            "interactive",
+            "DOMContentLoaded"
+        ));
+        assert!(!completed_reload_reached_wait_state(
+            "same-loader",
+            "same-loader",
+            "complete",
+            "load"
+        ));
+        assert!(!completed_reload_reached_wait_state(
+            "old-loader",
             "new-loader",
             "loading",
             "DOMContentLoaded"
