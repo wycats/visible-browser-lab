@@ -2383,6 +2383,44 @@ fn validate_source_package_contract(root: &Path) -> Result<()> {
     {
         bail!("source MCP config must preserve plugin-root and runtime environment contracts");
     }
+
+    let codex_config_path = root.join(".codex/config.toml");
+    let codex_config_source = fs::read_to_string(&codex_config_path).with_context(|| {
+        format!(
+            "failed to read Codex development config {}",
+            codex_config_path.display()
+        )
+    })?;
+    validate_codex_development_config(&codex_config_source)?;
+    Ok(())
+}
+
+fn validate_codex_development_config(source: &str) -> Result<()> {
+    let codex_config: toml::Value =
+        toml::from_str(source).context("invalid Codex development config TOML")?;
+    let development_server = codex_config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get("visible-browser-lab"))
+        .and_then(toml::Value::as_table)
+        .context("Codex development config omitted or malformed the visible-browser-lab server")?;
+    let expected_args = CODEX_MCP_ARGS
+        .iter()
+        .map(|argument| toml::Value::String((*argument).to_string()))
+        .collect::<Vec<_>>();
+    if development_server
+        .get("command")
+        .and_then(toml::Value::as_str)
+        != Some("./scripts/visible-browser-lab-mcp.sh")
+        || development_server
+            .get("args")
+            .and_then(toml::Value::as_array)
+            != Some(&expected_args)
+    {
+        bail!(
+            "Codex development config must use the source facade with trusted Codex compatibility"
+        );
+    }
     Ok(())
 }
 
@@ -3023,6 +3061,40 @@ mod tests {
             assert_eq!(server["cwd"], "${CLAUDE_PLUGIN_ROOT}");
             assert_eq!(server["args"], json!([]));
         }
+    }
+
+    #[test]
+    fn codex_development_config_preserves_trusted_conversation_identity() {
+        let source = fs::read_to_string(repo_root().unwrap().join(".codex/config.toml")).unwrap();
+        validate_codex_development_config(&source).unwrap();
+
+        let missing_policy = r#"
+[mcp_servers.visible-browser-lab]
+command = "./scripts/visible-browser-lab-mcp.sh"
+args = []
+"#;
+        assert!(
+            validate_codex_development_config(missing_policy)
+                .unwrap_err()
+                .to_string()
+                .contains("trusted Codex compatibility")
+        );
+        assert!(
+            validate_codex_development_config("")
+                .unwrap_err()
+                .to_string()
+                .contains("omitted or malformed the visible-browser-lab server")
+        );
+        assert!(
+            validate_codex_development_config(
+                r#"[mcp_servers]
+visible-browser-lab = "not a server table"
+"#,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("omitted or malformed the visible-browser-lab server")
+        );
     }
 
     #[test]
