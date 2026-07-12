@@ -440,21 +440,7 @@ struct BrowserVersion {
 }
 
 async fn validate_endpoint(endpoint: &ActiveDevToolsEndpoint) -> bool {
-    let url = format!("{}/json/version", endpoint.http_url.trim_end_matches('/'));
-    let Ok(response) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .expect("static HTTP client configuration must be valid")
-        .get(url)
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-    let Ok(version) = response.json::<BrowserVersion>().await else {
+    let Some(version) = browser_version(&endpoint.http_url).await else {
         return false;
     };
     let Ok(websocket_url) = url::Url::parse(&version.websocket_url) else {
@@ -472,6 +458,24 @@ async fn validate_endpoint(endpoint: &ActiveDevToolsEndpoint) -> bool {
         && loopback_host
         && websocket_url.port() == Some(endpoint.port)
         && websocket_url.path() == endpoint.websocket_path
+}
+
+async fn browser_version(endpoint: &str) -> Option<BrowserVersion> {
+    let url = format!("{}/json/version", endpoint.trim_end_matches('/'));
+    let Ok(response) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .expect("static HTTP client configuration must be valid")
+        .get(url)
+        .send()
+        .await
+    else {
+        return None;
+    };
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<BrowserVersion>().await.ok()
 }
 
 async fn remove_stale_active_port(path: &Path) -> Result<()> {
@@ -1344,7 +1348,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!replacement.reused);
-        assert!(validate_endpoint(&replacement.cdp_endpoint).await);
+        assert_eq!(
+            healthy_active_endpoint(&config).await.as_deref(),
+            Some(replacement.cdp_endpoint.as_str())
+        );
 
         terminate_managed_browser(&config, &replacement).await;
         wait_until_unhealthy(&replacement.cdp_endpoint).await;
@@ -1372,7 +1379,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn wait_until_unhealthy(endpoint: &str) {
         let deadline = Instant::now() + CHROME_START_TIMEOUT;
-        while validate_endpoint(endpoint).await {
+        while browser_version(endpoint).await.is_some() {
             assert!(Instant::now() < deadline, "managed Chrome did not stop");
             sleep(Duration::from_millis(50)).await;
         }
