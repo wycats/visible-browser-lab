@@ -86,7 +86,7 @@ use serde_json::{Value, json};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, broadcast, mpsc, oneshot, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
@@ -3079,10 +3079,10 @@ impl CdpClient {
                 ))
             })?;
 
-        let (recorder, recorder_task) = RawCdpClient::connect(&self.runtime.endpoint).await?;
+        let (recorder, binding_events, recorder_task) =
+            RawCdpClient::connect(&self.runtime.endpoint).await?;
         let mut hidden_target_id = None::<String>;
         let setup = async {
-            let binding_events = recorder.subscribe();
             let hidden = recorder
                 .execute(
                     "Target.createTarget",
@@ -3731,7 +3731,6 @@ impl CdpClient {
 #[derive(Clone)]
 struct RawCdpClient {
     commands: mpsc::Sender<RawCdpCommand>,
-    events: broadcast::Sender<Value>,
 }
 
 struct RawCdpCommand {
@@ -3742,7 +3741,9 @@ struct RawCdpCommand {
 }
 
 impl RawCdpClient {
-    async fn connect(endpoint: &CdpEndpoint) -> Result<(Self, JoinHandle<()>), BrowserToolError> {
+    async fn connect(
+        endpoint: &CdpEndpoint,
+    ) -> Result<(Self, mpsc::Receiver<Value>, JoinHandle<()>), BrowserToolError> {
         let websocket_url = if matches!(endpoint.origin().scheme(), "ws" | "wss") {
             endpoint.origin().clone()
         } else {
@@ -3805,8 +3806,7 @@ impl RawCdpClient {
         })?;
         let (mut output, mut input) = stream.split();
         let (command_tx, mut command_rx) = mpsc::channel::<RawCdpCommand>(32);
-        let (event_tx, _) = broadcast::channel::<Value>(8);
-        let actor_events = event_tx.clone();
+        let (event_tx, event_rx) = mpsc::channel::<Value>(8);
         let task = tokio::spawn(async move {
             let mut next_id = 1u64;
             let mut pending =
@@ -3870,8 +3870,10 @@ impl RawCdpClient {
                                 };
                                 let _ = response.send(result);
                             }
-                        } else {
-                            let _ = actor_events.send(value);
+                        } else if value.get("method").and_then(Value::as_str)
+                            == Some("Runtime.bindingCalled")
+                        {
+                            let _ = event_tx.send(value).await;
                         }
                     }
                 }
@@ -3885,14 +3887,10 @@ impl RawCdpClient {
         Ok((
             Self {
                 commands: command_tx,
-                events: event_tx,
             },
+            event_rx,
             task,
         ))
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.events.subscribe()
     }
 
     async fn execute(
@@ -4036,7 +4034,7 @@ struct RecorderCompletion {
 }
 
 async fn write_screencast_chunks(
-    mut events: broadcast::Receiver<Value>,
+    mut events: mpsc::Receiver<Value>,
     session_id: String,
     partial_path: PathBuf,
 ) -> Result<RecorderCompletion, BrowserToolError> {
@@ -4054,13 +4052,8 @@ async fn write_screencast_chunks(
     let mut written_bytes = 0u64;
     loop {
         let event = match events.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                return Err(BrowserToolError::artifact_error(format!(
-                    "hidden screencast event receiver dropped {skipped} messages"
-                )));
-            }
-            Err(broadcast::error::RecvError::Closed) => {
+            Some(event) => event,
+            None => {
                 return Err(BrowserToolError::chrome_unavailable(
                     "hidden screencast recorder event stream ended before finalization",
                 ));
@@ -4146,7 +4139,7 @@ async fn run_streaming_screencast(
     source_connection: RuntimeConnection,
     recorder: RawCdpClient,
     recorder_session_id: String,
-    binding_events: broadcast::Receiver<Value>,
+    binding_events: mpsc::Receiver<Value>,
     mut frame_events: chromiumoxide::listeners::EventStream<EventScreencastFrame>,
     mut visibility_events: chromiumoxide::listeners::EventStream<EventScreencastVisibilityChanged>,
     mut control: watch::Receiver<ScreencastControl>,
