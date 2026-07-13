@@ -1611,6 +1611,10 @@ pub fn run_screencast_smoke(
     open_tabs: &mut Vec<OpenTab>,
     duration: Duration,
 ) -> Result<ScreencastSmokeSummary> {
+    let max_duration_ms = u64::try_from(duration.as_millis())
+        .context("screencast smoke duration exceeded the wire integer range")?
+        .checked_add(30_000)
+        .context("screencast smoke duration overflowed its finalization allowance")?;
     client.initialize("visible-browser-lab-screencast-smoke")?;
     let session = client.call_tool(
         "start_session",
@@ -1646,7 +1650,7 @@ pub fn run_screencast_smoke(
             "operation":"start",
             "fps":10,
             "quality":70,
-            "max_duration_ms":duration.as_millis().saturating_add(30_000),
+            "max_duration_ms":max_duration_ms,
             "max_width":1280,
             "max_height":720
         }),
