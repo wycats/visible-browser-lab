@@ -1679,6 +1679,16 @@ pub fn run_screencast_smoke(
         Duration::from_secs(20),
         false,
     )?;
+    let before_recording = client.call_tool(
+        "list_tabs",
+        json!({
+            "agent_session_id":session_id,
+            "scope":"global_readonly"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let before_recording = global_target_ids(&before_recording)?;
     client.call_tool(
         "screencast",
         json!({
@@ -1694,6 +1704,21 @@ pub fn run_screencast_smoke(
         Duration::from_secs(20),
         false,
     )?;
+    let during_recording = client.call_tool(
+        "list_tabs",
+        json!({
+            "agent_session_id":session_id,
+            "scope":"global_readonly"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let during_recording = global_target_ids(&during_recording)?;
+    if during_recording != before_recording {
+        bail!(
+            "private screencast target changed public tab inventory: before={before_recording:?}, during={during_recording:?}"
+        );
+    }
     thread::sleep(duration);
 
     let stop_started = Instant::now();
@@ -1769,6 +1794,21 @@ pub fn run_screencast_smoke(
         size_bytes,
         stop_elapsed,
     })
+}
+
+fn global_target_ids(inventory: &Value) -> Result<Vec<String>> {
+    let groups = inventory
+        .get("groups")
+        .and_then(Value::as_array)
+        .context("global list_tabs omitted groups array")?;
+    let mut target_ids = groups
+        .iter()
+        .filter_map(|group| group.get("tabs").and_then(Value::as_array))
+        .flat_map(|tabs| tabs.iter())
+        .map(|tab| field_str(tab, "target_id"))
+        .collect::<Result<Vec<_>>>()?;
+    target_ids.sort();
+    Ok(target_ids)
 }
 
 pub struct McpClient {

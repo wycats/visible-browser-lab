@@ -6914,12 +6914,7 @@ async fn broker_close_tab(
             "stop the active performance trace before closing its tab",
         ));
     }
-    if let Some(job) = state.screencasts.lock().await.get(&params.tab_id).cloned()
-        && job.terminal.lock().unwrap().is_none()
-        && job.controller.progress().phase == CdpScreencastPhase::Recording
-    {
-        job.controller.cancel();
-    }
+    let active_screencast = state.screencasts.lock().await.get(&params.tab_id).cloned();
 
     let lease = state
         .registry()
@@ -6952,6 +6947,12 @@ async fn broker_close_tab(
             .unwrap()
             .finish_owned_tab_close_reservation(&lease.target_id, &params.tab_id);
         return Err(error);
+    }
+    if let Some(job) = active_screencast
+        && job.terminal.lock().unwrap().is_none()
+        && job.controller.progress().phase == CdpScreencastPhase::Recording
+    {
+        job.controller.cancel();
     }
     state
         .viewport_overrides
@@ -10320,6 +10321,44 @@ mod tests {
         )
         .await
         .unwrap();
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "stop", json!({}))),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_close_preserves_an_active_screencast() {
+        let (state, session_id, tab_id) = screencast_fixture(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_failed_emulation_reset(),
+        );
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+
+        let error = broker_close_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session_id.clone(),
+                tab_id: tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        let status = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "status", json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["state"], "recording");
+
         broker_screencast(
             &state,
             Ok(screencast_params(&session_id, &tab_id, "stop", json!({}))),

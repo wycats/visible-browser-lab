@@ -242,6 +242,7 @@ impl CdpClient {
 
     pub async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
         let connection = self.runtime.connection().await?;
+        let _inventory = self.runtime.target_inventory.lock().await;
         let response = self
             .runtime
             .browser_command(
@@ -250,12 +251,27 @@ impl CdpClient {
                 "list Chrome targets",
             )
             .await?;
+        let target_infos = response.result.target_infos;
+        let present_target_ids = target_infos
+            .iter()
+            .map(|target| target.target_id.as_ref().to_string())
+            .collect::<HashSet<_>>();
+        let private_target_ids = self
+            .runtime
+            .private_targets
+            .lock()
+            .unwrap()
+            .target_ids_for_inventory(&present_target_ids);
 
-        Ok(response
-            .result
-            .target_infos
+        Ok(target_infos
             .into_iter()
-            .filter(|target| target.r#type == "page")
+            .filter(|target| {
+                is_public_page_target(
+                    &target.r#type,
+                    target.target_id.as_ref(),
+                    &private_target_ids,
+                )
+            })
             .map(|target| CdpTarget {
                 id: target.target_id.as_ref().to_string(),
                 target_type: target.r#type,
@@ -3083,26 +3099,7 @@ impl CdpClient {
             RawCdpClient::connect(&self.runtime.endpoint).await?;
         let mut hidden_target_id = None::<String>;
         let setup = async {
-            let hidden = recorder
-                .execute(
-                    "Target.createTarget",
-                    json!({
-                        "url": "about:blank",
-                        "hidden": true,
-                        "background": true,
-                    }),
-                    None,
-                )
-                .await?;
-            let target_id = hidden
-                .get("targetId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    BrowserToolError::chrome_unavailable(
-                        "Chrome omitted the hidden screencast target id",
-                    )
-                })?
-                .to_string();
+            let target_id = create_hidden_screencast_target(&self.runtime, &recorder).await?;
             hidden_target_id = Some(target_id.clone());
             let attached = recorder
                 .execute(
@@ -3168,15 +3165,7 @@ impl CdpClient {
             Ok(setup) => setup,
             Err(error) => {
                 if let Some(target_id) = hidden_target_id.as_deref() {
-                    let _ = timeout(
-                        Duration::from_secs(1),
-                        recorder.execute(
-                            "Target.closeTarget",
-                            json!({ "targetId": target_id }),
-                            None,
-                        ),
-                    )
-                    .await;
+                    close_hidden_screencast_target(&self.runtime, &recorder, target_id).await;
                 }
                 recorder_task.abort();
                 return Err(error);
@@ -3193,7 +3182,7 @@ impl CdpClient {
         let task_runtime = Arc::clone(&self.runtime);
         let task = tokio::spawn(async move {
             let result = run_streaming_screencast(
-                task_runtime,
+                Arc::clone(&task_runtime),
                 source_page,
                 connection,
                 task_recorder.clone(),
@@ -3209,15 +3198,8 @@ impl CdpClient {
                 max_duration,
             )
             .await;
-            let _ = timeout(
-                Duration::from_secs(1),
-                task_recorder.execute(
-                    "Target.closeTarget",
-                    json!({ "targetId": task_hidden_target_id }),
-                    None,
-                ),
-            )
-            .await;
+            close_hidden_screencast_target(&task_runtime, &task_recorder, &task_hidden_target_id)
+                .await;
             recorder_task.abort();
             result
         });
@@ -3938,6 +3920,58 @@ fn try_forward_binding_event(events: &mpsc::Sender<Value>, event: Value) -> Resu
     })
 }
 
+async fn create_hidden_screencast_target(
+    runtime: &CdpRuntime,
+    recorder: &RawCdpClient,
+) -> Result<String, BrowserToolError> {
+    let _inventory = runtime.target_inventory.lock().await;
+    let hidden = recorder
+        .execute(
+            "Target.createTarget",
+            json!({
+                "url": "about:blank",
+                "hidden": true,
+                "background": true,
+            }),
+            None,
+        )
+        .await?;
+    let target_id = hidden
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BrowserToolError::chrome_unavailable("Chrome omitted the hidden screencast target id")
+        })?
+        .to_string();
+    runtime
+        .private_targets
+        .lock()
+        .unwrap()
+        .insert(target_id.clone());
+    Ok(target_id)
+}
+
+async fn close_hidden_screencast_target(
+    runtime: &CdpRuntime,
+    recorder: &RawCdpClient,
+    target_id: &str,
+) {
+    let _inventory = runtime.target_inventory.lock().await;
+    let _ = timeout(
+        Duration::from_secs(1),
+        recorder.execute("Target.closeTarget", json!({ "targetId": target_id }), None),
+    )
+    .await;
+    runtime
+        .private_targets
+        .lock()
+        .unwrap()
+        .mark_closing(target_id);
+    // Keep the private marker until a serialized inventory proves that Chrome
+    // has actually removed the target. A successful close response can precede
+    // target disappearance by a short interval.
+}
+
 async fn evaluate_screencast_expression(
     recorder: &RawCdpClient,
     session_id: &str,
@@ -4446,7 +4480,22 @@ async fn run_streaming_screencast(
 }
 
 fn source_screencast_disappeared(error: &CdpError) -> bool {
-    matches!(error, CdpError::NotFound)
+    match error {
+        CdpError::NotFound | CdpError::NoResponse | CdpError::ChannelSendError(_) => true,
+        CdpError::Chrome(error) => closed_source_session_message(&error.message),
+        CdpError::ChromeMessage(message) => closed_source_session_message(message),
+        _ => false,
+    }
+}
+
+fn closed_source_session_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("session with given id not found")
+        || message.contains("no session with given id")
+        || message.contains("session closed")
+        || message.contains("target closed")
+        || message.contains("target with given id not found")
+        || message.contains("inspected target navigated or closed")
 }
 
 async fn wait_for_screencast_cancel(control: &mut watch::Receiver<ScreencastControl>) {
@@ -4497,6 +4546,13 @@ fn navigation_timeout_budget(timeout_ms: u64, waits_for_lifecycle: bool) -> Dura
 struct CdpRuntime {
     endpoint: CdpEndpoint,
     state: Mutex<RuntimeState>,
+    /// Serializes target discovery with private recorder creation and cleanup
+    /// so a recorder target cannot appear in caller-visible inventory during
+    /// the gap between Chrome creating it and VBL registering its target id.
+    target_inventory: Mutex<()>,
+    /// Internal recorder targets are implementation details, not browser tabs
+    /// that callers may list, claim, or manipulate.
+    private_targets: StdMutex<PrivateTargetInventory>,
     /// Targets whose screencast has engaged focus emulation to keep frames
     /// flowing while the page is hidden (RFC 00010). The emulation makes the
     /// page report itself focused and visible, so user-focus checks must
@@ -4552,6 +4608,8 @@ impl CdpRuntime {
         Self {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
+            target_inventory: Mutex::new(()),
+            private_targets: StdMutex::new(PrivateTargetInventory::default()),
             screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
             stale_page_contexts: StdMutex::new(BTreeMap::new()),
             stale_page_context_revision: AtomicU64::new(0),
@@ -4733,6 +4791,42 @@ impl CdpRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct PrivateTargetInventory {
+    target_ids: HashSet<String>,
+    closing_target_ids: HashSet<String>,
+}
+
+impl PrivateTargetInventory {
+    fn insert(&mut self, target_id: String) {
+        self.closing_target_ids.remove(&target_id);
+        self.target_ids.insert(target_id);
+    }
+
+    fn mark_closing(&mut self, target_id: &str) {
+        if self.target_ids.contains(target_id) {
+            self.closing_target_ids.insert(target_id.to_string());
+        }
+    }
+
+    fn target_ids_for_inventory(
+        &mut self,
+        present_target_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        let removed_target_ids = self
+            .closing_target_ids
+            .iter()
+            .filter(|target_id| !present_target_ids.contains(*target_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for target_id in removed_target_ids {
+            self.closing_target_ids.remove(&target_id);
+            self.target_ids.remove(&target_id);
+        }
+        self.target_ids.clone()
+    }
+}
+
 impl Drop for CdpRuntime {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.try_lock()
@@ -4741,6 +4835,14 @@ impl Drop for CdpRuntime {
             connection.handler.abort();
         }
     }
+}
+
+fn is_public_page_target(
+    target_type: &str,
+    target_id: &str,
+    private_target_ids: &HashSet<String>,
+) -> bool {
+    target_type == "page" && !private_target_ids.contains(target_id)
 }
 
 fn invalidates_connection(error: &CdpError) -> bool {
@@ -5573,7 +5675,45 @@ mod tests {
     #[test]
     fn missing_source_target_does_not_fail_screencast_finalization() {
         assert!(source_screencast_disappeared(&CdpError::NotFound));
+        assert!(source_screencast_disappeared(&CdpError::NoResponse));
+        assert!(source_screencast_disappeared(&CdpError::Chrome(
+            chromiumoxide::types::Error {
+                code: -32001,
+                message: "Session with given id not found.".to_string(),
+            }
+        )));
         assert!(!source_screencast_disappeared(&CdpError::Timeout));
+    }
+
+    #[test]
+    fn private_recorder_targets_are_not_public_page_targets() {
+        let private = HashSet::from(["recorder".to_string()]);
+        assert!(!is_public_page_target("page", "recorder", &private));
+        assert!(is_public_page_target("page", "user-tab", &private));
+        assert!(!is_public_page_target("service_worker", "worker", &private));
+    }
+
+    #[test]
+    fn private_target_markers_only_retire_after_close_and_confirmed_absence() {
+        let mut private = PrivateTargetInventory::default();
+        private.insert("recorder".to_string());
+
+        assert!(
+            private
+                .target_ids_for_inventory(&HashSet::new())
+                .contains("recorder")
+        );
+        private.mark_closing("recorder");
+        assert!(
+            private
+                .target_ids_for_inventory(&HashSet::from(["recorder".to_string()]))
+                .contains("recorder")
+        );
+        assert!(
+            !private
+                .target_ids_for_inventory(&HashSet::new())
+                .contains("recorder")
+        );
     }
 
     #[test]
