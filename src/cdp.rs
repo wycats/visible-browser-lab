@@ -3746,26 +3746,32 @@ impl RawCdpClient {
         let websocket_url = if matches!(endpoint.origin().scheme(), "ws" | "wss") {
             endpoint.origin().clone()
         } else {
-            let version = reqwest::get(endpoint.version_url())
-                .await
-                .map_err(|error| {
-                    BrowserToolError::chrome_unavailable(format!(
-                        "failed to discover Chrome websocket endpoint: {error}"
-                    ))
-                })?
-                .error_for_status()
-                .map_err(|error| {
-                    BrowserToolError::chrome_unavailable(format!(
-                        "Chrome websocket discovery failed: {error}"
-                    ))
-                })?
-                .json::<Value>()
-                .await
-                .map_err(|error| {
-                    BrowserToolError::chrome_unavailable(format!(
-                        "Chrome returned invalid websocket discovery data: {error}"
-                    ))
-                })?;
+            let version = timeout(SCREENCAST_RAW_CDP_TIMEOUT, async {
+                reqwest::get(endpoint.version_url())
+                    .await
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "failed to discover Chrome websocket endpoint: {error}"
+                        ))
+                    })?
+                    .error_for_status()
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome websocket discovery failed: {error}"
+                        ))
+                    })?
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned invalid websocket discovery data: {error}"
+                        ))
+                    })
+            })
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout("Chrome websocket discovery exceeded 5 seconds")
+            })??;
             Url::parse(
                 version
                     .get("webSocketDebuggerUrl")
@@ -3782,13 +3788,21 @@ impl RawCdpClient {
                 ))
             })?
         };
-        let (stream, _) = connect_async(websocket_url.as_str())
-            .await
-            .map_err(|error| {
-                BrowserToolError::chrome_unavailable(format!(
-                    "failed to connect hidden screencast CDP session: {error}"
-                ))
-            })?;
+        let (stream, _) = timeout(
+            SCREENCAST_RAW_CDP_TIMEOUT,
+            connect_async(websocket_url.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            BrowserToolError::operation_timeout(
+                "hidden screencast CDP handshake exceeded 5 seconds",
+            )
+        })?
+        .map_err(|error| {
+            BrowserToolError::chrome_unavailable(format!(
+                "failed to connect hidden screencast CDP session: {error}"
+            ))
+        })?;
         let (mut output, mut input) = stream.split();
         let (command_tx, mut command_rx) = mpsc::channel::<RawCdpCommand>(32);
         let (event_tx, _) = broadcast::channel::<Value>(8);
