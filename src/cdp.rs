@@ -4297,11 +4297,15 @@ async fn run_streaming_screencast(
     let stop_result = tokio::select! {
         result = timeout(
             Duration::from_secs(5),
-            runtime.page_command(
-                &source_connection,
-                source_page.execute(StopScreencastParams::default()),
-                "stop page screencast",
-            ),
+            async {
+                match source_page.execute(StopScreencastParams::default()).await {
+                    Ok(_) => Ok(()),
+                    Err(error) if source_screencast_disappeared(&error) => Ok(()),
+                    Err(error) => Err(runtime
+                        .page_error(&source_connection, "stop page screencast", error)
+                        .await),
+                }
+            },
         ) => Some(result),
         _ = wait_for_screencast_cancel(&mut control), if !cancelled => {
             cancelled = true;
@@ -4434,6 +4438,10 @@ async fn run_streaming_screencast(
         .await
         .map_err(CdpScreencastFailure::browser)?;
     Ok(CdpScreencastOutput { metrics })
+}
+
+fn source_screencast_disappeared(error: &CdpError) -> bool {
+    matches!(error, CdpError::NotFound)
 }
 
 async fn wait_for_screencast_cancel(control: &mut watch::Receiver<ScreencastControl>) {
@@ -5545,6 +5553,12 @@ fn wall_timestamp_ms(value: Option<&Value>) -> Option<u64> {
 mod tests {
     use super::*;
     use visible_browser_lab_test_support::{BrowserMode, RealBrowser};
+
+    #[test]
+    fn missing_source_target_does_not_fail_screencast_finalization() {
+        assert!(source_screencast_disappeared(&CdpError::NotFound));
+        assert!(!source_screencast_disappeared(&CdpError::Timeout));
+    }
 
     #[test]
     fn builds_cdp_discovery_urls() {

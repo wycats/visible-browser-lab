@@ -3562,7 +3562,11 @@ async fn broker_claim_tab(
             .lock()
             .await
             .values()
-            .filter(|job| job.target_id == target.id && job.terminal.lock().unwrap().is_none())
+            .filter(|job| {
+                job.target_id == target.id
+                    && job.terminal.lock().unwrap().is_none()
+                    && job.controller.progress().phase == CdpScreencastPhase::Recording
+            })
             .cloned()
             .collect::<Vec<_>>();
         for job in jobs {
@@ -6893,16 +6897,16 @@ async fn broker_close_tab(
         .lock()
         .unwrap()
         .owned_lease(&params.agent_session_id, &params.tab_id)?;
+    if state.traces.lock().await.contains_key(&lease.target_id) {
+        return Err(BrowserToolError::invalid_input(
+            "stop the active performance trace before closing its tab",
+        ));
+    }
     if let Some(job) = state.screencasts.lock().await.get(&params.tab_id).cloned()
         && job.terminal.lock().unwrap().is_none()
         && job.controller.progress().phase == CdpScreencastPhase::Recording
     {
         job.controller.cancel();
-    }
-    if state.traces.lock().await.contains_key(&lease.target_id) {
-        return Err(BrowserToolError::invalid_input(
-            "stop the active performance trace before closing its tab",
-        ));
     }
 
     let lease = state
@@ -7444,7 +7448,7 @@ mod tests {
         tab_id: &TabId,
         expected: &str,
     ) -> Value {
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             let status = broker_screencast(
                 state,
                 Ok(screencast_params(session_id, tab_id, "status", json!({}))),
@@ -10171,12 +10175,145 @@ mod tests {
 
         browser.lock().unwrap().targets.clear();
         reconcile_missing_targets(&state, &[]).await;
+        tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(10)).await;
         let ready =
             wait_for_screencast_state(&state, &session.agent_session_id, &tab.tab_id, "ready")
                 .await;
         assert_eq!(ready["recording"], false);
         assert!(ready["artifact"]["artifact_id"].is_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn takeover_preserves_a_finalizing_screencast() {
+        let browser = FakeBrowser::with_targets(vec![fake_target("target-a")])
+            .with_screencast_finalization_delay(Duration::from_secs(10));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(browser))));
+        let first = state.registry().lock().unwrap().start_session(None);
+        let first_tab = state
+            .registry()
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &first.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        let second = state.registry().lock().unwrap().start_session(None);
+
+        broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &first.agent_session_id,
+                &first_tab.tab_id,
+                "start",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+        let stop_state = state.clone();
+        let stop_session = first.agent_session_id.clone();
+        let stop_tab = first_tab.tab_id.clone();
+        let stop = tokio::spawn(async move {
+            broker_screencast(
+                &stop_state,
+                Ok(screencast_params(
+                    &stop_session,
+                    &stop_tab,
+                    "stop",
+                    json!({}),
+                )),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        wait_for_screencast_state(
+            &state,
+            &first.agent_session_id,
+            &first_tab.tab_id,
+            "finalizing",
+        )
+        .await;
+
+        broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: second.agent_session_id,
+                target_id: "target-a".to_string(),
+                takeover: true,
+                user_instruction: Some("Take over the tab".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let ready =
+            wait_for_screencast_state(&state, &first.agent_session_id, &first_tab.tab_id, "ready")
+                .await;
+        assert!(ready["artifact"]["artifact_id"].is_string());
+        stop.abort();
+    }
+
+    #[tokio::test]
+    async fn blocked_close_preserves_an_active_screencast() {
+        let (state, session_id, tab_id) =
+            screencast_fixture(FakeBrowser::with_targets(vec![fake_target("target-a")]));
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+        broker_performance(
+            &state,
+            Ok(screencast_params(
+                &session_id,
+                &tab_id,
+                "start_trace",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+
+        let error = broker_close_tab(
+            &state,
+            Ok(TabActionParams {
+                agent_session_id: session_id.clone(),
+                tab_id: tab_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        let status = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "status", json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["state"], "recording");
+
+        broker_performance(
+            &state,
+            Ok(screencast_params(
+                &session_id,
+                &tab_id,
+                "stop_trace",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "stop", json!({}))),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

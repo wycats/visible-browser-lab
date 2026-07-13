@@ -2094,35 +2094,56 @@ pub fn close_browser_via_cdp(endpoint: &str) -> Result<()> {
     bail!("managed Chrome endpoint `{endpoint}` remained reachable after Browser.close")
 }
 
-pub fn cdp_target_count_by_type(endpoint: &str, target_type: &str) -> Result<usize> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to create target inventory runtime")?;
-    runtime.block_on(async {
-        let (browser, mut handler) = Browser::connect(endpoint)
-            .await
+pub struct CdpTargetInventory {
+    runtime: tokio::runtime::Runtime,
+    browser: Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+}
+
+impl CdpTargetInventory {
+    pub fn connect(endpoint: &str) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create target inventory runtime")?;
+        let (browser, mut handler) = runtime
+            .block_on(Browser::connect(endpoint))
             .with_context(|| format!("failed to connect to Chrome at `{endpoint}`"))?;
-        let handler_task = tokio::spawn(async move {
+        let handler_task = runtime.spawn(async move {
             while let Some(result) = handler.next().await {
                 if result.is_err() {
                     break;
                 }
             }
         });
-        let count = browser
-            .execute(GetTargetsParams::default())
-            .await
-            .context("failed to inventory Chrome targets")?
-            .result
-            .target_infos
-            .into_iter()
-            .filter(|target| target.r#type == target_type)
-            .count();
-        drop(browser);
-        handler_task.abort();
-        Ok::<usize, anyhow::Error>(count)
-    })
+        Ok(Self {
+            runtime,
+            browser,
+            handler_task,
+        })
+    }
+
+    pub fn count_by_type(&self, target_type: &str) -> Result<usize> {
+        self.runtime.block_on(async {
+            let count = self
+                .browser
+                .execute(GetTargetsParams::default())
+                .await
+                .context("failed to inventory Chrome targets")?
+                .result
+                .target_infos
+                .into_iter()
+                .filter(|target| target.r#type == target_type)
+                .count();
+            Ok::<usize, anyhow::Error>(count)
+        })
+    }
+}
+
+impl Drop for CdpTargetInventory {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+    }
 }
 
 pub fn managed_endpoint(state_dir: &Path) -> Result<String> {

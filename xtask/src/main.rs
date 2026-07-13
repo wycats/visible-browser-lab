@@ -1116,7 +1116,7 @@ fn live_smoke(args: LiveSmokeArgs) -> Result<()> {
 
 fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
     use visible_browser_lab_test_support::{
-        BrowserMode, McpClient, RealBrowser, cdp_target_count_by_type, cleanup_open_tabs,
+        BrowserMode, CdpTargetInventory, McpClient, RealBrowser, cleanup_open_tabs,
         run_screencast_smoke, stop_broker,
     };
 
@@ -1139,7 +1139,8 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
         .with_context(|| format!("failed to create `{}`", state_dir.display()))?;
     let mut browser = RealBrowser::launch(BrowserMode::Headless)?;
     let endpoint = browser.cdp_endpoint().to_string();
-    let baseline_other_targets = cdp_target_count_by_type(&endpoint, "other")?;
+    let target_inventory = CdpTargetInventory::connect(&endpoint)?;
+    let baseline_other_targets = target_inventory.count_by_type("other")?;
     let mut client = McpClient::spawn(&binary, &endpoint, &state_dir, &root)?;
     let mut open_tabs = Vec::new();
     let result = run_screencast_smoke(&mut client, &mut open_tabs, args.duration);
@@ -1150,7 +1151,7 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
         stop_broker(&state_dir);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let current = cdp_target_count_by_type(&endpoint, "other")?;
+            let current = target_inventory.count_by_type("other")?;
             if current <= baseline_other_targets {
                 break;
             }

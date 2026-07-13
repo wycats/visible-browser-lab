@@ -305,6 +305,19 @@ jobs:
           test -n "$chrome"
           echo "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" >> "$GITHUB_ENV"
 
+      # Chrome for Testing publishes no Windows ARM package. The native ARM
+      # runner image includes Google Chrome, so use the explicit test-browser
+      # path instead of asking the CFT manager for an unsupported platform.
+      - name: Select installed Chrome for Windows ARM screencast smoke
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $chrome = Join-Path $Env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+          if (-not (Test-Path $chrome)) {
+            throw "Windows ARM runner Chrome was not found at $chrome"
+          }
+          "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Validate packaged durable screencast
         shell: bash
         env:
