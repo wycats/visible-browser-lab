@@ -6787,12 +6787,7 @@ async fn finalize_screencast_job(
     reservation: ReservedArtifact,
 ) {
     let terminal = match BrowserBackend::finish_screencast(capture).await {
-        Ok(_) => match state
-            .artifacts()
-            .lock()
-            .unwrap()
-            .publish_reserved(reservation.clone())
-        {
+        Ok(_) => match publish_screencast_reservation(state.clone(), reservation.clone()).await {
             Ok(artifact) => ScreencastTerminal::Ready(artifact),
             Err(error) => {
                 state
@@ -6819,6 +6814,23 @@ async fn finalize_screencast_job(
         }
     };
     *job.terminal.lock().unwrap() = Some(terminal);
+}
+
+async fn publish_screencast_reservation(
+    state: BrokerState,
+    reservation: ReservedArtifact,
+) -> Result<ArtifactSummary, BrowserToolError> {
+    tokio::task::spawn_blocking(move || {
+        state
+            .artifacts()
+            .lock()
+            .unwrap()
+            .publish_reserved(reservation)
+    })
+    .await
+    .map_err(|error| {
+        BrowserToolError::artifact_error(format!("artifact publication task failed: {error}"))
+    })?
 }
 
 fn current_time_ms() -> u64 {

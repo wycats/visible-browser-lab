@@ -1885,6 +1885,14 @@
         "icon": "$(browser)",
         "inputSchema": {
           "additionalProperties": false,
+          "dependencies": {
+            "max_height": [
+              "max_width"
+            ],
+            "max_width": [
+              "max_height"
+            ]
+          },
           "properties": {
             "fps": {
               "maximum": 30,

@@ -591,7 +591,14 @@ fn compact_domain_input_schema(domain: &str, operations: &[&str]) -> Value {
         required.push("tab_id");
     }
     required.push("operation");
-    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+    let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+    if domain == "screencast" {
+        schema["dependencies"] = json!({
+            "max_width": ["max_height"],
+            "max_height": ["max_width"]
+        });
+    }
+    schema
 }
 
 fn compact_domain_output_schema(domain: &str, operations: &[&str]) -> Value {
@@ -2302,6 +2309,13 @@ mod tests {
         assert_eq!(properties["max_width"]["maximum"], 3_840);
         assert_eq!(properties["max_width"]["multipleOf"], 2);
         assert_eq!(properties["max_height"]["maximum"], 2_160);
+        assert_eq!(
+            tool.input_schema["dependencies"],
+            json!({
+                "max_width": ["max_height"],
+                "max_height": ["max_width"]
+            })
+        );
         let output = serde_json::to_string(&tool.output_schema).unwrap();
         for state in ["recording", "finalizing", "ready", "error"] {
             assert!(output.contains(state), "missing screencast state {state}");
