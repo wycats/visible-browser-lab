@@ -288,6 +288,7 @@ jobs:
           fi
 
       - name: Cache Chrome for Testing
+        if: ${{ !contains(matrix.target, 'windows') }}
         uses: actions/cache@v6
         with:
           path: target/chrome-for-testing
@@ -305,11 +306,11 @@ jobs:
           test -n "$chrome"
           echo "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" >> "$GITHUB_ENV"
 
-      # Chrome for Testing publishes no Windows ARM package. The native ARM
-      # runner image includes Google Chrome, so use the explicit test-browser
-      # path instead of asking the CFT manager for an unsupported platform.
-      - name: Select installed Chrome for Windows ARM screencast smoke
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+      # Cached Chrome for Testing can retain ACLs that its Windows sandbox
+      # cannot execute after restore. Both native Windows runner images include
+      # Google Chrome, so use that stable executable for packaged smoke tests.
+      - name: Select installed Chrome for Windows screencast smoke
+        if: contains(matrix.target, 'windows')
         shell: pwsh
         run: |
           $chrome = Join-Path $Env:ProgramFiles 'Google\Chrome\Application\chrome.exe'

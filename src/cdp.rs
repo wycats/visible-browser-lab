@@ -3872,8 +3872,9 @@ impl RawCdpClient {
                             }
                         } else if value.get("method").and_then(Value::as_str)
                             == Some("Runtime.bindingCalled")
+                            && let Err(error) = try_forward_binding_event(&event_tx, value)
                         {
-                            let _ = event_tx.send(value).await;
+                            break error;
                         }
                     }
                 }
@@ -3924,6 +3925,17 @@ impl RawCdpClient {
                 )
             })?
     }
+}
+
+fn try_forward_binding_event(events: &mpsc::Sender<Value>, event: Value) -> Result<(), String> {
+    events.try_send(event).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => {
+            "hidden screencast recorder event queue overflowed".to_string()
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            "hidden screencast recorder event consumer closed".to_string()
+        }
+    })
 }
 
 async fn evaluate_screencast_expression(
@@ -5546,6 +5558,17 @@ fn wall_timestamp_ms(value: Option<&Value>) -> Option<u64> {
 mod tests {
     use super::*;
     use visible_browser_lab_test_support::{BrowserMode, RealBrowser};
+
+    #[test]
+    fn full_screencast_event_queue_fails_without_waiting() {
+        let (events, _receiver) = mpsc::channel(1);
+        try_forward_binding_event(&events, json!({ "chunk": 1 })).unwrap();
+
+        assert_eq!(
+            try_forward_binding_event(&events, json!({ "chunk": 2 })).unwrap_err(),
+            "hidden screencast recorder event queue overflowed"
+        );
+    }
 
     #[test]
     fn missing_source_target_does_not_fail_screencast_finalization() {
