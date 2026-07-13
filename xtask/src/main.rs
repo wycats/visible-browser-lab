@@ -1140,7 +1140,10 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
     let mut browser = RealBrowser::launch(BrowserMode::Headless)?;
     let endpoint = browser.cdp_endpoint().to_string();
     let target_inventory = CdpTargetInventory::connect(&endpoint)?;
-    let baseline_page_targets = target_inventory.count_by_type("page")?;
+    // Chrome reports hidden recorder targets as `page` in headless runners and
+    // `other` in headed Chrome. Track both while ignoring unrelated service
+    // worker churn from Chrome's own background services.
+    let baseline_targets = target_inventory.target_snapshot_by_types(&["page", "other"])?;
     let mut client = McpClient::spawn(&binary, &endpoint, &state_dir, &root)?;
     let mut open_tabs = Vec::new();
     let result = run_screencast_smoke(&mut client, &mut open_tabs, args.duration);
@@ -1151,13 +1154,17 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
         stop_broker(&state_dir);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let current = target_inventory.count_by_type("page")?;
-            if current <= baseline_page_targets {
+            let current = target_inventory.target_snapshot_by_types(&["page", "other"])?;
+            let unexpected = current
+                .iter()
+                .filter(|target| !baseline_targets.contains(target))
+                .collect::<Vec<_>>();
+            if unexpected.is_empty() {
                 break;
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "hidden screencast target survived cleanup: baseline={baseline_page_targets}, current={current}"
+                    "hidden screencast target survived cleanup: unexpected={unexpected:?}, baseline={baseline_targets:?}, current={current:?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(100));

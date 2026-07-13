@@ -18,10 +18,10 @@ export function withWorkspaceFallback(
   context: SurfaceRequestContext | undefined,
   fallbackWorkspaceRoot: string | undefined,
 ): SurfaceRequestContext {
-  if (context) {
+  if (context?.workspace_root || !fallbackWorkspaceRoot) {
     return { ...context };
   }
-  return fallbackWorkspaceRoot ? { workspace_root: fallbackWorkspaceRoot } : {};
+  return { ...context, workspace_root: fallbackWorkspaceRoot };
 }
 
 export function unsupportedInvocationTokenError(method: string): string {

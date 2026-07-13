@@ -159,10 +159,7 @@ async function invokeSurfaceCall(
 ): Promise<BrowserToolResult> {
   const binary = resolveBinary(context);
   const args = ["surface", "call", method, "--request-envelope-version", "1"];
-  const requestContext = withWorkspaceFallback(
-    invocationContext,
-    invocationContext ? undefined : activeWorkspaceRoot(),
-  );
+  const requestContext = withWorkspaceFallback(invocationContext, activeWorkspaceRoot());
   const envelope = { arguments: input, context: requestContext };
 
   const env = runtimeEnvironment();
