@@ -85,13 +85,13 @@ A tab cannot start another screencast while its current job is recording or fina
 
 VBL continues to use `Page.startScreencast` for the source tab. The command supplies `maxWidth` and `maxHeight` so Chrome performs source scaling. VBL uses frame metadata timestamps and a monotonic presentation schedule to select frames at the requested rate instead of deriving a stride from an assumed 60 Hz compositor.
 
-Each recording owns a bounded frame channel. The CDP listener acknowledges source frames promptly. When the encoder cannot keep up, the listener drops intermediate frames while preserving monotonic presentation order. Memory use is therefore bounded by configuration rather than recording duration.
+Each recording owns a bounded frame channel. The CDP listener promptly sends `Page.screencastFrameAck` for each source frame. When the encoder cannot keep up, the listener drops intermediate frames while preserving monotonic presentation order. Memory use is therefore bounded by configuration rather than recording duration.
 
 Source navigation does not restart the job or create a new artifact. If the CDP target survives, frame acquisition continues across the new document.
 
 ## Hidden Chrome recorder
 
-The primary backend creates a broker-private target with `Target.createTarget({ url: "about:blank", hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, letterboxes them into the configured canvas without distortion, and requests frames from `canvas.captureStream(0)`.
+The primary backend creates a broker-private target with `Target.createTarget({ url: "about:blank", hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, letterboxes them into the configured canvas without distortion, and calls `requestFrame()` on the `CanvasCaptureMediaStreamTrack` returned by `canvas.captureStream(0)` to commit each frame to `MediaRecorder`.
 
 `MediaRecorder` emits timesliced `video/webm;codecs=vp8` chunks through a private CDP binding. The broker appends each chunk to the reserved partial file. No duration-sized frame or video buffer crosses back into Rust.
 
