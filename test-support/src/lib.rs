@@ -16,8 +16,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrome_for_testing_manager::{ChromeBinary, ChromeForTestingManager, VersionRequest};
-use chromiumoxide::Browser;
+use chromiumoxide::{Browser, cdp::browser_protocol::target::GetTargetsParams};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -25,6 +26,7 @@ use tempfile::TempDir;
 pub const BINARY_NAME: &str = "visible-browser-lab-mcp";
 pub const BROWSER_MODE_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_BROWSER_MODE";
 pub const CFT_CACHE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_CFT_CACHE_DIR";
+pub const TEST_CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH";
 
 static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
 const FIXTURE_CONNECTION_POLL: Duration = Duration::from_millis(100);
@@ -140,6 +142,12 @@ impl Drop for RealBrowser {
 }
 
 pub fn chrome_for_testing_executable() -> Result<PathBuf> {
+    if let Some(configured) = env::var_os(TEST_CHROME_PATH_ENV) {
+        let executable = PathBuf::from(configured);
+        validate_browser_executable(&executable, TEST_CHROME_PATH_ENV)?;
+        prepare_chrome_for_testing_executable(&executable)?;
+        return Ok(executable);
+    }
     static CHROME_FOR_TESTING_LOCK: Mutex<()> = Mutex::new(());
     let _guard = CHROME_FOR_TESTING_LOCK
         .lock()
@@ -169,6 +177,26 @@ pub fn chrome_for_testing_executable() -> Result<PathBuf> {
         prepare_chrome_for_testing_executable(&executable)?;
         Ok(executable)
     })
+}
+
+fn validate_browser_executable(executable: &Path, source: &str) -> Result<()> {
+    if !executable.is_file() {
+        bail!("{source} `{}` is not a file", executable.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = executable
+            .metadata()
+            .with_context(|| format!("failed to inspect `{}`", executable.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            bail!("{source} `{}` is not executable", executable.display());
+        }
+    }
+    Ok(())
 }
 
 fn chrome_for_testing_arguments(profile_dir: &Path, mode: BrowserMode) -> Vec<OsString> {
@@ -237,6 +265,25 @@ fn remove_macos_quarantine(_executable: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_browser_path_must_be_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = tempfile::NamedTempFile::new().expect("temporary browser file");
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600))
+            .expect("remove executable bits");
+
+        let error = validate_browser_executable(file.path(), TEST_CHROME_PATH_ENV)
+            .expect_err("non-executable browser path must fail");
+        assert!(error.to_string().contains("is not executable"));
+
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o700))
+            .expect("add executable bit");
+        validate_browser_executable(file.path(), TEST_CHROME_PATH_ENV)
+            .expect("executable browser path is accepted");
+    }
 
     #[test]
     fn chrome_for_testing_arguments_include_stable_profile_and_startup_flags() {
@@ -1586,6 +1633,181 @@ pub struct SmokeSummary {
     pub global_groups: usize,
 }
 
+#[derive(Debug)]
+pub struct ScreencastSmokeSummary {
+    pub artifact_id: String,
+    pub size_bytes: u64,
+    pub stop_elapsed: Duration,
+}
+
+pub fn run_screencast_smoke(
+    client: &mut McpClient,
+    open_tabs: &mut Vec<OpenTab>,
+    duration: Duration,
+) -> Result<ScreencastSmokeSummary> {
+    let max_duration_ms = u64::try_from(duration.as_millis())
+        .context("screencast smoke duration exceeded the wire integer range")?
+        .checked_add(30_000)
+        .context("screencast smoke duration overflowed its finalization allowance")?;
+    client.initialize("visible-browser-lab-screencast-smoke")?;
+    let session = client.call_tool(
+        "start_session",
+        json!({
+            "label":"packaged-screencast-smoke",
+            "start_url":data_url("VBL Screencast Smoke", "VBL Screencast Smoke"),
+            "focus":false
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = OpenTab::from_summary(
+        &session_id,
+        session.get("tab").context("start_session omitted tab")?,
+    )?;
+    open_tabs.push(tab.clone());
+    client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "source":"window.__vblSmokeTick=0;window.__vblSmokeTimer=setInterval(()=>{window.__vblSmokeTick++;document.body.style.background=`hsl(${window.__vblSmokeTick%360} 70% 45%)`;document.body.textContent=`frame ${window.__vblSmokeTick}`},50);true"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let before_recording = client.call_tool(
+        "list_tabs",
+        json!({
+            "agent_session_id":session_id,
+            "scope":"global_readonly"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let before_recording = global_target_ids(&before_recording)?;
+    client.call_tool(
+        "screencast",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "operation":"start",
+            "fps":10,
+            "quality":70,
+            "max_duration_ms":max_duration_ms,
+            "max_width":1280,
+            "max_height":720
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let during_recording = client.call_tool(
+        "list_tabs",
+        json!({
+            "agent_session_id":session_id,
+            "scope":"global_readonly"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let during_recording = global_target_ids(&during_recording)?;
+    if during_recording != before_recording {
+        bail!(
+            "private screencast target changed public tab inventory: before={before_recording:?}, during={during_recording:?}"
+        );
+    }
+    thread::sleep(duration);
+
+    let stop_started = Instant::now();
+    let mut result = client.call_tool(
+        "screencast",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "operation":"stop"
+        }),
+        Duration::from_secs(15),
+        false,
+    )?;
+    let stop_elapsed = stop_started.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(35);
+    while result.get("state").and_then(Value::as_str) == Some("finalizing")
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(250));
+        result = client.call_tool(
+            "screencast",
+            json!({
+                "agent_session_id":session_id,
+                "tab_id":tab.tab_id,
+                "operation":"status"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+    }
+    match result.get("state").and_then(Value::as_str) {
+        Some("ready") => {}
+        Some("error") => bail!(
+            "packaged screencast failed: {}",
+            result.get("error").cloned().unwrap_or(Value::Null)
+        ),
+        state => bail!("packaged screencast did not become ready; state={state:?}"),
+    }
+    let artifact = result
+        .get("artifact")
+        .context("ready screencast omitted artifact")?;
+    let artifact_id = field_str(artifact, "artifact_id")?;
+    if artifact.get("media_type").and_then(Value::as_str) != Some("video/webm") {
+        bail!("packaged screencast artifact did not declare video/webm");
+    }
+    let size_bytes = artifact
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .context("ready screencast omitted artifact size")?;
+    if size_bytes < 1_024 {
+        bail!("packaged screencast artifact was unexpectedly small: {size_bytes} bytes");
+    }
+    let prefix = client.call_tool(
+        "artifacts",
+        json!({
+            "agent_session_id":session_id,
+            "operation":"read",
+            "artifact_id":artifact_id,
+            "offset":0,
+            "length":4
+        }),
+        Duration::from_secs(10),
+        false,
+    )?;
+    let bytes = BASE64
+        .decode(field_str(&prefix, "data_base64")?)
+        .context("failed to decode screencast artifact prefix")?;
+    if bytes != [0x1a, 0x45, 0xdf, 0xa3] {
+        bail!("packaged screencast artifact is not a WebM container");
+    }
+    Ok(ScreencastSmokeSummary {
+        artifact_id,
+        size_bytes,
+        stop_elapsed,
+    })
+}
+
+fn global_target_ids(inventory: &Value) -> Result<Vec<String>> {
+    let groups = inventory
+        .get("groups")
+        .and_then(Value::as_array)
+        .context("global list_tabs omitted groups array")?;
+    let mut target_ids = groups
+        .iter()
+        .filter_map(|group| group.get("tabs").and_then(Value::as_array))
+        .flat_map(|tabs| tabs.iter())
+        .map(|tab| field_str(tab, "target_id"))
+        .collect::<Result<Vec<_>>>()?;
+    target_ids.sort();
+    Ok(target_ids)
+}
+
 pub struct McpClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -1944,6 +2166,58 @@ pub fn close_browser_via_cdp(endpoint: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     bail!("managed Chrome endpoint `{endpoint}` remained reachable after Browser.close")
+}
+
+pub struct CdpTargetInventory {
+    runtime: tokio::runtime::Runtime,
+    browser: Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+}
+
+impl CdpTargetInventory {
+    pub fn connect(endpoint: &str) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create target inventory runtime")?;
+        let (browser, mut handler) = runtime
+            .block_on(Browser::connect(endpoint))
+            .with_context(|| format!("failed to connect to Chrome at `{endpoint}`"))?;
+        let handler_task = runtime.spawn(async move {
+            while let Some(result) = handler.next().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            runtime,
+            browser,
+            handler_task,
+        })
+    }
+
+    pub fn count_by_type(&self, target_type: &str) -> Result<usize> {
+        self.runtime.block_on(async {
+            let count = self
+                .browser
+                .execute(GetTargetsParams::default())
+                .await
+                .context("failed to inventory Chrome targets")?
+                .result
+                .target_infos
+                .into_iter()
+                .filter(|target| target.r#type == target_type)
+                .count();
+            Ok::<usize, anyhow::Error>(count)
+        })
+    }
+}
+
+impl Drop for CdpTargetInventory {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+    }
 }
 
 pub fn managed_endpoint(state_dir: &Path) -> Result<String> {

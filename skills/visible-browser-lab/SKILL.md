@@ -37,6 +37,8 @@ Mutating semantic actions return an accessibility diff by default; request `obse
 
 Use `wait_for` for asynchronous text, element, URL, load, or expression state. Use `screenshot` for visual appearance. Use `console` and `network` for runtime diagnosis. Use `help` to select an operation in `interact`, `emulation`, `performance`, `audit`, `memory`, `screencast`, or `artifacts`. Use `evaluate` or a strict CSS target only when the accessibility snapshot and named semantic tools cannot represent the required state. Do not use them to verify a semantic action.
 
+Screencasts are broker-owned silent VP8-in-WebM jobs. `screencast start` defaults to 1280×720, 10 fps, quality 70, and 30 seconds; supply `max_width` and `max_height` together as even integers when overriding the size. `stop` waits briefly and may return `finalizing`; poll `status` or repeat `stop` until the same job reaches `ready` or `error`. A caller timeout does not cancel finalization, and no internal encoder or artifact handle belongs in later calls.
+
 If a leased target disappears, keep the missing lease visible in owned listings, create or claim another tab, and continue with the new `tab_id`.
 
 ## Auth and Permissions

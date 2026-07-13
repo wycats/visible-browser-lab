@@ -13,4 +13,3 @@ pub mod protocol;
 pub mod semantic;
 pub mod surface;
 pub mod surface_cli;
-pub mod video;

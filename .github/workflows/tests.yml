@@ -70,10 +70,21 @@ jobs:
           rustup default stable
 
       - name: Cache Chrome for Testing
+        if: runner.os != 'Windows'
         uses: actions/cache@v6
         with:
           path: target/chrome-for-testing
           key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Select installed Chrome for Windows browser tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $chrome = Join-Path $Env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+          if (-not (Test-Path $chrome)) {
+            throw "Windows runner Chrome was not found at $chrome"
+          }
+          "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Test real-browser MCP facade
         env:

@@ -1,4 +1,9 @@
-use std::{env, path::PathBuf, thread, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use proptest::{
@@ -12,7 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use visible_browser_lab_test_support::{
     EXPECTED_TOOLS, FixtureServer, McpClient, OpenTab, RealBrowser, cleanup_open_tabs,
-    close_target_via_cdp, field_str, run_live_smoke, stop_broker, tabs_include_id,
+    close_target_via_cdp, data_url, field_str, run_live_smoke, stop_broker, tabs_include_id,
 };
 
 const PROPERTY_BROWSER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -416,18 +421,44 @@ fn complete_v03_domain_surface() -> Result<()> {
         false,
     )?;
     harness.client_mut().call_tool(
+        "navigate",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "action":"url",
+            "url":data_url("Screencast Navigation", "Screencast Navigation"),
+            "wait_until":"load",
+            "timeout_ms":10_000
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
         "evaluate",
         json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"source":"document.body.style.background='rgb(10,20,30)';true"}),
         Duration::from_secs(20),
         false,
     )?;
     std::thread::sleep(Duration::from_millis(800));
-    harness.client_mut().call_tool(
+    let mut stopped = harness.client_mut().call_tool(
         "screencast",
         json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"stop"}),
         Duration::from_secs(60),
         false,
     )?;
+    let completion_deadline = Instant::now() + Duration::from_secs(35);
+    while stopped["state"] == "finalizing" && Instant::now() < completion_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        stopped = harness.client_mut().call_tool(
+            "screencast",
+            json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"status"}),
+            Duration::from_secs(10),
+            false,
+        )?;
+    }
+    assert_eq!(stopped["state"], "ready");
+    assert_eq!(stopped["artifact"]["media_type"], "video/webm");
+    assert!(stopped["metrics"]["encoded_frames"].as_u64().unwrap() > 0);
 
     let listed = harness.client_mut().call_tool(
         "artifacts",

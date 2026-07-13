@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "visible-browser-lab"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 rust-version = "1.96"
 
@@ -22,6 +22,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 agent-surface-contract = { path = "agent-surface-contract" }
+async-tungstenite = { version = "0.32.1", default-features = false, features = [
+    "tokio-runtime",
+] }
 base64 = "0.22"
 clap = { version = "4.6.1", features = ["derive"] }
 chromiumoxide = { version = "=0.9.1", default-features = false }
@@ -36,11 +39,6 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 libc = "0.2"
 petgraph = "0.8"
-oxideav-core = "0.1"
-oxideav-mkv = "0.0.9"
-rav1e = { version = "0.8.1", default-features = false, features = [
-    "threading",
-] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 regex = "1.11"
 rmcp = { version = "1.7.0", features = ["transport-io"] }

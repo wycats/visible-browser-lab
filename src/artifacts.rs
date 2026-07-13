@@ -31,10 +31,28 @@ pub struct ArtifactRecord {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReservedArtifact {
+    artifact_id: String,
+    owner_session_id: AgentSessionId,
+    tab_id: Option<TabId>,
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    kind: String,
+    media_type: String,
+}
+
+impl ReservedArtifact {
+    pub fn partial_path(&self) -> &Path {
+        &self.partial_path
+    }
+}
+
 #[derive(Debug)]
 pub struct ArtifactRegistry {
     root: PathBuf,
     records: HashMap<String, ArtifactRecord>,
+    reservations: HashMap<String, ReservedArtifact>,
 }
 
 impl ArtifactRegistry {
@@ -84,7 +102,104 @@ impl ArtifactRegistry {
         Ok(Self {
             root,
             records: HashMap::new(),
+            reservations: HashMap::new(),
         })
+    }
+
+    pub fn reserve(
+        &mut self,
+        session_id: &AgentSessionId,
+        tab_id: Option<&TabId>,
+        kind: &str,
+        media_type: &str,
+        extension: &str,
+    ) -> Result<ReservedArtifact, BrowserToolError> {
+        let artifact_id = format!("artifact_{}", Uuid::new_v4());
+        let session_dir = self.root.join(&session_id.0);
+        fs::create_dir_all(&session_dir).map_err(|error| {
+            BrowserToolError::artifact_error(format!(
+                "failed to create session artifact directory: {error}"
+            ))
+        })?;
+        let final_path = session_dir.join(format!("{artifact_id}.{extension}"));
+        let partial_path = session_dir.join(format!("{artifact_id}.{extension}.partial"));
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial_path)
+            .map_err(|error| {
+                BrowserToolError::artifact_error(format!(
+                    "failed to reserve artifact storage: {error}"
+                ))
+            })?;
+        let reservation = ReservedArtifact {
+            artifact_id: artifact_id.clone(),
+            owner_session_id: session_id.clone(),
+            tab_id: tab_id.cloned(),
+            partial_path,
+            final_path,
+            kind: kind.to_string(),
+            media_type: media_type.to_string(),
+        };
+        self.reservations.insert(artifact_id, reservation.clone());
+        Ok(reservation)
+    }
+
+    pub fn publish_reserved(
+        &mut self,
+        reservation: ReservedArtifact,
+    ) -> Result<ArtifactSummary, BrowserToolError> {
+        let Some(current) = self.reservations.get(&reservation.artifact_id) else {
+            let _ = fs::remove_file(&reservation.partial_path);
+            return Err(BrowserToolError::artifact_error(
+                "artifact reservation is no longer active",
+            ));
+        };
+        if current.partial_path != reservation.partial_path
+            || current.owner_session_id != reservation.owner_session_id
+        {
+            return Err(BrowserToolError::artifact_error(
+                "artifact reservation does not match the active record",
+            ));
+        }
+
+        let (size_bytes, sha256) = file_digest(&reservation.partial_path)?;
+        fs::rename(&reservation.partial_path, &reservation.final_path).map_err(|error| {
+            BrowserToolError::artifact_error(format!(
+                "failed to publish completed artifact: {error}"
+            ))
+        })?;
+        let summary = ArtifactSummary {
+            artifact_id: reservation.artifact_id.clone(),
+            kind: reservation.kind.clone(),
+            media_type: reservation.media_type.clone(),
+            size_bytes,
+            sha256,
+            created_at_ms: now_ms(),
+            retention: "session".to_string(),
+        };
+        self.reservations.remove(&reservation.artifact_id);
+        self.records.insert(
+            reservation.artifact_id,
+            ArtifactRecord {
+                summary: summary.clone(),
+                owner_session_id: reservation.owner_session_id,
+                tab_id: reservation.tab_id,
+                path: reservation.final_path,
+            },
+        );
+        Ok(summary)
+    }
+
+    pub fn discard_reserved(&mut self, reservation: &ReservedArtifact) {
+        if self
+            .reservations
+            .get(&reservation.artifact_id)
+            .is_some_and(|current| current.partial_path == reservation.partial_path)
+        {
+            self.reservations.remove(&reservation.artifact_id);
+        }
+        let _ = fs::remove_file(&reservation.partial_path);
     }
 
     pub fn insert_bytes(
@@ -237,6 +352,22 @@ impl ArtifactRegistry {
                 let _ = fs::remove_file(record.path);
             }
         }
+        let reservation_ids = self
+            .reservations
+            .iter()
+            .filter(|(_, reservation)| &reservation.owner_session_id == session_id)
+            .map(|(artifact_id, _)| artifact_id.clone())
+            .collect::<Vec<_>>();
+        for artifact_id in reservation_ids {
+            if let Some(reservation) = self.reservations.remove(&artifact_id) {
+                let _ = fs::remove_file(reservation.partial_path);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn reservation_count(&self) -> usize {
+        self.reservations.len()
     }
 
     fn record(
@@ -249,6 +380,25 @@ impl ArtifactRegistry {
             .filter(|record| &record.owner_session_id == session_id)
             .ok_or_else(|| BrowserToolError::artifact_not_found(artifact_id))
     }
+}
+
+fn file_digest(path: &Path) -> Result<(u64, String), BrowserToolError> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| BrowserToolError::artifact_error(error.to_string()))?;
+    let mut digest = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| BrowserToolError::artifact_error(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size_bytes = size_bytes.saturating_add(read as u64);
+    }
+    Ok((size_bytes, format!("{:x}", digest.finalize())))
 }
 
 fn safe_workspace_destination(

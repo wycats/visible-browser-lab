@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -8,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use async_tungstenite::{tokio::connect_async, tungstenite::Message};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 #[allow(deprecated)]
 use chromiumoxide::{
@@ -82,7 +84,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, oneshot},
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
@@ -97,6 +101,10 @@ const PAGE_DISCOVERY_RETRY: Duration = Duration::from_millis(25);
 const EXISTING_TARGET_REGISTRATION_DELAY: Duration = Duration::from_millis(250);
 const NAVIGATION_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 const BEFOREUNLOAD_STASH_KEY: &str = "__io_github_wycats_visible_browser_lab_beforeunload_stash_v1";
+const SCREENCAST_CHUNK_BINDING: &str = "__vblScreencastChunk";
+const SCREENCAST_FRAME_QUEUE_CAPACITY: usize = 1;
+const SCREENCAST_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SCREENCAST_RAW_CDP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every remote handle we create is tagged with a per-operation object
 /// group. Ungrouped handles pin their DOM nodes (including whole detached
@@ -234,6 +242,7 @@ impl CdpClient {
 
     pub async fn page_targets(&self) -> Result<Vec<CdpTarget>, BrowserToolError> {
         let connection = self.runtime.connection().await?;
+        let _inventory = self.runtime.target_inventory.lock().await;
         let response = self
             .runtime
             .browser_command(
@@ -242,12 +251,27 @@ impl CdpClient {
                 "list Chrome targets",
             )
             .await?;
+        let target_infos = response.result.target_infos;
+        let present_target_ids = target_infos
+            .iter()
+            .map(|target| target.target_id.as_ref().to_string())
+            .collect::<HashSet<_>>();
+        let private_target_ids = self
+            .runtime
+            .private_targets
+            .lock()
+            .unwrap()
+            .target_ids_for_inventory(&present_target_ids);
 
-        Ok(response
-            .result
-            .target_infos
+        Ok(target_infos
             .into_iter()
-            .filter(|target| target.r#type == "page")
+            .filter(|target| {
+                is_public_page_target(
+                    &target.r#type,
+                    target.target_id.as_ref(),
+                    &private_target_ids,
+                )
+            })
             .map(|target| CdpTarget {
                 id: target.target_id.as_ref().to_string(),
                 target_type: target.r#type,
@@ -3048,147 +3072,152 @@ impl CdpClient {
     pub async fn start_screencast(
         &self,
         target: &CdpTarget,
-        fps: u32,
-        quality: u8,
-        max_duration: Duration,
+        options: CdpScreencastOptions,
+        partial_path: &Path,
     ) -> Result<CdpScreencastCapture, BrowserToolError> {
-        let (page, connection) = self.page(&target.id).await?;
-        let mut events = self
-            .event_listener::<EventScreencastFrame>(&page, &connection)
-            .await?;
-        let mut visibility = self
-            .event_listener::<EventScreencastVisibilityChanged>(&page, &connection)
-            .await?;
-        self.runtime
-            .page_command(
-                &connection,
-                page.execute(
-                    StartScreencastParams::builder()
-                        .format(StartScreencastFormat::Jpeg)
-                        .quality(i64::from(quality))
-                        .every_nth_frame(1)
-                        .build(),
-                ),
-                "start page screencast",
+        let CdpScreencastOptions {
+            fps,
+            quality,
+            max_duration,
+            max_width,
+            max_height,
+        } = options;
+        let (source_page, connection) = self.page(&target.id).await?;
+        let partial_path = partial_path.to_path_buf();
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&partial_path)
+            .await
+            .map_err(|error| {
+                BrowserToolError::artifact_error(format!(
+                    "failed to open reserved screencast output: {error}"
+                ))
+            })?;
+
+        let (recorder, binding_events, recorder_task) =
+            RawCdpClient::connect(&self.runtime.endpoint).await?;
+        let mut hidden_target_id = None::<String>;
+        let setup = async {
+            let target_id = create_hidden_screencast_target(&self.runtime, &recorder).await?;
+            hidden_target_id = Some(target_id.clone());
+            let attached = recorder
+                .execute(
+                    "Target.attachToTarget",
+                    json!({ "targetId": target_id, "flatten": true }),
+                    None,
+                )
+                .await?;
+            let session_id = attached
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserToolError::chrome_unavailable(
+                        "Chrome omitted the hidden screencast session id",
+                    )
+                })?
+                .to_string();
+            recorder
+                .execute("Runtime.enable", json!({}), Some(&session_id))
+                .await?;
+            recorder
+                .execute(
+                    "Runtime.addBinding",
+                    json!({ "name": SCREENCAST_CHUNK_BINDING }),
+                    Some(&session_id),
+                )
+                .await?;
+            evaluate_screencast_expression(
+                &recorder,
+                &session_id,
+                recorder_program(max_width, max_height, quality),
+                true,
+                "initialize hidden screencast recorder",
             )
             .await?;
-        let (done_tx, mut done_rx) = oneshot::channel();
-        let event_page = page.clone();
-        let overrides = self.runtime.screencast_focus_overrides.clone();
-        let override_target = target.id.clone();
-        let task = tokio::spawn(async move {
-            let deadline = Instant::now() + max_duration;
-            let sample_stride = (60 / fps.max(1)).max(1) as usize;
-            let max_frames = ((fps as f64) * max_duration.as_secs_f64().ceil()) as usize;
-            let mut frame_index = 0usize;
-            let mut frames = Vec::new();
-            // The cast owns its frame guarantee (RFC 00010): if the page
-            // goes hidden mid-cast (a page-spawned sibling tab was
-            // activated), Chrome stops producing frames and the recording
-            // would silently collapse. Focus emulation forces the page
-            // back to visible, which restarts frame production. The shared
-            // registry is the source of truth for whether the override is
-            // engaged: `has_focus` consults it so the emulated focus never
-            // leaks into user-focus checks, and `activate_target` clears it
-            // when the tab becomes genuinely visible. If the page goes
-            // hidden again after a real activation, the cast re-engages.
-            //
-            // Enabling the emulation makes Chrome re-report the page as
-            // visible, so the first visible event after an enable is our
-            // own echo, not a genuine visibility change. Later visible
-            // events are genuine (the user returned to the tab or the
-            // covering sibling closed) and disengage the override so
-            // honest focus answers come back without waiting for the cast
-            // to end.
-            let mut visibility_open = true;
-            let mut emulation_echo_pending = false;
-            loop {
-                tokio::select! {
-                    _ = &mut done_rx => break,
-                    changed = visibility.next(), if visibility_open => {
-                        let Some(changed) = changed else {
-                            visibility_open = false;
-                            continue;
-                        };
-                        if changed.visible {
-                            if emulation_echo_pending {
-                                emulation_echo_pending = false;
-                            } else if overrides.lock().unwrap().remove(&override_target) {
-                                let _ = event_page
-                                    .execute(SetFocusEmulationEnabledParams::new(false))
-                                    .await;
-                            }
-                        } else if overrides.lock().unwrap().insert(override_target.clone()) {
-                            emulation_echo_pending = true;
-                            if event_page
-                                .execute(SetFocusEmulationEnabledParams::new(true))
-                                .await
-                                .is_err()
-                            {
-                                emulation_echo_pending = false;
-                                overrides.lock().unwrap().remove(&override_target);
-                            } else if !overrides.lock().unwrap().contains(&override_target) {
-                                // `activate_target` cleared the override while
-                                // the enable was in flight; honor the clear so
-                                // the emulation cannot outlive the registry
-                                // entry that makes `has_focus` distrust it.
-                                emulation_echo_pending = false;
-                                let _ = event_page
-                                    .execute(SetFocusEmulationEnabledParams::new(false))
-                                    .await;
-                            }
-                        }
-                    }
-                    frame = events.next() => {
-                        let Some(frame) = frame else { break };
-                        let _ = event_page.execute(ScreencastFrameAckParams::new(frame.session_id)).await;
-                        if Instant::now() <= deadline
-                            && frames.len() < max_frames
-                            && frame_index.is_multiple_of(sample_stride)
-                        {
-                            let encoded: String = frame.data.clone().into();
-                            if let Ok(bytes) = BASE64.decode(encoded) {
-                                frames.push(CapturedScreencastFrame { bytes });
-                            }
-                        }
-                        frame_index += 1;
-                    }
+
+            let frame_events = self
+                .event_listener::<EventScreencastFrame>(&source_page, &connection)
+                .await?;
+            let visibility_events = self
+                .event_listener::<EventScreencastVisibilityChanged>(&source_page, &connection)
+                .await?;
+            self.runtime
+                .page_command(
+                    &connection,
+                    source_page.execute(
+                        StartScreencastParams::builder()
+                            .format(StartScreencastFormat::Jpeg)
+                            .quality(i64::from(quality))
+                            .max_width(i64::from(max_width))
+                            .max_height(i64::from(max_height))
+                            .every_nth_frame(1)
+                            .build(),
+                    ),
+                    "start page screencast",
+                )
+                .await?;
+
+            Ok::<_, BrowserToolError>((session_id, binding_events, frame_events, visibility_events))
+        }
+        .await;
+        let (recorder_session_id, binding_events, frame_events, visibility_events) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                if let Some(target_id) = hidden_target_id.as_deref() {
+                    close_hidden_screencast_target(&self.runtime, &recorder, target_id).await;
                 }
+                recorder_task.abort();
+                return Err(error);
             }
-            if overrides.lock().unwrap().remove(&override_target) {
-                let _ = event_page
-                    .execute(SetFocusEmulationEnabledParams::new(false))
-                    .await;
-            }
-            frames
+        };
+        let hidden_target_id = hidden_target_id.expect("setup records the hidden target id");
+
+        let (control, control_rx) = watch::channel(ScreencastControl::Record);
+        let progress = Arc::new(StdMutex::new(CdpScreencastProgress::default()));
+        let task_progress = Arc::clone(&progress);
+        let source_target_id = target.id.clone();
+        let task_hidden_target_id = hidden_target_id.clone();
+        let task_recorder = recorder.clone();
+        let task_runtime = Arc::clone(&self.runtime);
+        let task = tokio::spawn(async move {
+            let result = run_streaming_screencast(
+                Arc::clone(&task_runtime),
+                source_page,
+                connection,
+                task_recorder.clone(),
+                recorder_session_id,
+                binding_events,
+                frame_events,
+                visibility_events,
+                control_rx,
+                task_progress,
+                source_target_id,
+                partial_path,
+                fps,
+                max_duration,
+            )
+            .await;
+            close_hidden_screencast_target(&task_runtime, &task_recorder, &task_hidden_target_id)
+                .await;
+            recorder_task.abort();
+            result
         });
         Ok(CdpScreencastCapture {
-            client: self.clone(),
-            target_id: target.id.clone(),
-            done: Some(done_tx),
+            controller: CdpScreencastController { control, progress },
             task,
         })
     }
 
-    pub async fn stop_screencast(
-        mut capture: CdpScreencastCapture,
-    ) -> Result<Vec<CapturedScreencastFrame>, BrowserToolError> {
-        let (page, connection) = capture.client.page(&capture.target_id).await?;
-        capture
-            .client
-            .runtime
-            .page_command(
-                &connection,
-                page.execute(StopScreencastParams::default()),
-                "stop page screencast",
-            )
-            .await?;
-        if let Some(done) = capture.done.take() {
-            let _ = done.send(());
-        }
+    pub async fn finish_screencast(
+        capture: CdpScreencastCapture,
+    ) -> Result<CdpScreencastOutput, CdpScreencastFailure> {
         capture.task.await.map_err(|error| {
-            BrowserToolError::chrome_unavailable(format!("screencast collector failed: {error}"))
-        })
+            CdpScreencastFailure::new(
+                "screencast_task_failed",
+                format!("screencast task failed: {error}"),
+            )
+        })?
     }
 
     pub async fn stop_trace(capture: CdpTraceCapture) -> Result<Vec<Value>, BrowserToolError> {
@@ -3681,6 +3710,825 @@ impl CdpClient {
     }
 }
 
+#[derive(Clone)]
+struct RawCdpClient {
+    commands: mpsc::Sender<RawCdpCommand>,
+}
+
+struct RawCdpCommand {
+    method: String,
+    params: Value,
+    session_id: Option<String>,
+    response: oneshot::Sender<Result<Value, BrowserToolError>>,
+}
+
+impl RawCdpClient {
+    async fn connect(
+        endpoint: &CdpEndpoint,
+    ) -> Result<(Self, mpsc::Receiver<Value>, JoinHandle<()>), BrowserToolError> {
+        let websocket_url = if matches!(endpoint.origin().scheme(), "ws" | "wss") {
+            endpoint.origin().clone()
+        } else {
+            let version = timeout(SCREENCAST_RAW_CDP_TIMEOUT, async {
+                reqwest::get(endpoint.version_url())
+                    .await
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "failed to discover Chrome websocket endpoint: {error}"
+                        ))
+                    })?
+                    .error_for_status()
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome websocket discovery failed: {error}"
+                        ))
+                    })?
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| {
+                        BrowserToolError::chrome_unavailable(format!(
+                            "Chrome returned invalid websocket discovery data: {error}"
+                        ))
+                    })
+            })
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout("Chrome websocket discovery exceeded 5 seconds")
+            })??;
+            Url::parse(
+                version
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        BrowserToolError::chrome_unavailable(
+                            "Chrome omitted webSocketDebuggerUrl from /json/version",
+                        )
+                    })?,
+            )
+            .map_err(|error| {
+                BrowserToolError::chrome_unavailable(format!(
+                    "Chrome returned an invalid websocket URL: {error}"
+                ))
+            })?
+        };
+        let (stream, _) = timeout(
+            SCREENCAST_RAW_CDP_TIMEOUT,
+            connect_async(websocket_url.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            BrowserToolError::operation_timeout(
+                "hidden screencast CDP handshake exceeded 5 seconds",
+            )
+        })?
+        .map_err(|error| {
+            BrowserToolError::chrome_unavailable(format!(
+                "failed to connect hidden screencast CDP session: {error}"
+            ))
+        })?;
+        let (mut output, mut input) = stream.split();
+        let (command_tx, mut command_rx) = mpsc::channel::<RawCdpCommand>(32);
+        let (event_tx, event_rx) = mpsc::channel::<Value>(8);
+        let task = tokio::spawn(async move {
+            let mut next_id = 1u64;
+            let mut pending =
+                HashMap::<u64, oneshot::Sender<Result<Value, BrowserToolError>>>::new();
+            let terminal_error = loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            break "hidden screencast CDP command channel closed".to_string();
+                        };
+                        let id = next_id;
+                        next_id = next_id.saturating_add(1);
+                        let mut message = json!({
+                            "id": id,
+                            "method": command.method,
+                            "params": command.params,
+                        });
+                        if let Some(session_id) = command.session_id {
+                            message["sessionId"] = Value::String(session_id);
+                        }
+                        pending.insert(id, command.response);
+                        if let Err(error) = output.send(Message::Text(message.to_string().into())).await {
+                            if let Some(response) = pending.remove(&id) {
+                                let _ = response.send(Err(BrowserToolError::chrome_unavailable(
+                                    format!("failed to send hidden screencast CDP command: {error}"),
+                                )));
+                            }
+                            break format!("hidden screencast CDP write failed: {error}");
+                        }
+                    }
+                    message = input.next() => {
+                        let Some(message) = message else {
+                            break "hidden screencast CDP connection closed".to_string();
+                        };
+                        let message = match message {
+                            Ok(Message::Text(message)) => message,
+                            Ok(Message::Close(_)) => {
+                                break "hidden screencast CDP connection closed".to_string();
+                            }
+                            Ok(_) => continue,
+                            Err(error) => {
+                                break format!("hidden screencast CDP read failed: {error}");
+                            }
+                        };
+                        let value = match serde_json::from_str::<Value>(&message) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "ignored malformed hidden screencast CDP message");
+                                continue;
+                            }
+                        };
+                        if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                            if let Some(response) = pending.remove(&id) {
+                                let result = if let Some(error) = value.get("error") {
+                                    Err(BrowserToolError::chrome_unavailable(format!(
+                                        "hidden screencast CDP command failed: {}",
+                                        error.get("message").and_then(Value::as_str).unwrap_or("unknown CDP error")
+                                    )))
+                                } else {
+                                    Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                                };
+                                let _ = response.send(result);
+                            }
+                        } else if value.get("method").and_then(Value::as_str)
+                            == Some("Runtime.bindingCalled")
+                            && let Err(error) = try_forward_binding_event(&event_tx, value)
+                        {
+                            break error;
+                        }
+                    }
+                }
+            };
+            for (_, response) in pending {
+                let _ = response.send(Err(BrowserToolError::chrome_unavailable(
+                    terminal_error.clone(),
+                )));
+            }
+        });
+        Ok((
+            Self {
+                commands: command_tx,
+            },
+            event_rx,
+            task,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        method: impl Into<String>,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, BrowserToolError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(RawCdpCommand {
+                method: method.into(),
+                params,
+                session_id: session_id.map(str::to_string),
+                response,
+            })
+            .await
+            .map_err(|_| {
+                BrowserToolError::chrome_unavailable("hidden screencast CDP command channel closed")
+            })?;
+        timeout(SCREENCAST_RAW_CDP_TIMEOUT, result)
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout(
+                    "hidden screencast CDP command exceeded 5 seconds",
+                )
+            })?
+            .map_err(|_| {
+                BrowserToolError::chrome_unavailable(
+                    "hidden screencast CDP response channel closed",
+                )
+            })?
+    }
+}
+
+fn try_forward_binding_event(events: &mpsc::Sender<Value>, event: Value) -> Result<(), String> {
+    events.try_send(event).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => {
+            "hidden screencast recorder event queue overflowed".to_string()
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            "hidden screencast recorder event consumer closed".to_string()
+        }
+    })
+}
+
+async fn create_hidden_screencast_target(
+    runtime: &CdpRuntime,
+    recorder: &RawCdpClient,
+) -> Result<String, BrowserToolError> {
+    let _inventory = runtime.target_inventory.lock().await;
+    let hidden = recorder
+        .execute(
+            "Target.createTarget",
+            json!({
+                "url": "about:blank",
+                "hidden": true,
+                "background": true,
+            }),
+            None,
+        )
+        .await?;
+    let target_id = hidden
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BrowserToolError::chrome_unavailable("Chrome omitted the hidden screencast target id")
+        })?
+        .to_string();
+    runtime
+        .private_targets
+        .lock()
+        .unwrap()
+        .insert(target_id.clone());
+    Ok(target_id)
+}
+
+async fn close_hidden_screencast_target(
+    runtime: &CdpRuntime,
+    recorder: &RawCdpClient,
+    target_id: &str,
+) {
+    let _inventory = runtime.target_inventory.lock().await;
+    let _ = timeout(
+        Duration::from_secs(1),
+        recorder.execute("Target.closeTarget", json!({ "targetId": target_id }), None),
+    )
+    .await;
+    runtime
+        .private_targets
+        .lock()
+        .unwrap()
+        .mark_closing(target_id);
+    // Keep the private marker until a serialized inventory proves that Chrome
+    // has actually removed the target. A successful close response can precede
+    // target disappearance by a short interval.
+}
+
+async fn evaluate_screencast_expression(
+    recorder: &RawCdpClient,
+    session_id: &str,
+    expression: String,
+    await_promise: bool,
+    operation: &str,
+) -> Result<Value, BrowserToolError> {
+    let response = recorder
+        .execute(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "awaitPromise": await_promise,
+                "returnByValue": true,
+            }),
+            Some(session_id),
+        )
+        .await?;
+    if let Some(details) = response.get("exceptionDetails") {
+        return Err(BrowserToolError::artifact_error(format!(
+            "{operation} failed: {}",
+            details
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("JavaScript exception")
+        )));
+    }
+    Ok(response
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn recorder_program(width: u32, height: u32, quality: u8) -> String {
+    let pixels = u64::from(width) * u64::from(height);
+    let scale = (pixels as f64 / (1280.0 * 720.0)).clamp(0.25, 4.0);
+    let base_bitrate = 250_000u64 + u64::from(quality) * 47_500;
+    let bitrate = ((base_bitrate as f64) * scale).round() as u64;
+    r#"(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = __WIDTH__;
+    canvas.height = __HEIGHT__;
+    document.body.replaceChildren(canvas);
+    const context = canvas.getContext('2d', { alpha: false });
+    const stream = canvas.captureStream(0);
+    const track = stream.getVideoTracks()[0];
+    const mimeType = 'video/webm;codecs=vp8';
+    if (!MediaRecorder.isTypeSupported(mimeType)) throw new Error(mimeType + ' is unsupported');
+    if (typeof track.requestFrame !== 'function') throw new Error('CanvasCaptureMediaStreamTrack.requestFrame is unsupported');
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: __BITRATE__ });
+    let sequence = 0;
+    let totalBytes = 0;
+    let emission = Promise.resolve();
+    const emit = payload => __BINDING__(JSON.stringify(payload));
+    recorder.ondataavailable = event => {
+      if (!event.data.size) return;
+      emission = emission.then(async () => {
+        const bytes = new Uint8Array(await event.data.arrayBuffer());
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+        }
+        totalBytes += bytes.length;
+        emit({ kind: 'chunk', sequence: sequence++, size: bytes.length, data: btoa(binary) });
+      }).catch(error => emit({ kind: 'error', message: String(error?.message ?? error) }));
+    };
+    recorder.onstop = async () => {
+      await emission;
+      emit({ kind: 'done', chunks: sequence, bytes: totalBytes });
+    };
+    recorder.onerror = event => emit({ kind: 'error', message: String(event.error?.message ?? event.error ?? 'MediaRecorder error') });
+    window.__vblScreencastRecorder = {
+      async push(data) {
+        const binary = atob(data);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+        const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+        context.fillStyle = '#000';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        const scale = Math.min(canvas.width / bitmap.width, canvas.height / bitmap.height);
+        const drawWidth = bitmap.width * scale;
+        const drawHeight = bitmap.height * scale;
+        context.drawImage(bitmap, (canvas.width - drawWidth) / 2, (canvas.height - drawHeight) / 2, drawWidth, drawHeight);
+        bitmap.close();
+        track.requestFrame();
+        return true;
+      },
+      stop() {
+        if (recorder.state !== 'inactive') recorder.stop();
+        return true;
+      },
+    };
+    recorder.start(1000);
+    return { mimeType: recorder.mimeType, width: canvas.width, height: canvas.height };
+  })()"#
+        .replace("__WIDTH__", &width.to_string())
+        .replace("__HEIGHT__", &height.to_string())
+        .replace("__BITRATE__", &bitrate.to_string())
+        .replace("__BINDING__", SCREENCAST_CHUNK_BINDING)
+}
+
+#[derive(Debug)]
+struct RecorderCompletion {
+    chunks: u64,
+    bytes: u64,
+}
+
+async fn write_screencast_chunks(
+    mut events: mpsc::Receiver<Value>,
+    session_id: String,
+    partial_path: PathBuf,
+) -> Result<RecorderCompletion, BrowserToolError> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&partial_path)
+        .await
+        .map_err(|error| {
+            BrowserToolError::artifact_error(format!(
+                "failed to open reserved screencast output: {error}"
+            ))
+        })?;
+    let mut written_chunks = 0u64;
+    let mut written_bytes = 0u64;
+    loop {
+        let event = match events.recv().await {
+            Some(event) => event,
+            None => {
+                return Err(BrowserToolError::chrome_unavailable(
+                    "hidden screencast recorder event stream ended before finalization",
+                ));
+            }
+        };
+        if event.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled")
+            || event.get("sessionId").and_then(Value::as_str) != Some(session_id.as_str())
+            || event.pointer("/params/name").and_then(Value::as_str)
+                != Some(SCREENCAST_CHUNK_BINDING)
+        {
+            continue;
+        }
+        let payload = event
+            .pointer("/params/payload")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserToolError::artifact_error(
+                    "hidden screencast recorder omitted binding payload",
+                )
+            })?;
+        let payload: Value = serde_json::from_str(payload).map_err(|error| {
+            BrowserToolError::artifact_error(format!(
+                "hidden screencast recorder returned malformed data: {error}"
+            ))
+        })?;
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("chunk") => {
+                let data = payload.get("data").and_then(Value::as_str).ok_or_else(|| {
+                    BrowserToolError::artifact_error(
+                        "hidden screencast recorder omitted chunk data",
+                    )
+                })?;
+                let bytes = BASE64.decode(data).map_err(|error| {
+                    BrowserToolError::artifact_error(format!(
+                        "hidden screencast recorder returned invalid chunk data: {error}"
+                    ))
+                })?;
+                output.write_all(&bytes).await.map_err(|error| {
+                    BrowserToolError::artifact_error(format!(
+                        "failed to append screencast output: {error}"
+                    ))
+                })?;
+                written_chunks = written_chunks.saturating_add(1);
+                written_bytes = written_bytes.saturating_add(bytes.len() as u64);
+            }
+            Some("done") => {
+                output.flush().await.map_err(|error| {
+                    BrowserToolError::artifact_error(format!(
+                        "failed to flush screencast output: {error}"
+                    ))
+                })?;
+                output.sync_data().await.map_err(|error| {
+                    BrowserToolError::artifact_error(format!(
+                        "failed to sync screencast output: {error}"
+                    ))
+                })?;
+                return Ok(RecorderCompletion {
+                    chunks: written_chunks,
+                    bytes: written_bytes,
+                });
+            }
+            Some("error") => {
+                return Err(BrowserToolError::artifact_error(
+                    payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("hidden screencast recorder failed"),
+                ));
+            }
+            _ => {
+                return Err(BrowserToolError::artifact_error(
+                    "hidden screencast recorder returned an unknown message",
+                ));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_streaming_screencast(
+    runtime: Arc<CdpRuntime>,
+    source_page: Page,
+    source_connection: RuntimeConnection,
+    recorder: RawCdpClient,
+    recorder_session_id: String,
+    binding_events: mpsc::Receiver<Value>,
+    mut frame_events: chromiumoxide::listeners::EventStream<EventScreencastFrame>,
+    mut visibility_events: chromiumoxide::listeners::EventStream<EventScreencastVisibilityChanged>,
+    mut control: watch::Receiver<ScreencastControl>,
+    progress: Arc<StdMutex<CdpScreencastProgress>>,
+    source_target_id: String,
+    partial_path: PathBuf,
+    fps: u32,
+    max_duration: Duration,
+) -> Result<CdpScreencastOutput, CdpScreencastFailure> {
+    let mut chunk_writer = tokio::spawn(write_screencast_chunks(
+        binding_events,
+        recorder_session_id.clone(),
+        partial_path.clone(),
+    ));
+    let (frame_tx, mut frame_rx) = mpsc::channel::<String>(SCREENCAST_FRAME_QUEUE_CAPACITY);
+    let worker_recorder = recorder.clone();
+    let worker_session_id = recorder_session_id.clone();
+    let worker_progress = Arc::clone(&progress);
+    let mut frame_worker = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            let expression = format!(
+                "window.__vblScreencastRecorder.push({})",
+                serde_json::to_string(&frame).expect("base64 frame is JSON serializable")
+            );
+            timeout(
+                Duration::from_secs(5),
+                evaluate_screencast_expression(
+                    &worker_recorder,
+                    &worker_session_id,
+                    expression,
+                    true,
+                    "encode screencast frame",
+                ),
+            )
+            .await
+            .map_err(|_| {
+                BrowserToolError::operation_timeout("screencast frame encoding timed out")
+            })??;
+            let mut current = worker_progress.lock().unwrap();
+            current.metrics.encoded_frames = current.metrics.encoded_frames.saturating_add(1);
+        }
+        Ok::<(), BrowserToolError>(())
+    });
+
+    let deadline = sleep(max_duration);
+    tokio::pin!(deadline);
+    let recording_started = Instant::now();
+    let frame_interval = 1.0 / f64::from(fps.max(1));
+    let mut next_timestamp = None::<f64>;
+    let mut visibility_open = true;
+    let mut emulation_echo_pending = false;
+    let overrides = Arc::clone(&runtime.screencast_focus_overrides);
+    let mut failure = None::<CdpScreencastFailure>;
+    let mut cancelled = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            changed = control.changed() => {
+                let command = if changed.is_ok() {
+                    *control.borrow()
+                } else {
+                    ScreencastControl::Cancel
+                };
+                match command {
+                    ScreencastControl::Record => {}
+                    ScreencastControl::Stop => break,
+                    ScreencastControl::Cancel => {
+                        cancelled = true;
+                        break;
+                    }
+                }
+            }
+            changed = visibility_events.next(), if visibility_open => {
+                let Some(changed) = changed else {
+                    visibility_open = false;
+                    continue;
+                };
+                if changed.visible {
+                    if emulation_echo_pending {
+                        emulation_echo_pending = false;
+                    } else if overrides.lock().unwrap().remove(&source_target_id) {
+                        let _ = source_page
+                            .execute(SetFocusEmulationEnabledParams::new(false))
+                            .await;
+                    }
+                } else if overrides.lock().unwrap().insert(source_target_id.clone()) {
+                    emulation_echo_pending = true;
+                    if source_page
+                        .execute(SetFocusEmulationEnabledParams::new(true))
+                        .await
+                        .is_err()
+                    {
+                        emulation_echo_pending = false;
+                        overrides.lock().unwrap().remove(&source_target_id);
+                    } else if !overrides.lock().unwrap().contains(&source_target_id) {
+                        emulation_echo_pending = false;
+                        let _ = source_page
+                            .execute(SetFocusEmulationEnabledParams::new(false))
+                            .await;
+                    }
+                }
+            }
+            frame = frame_events.next() => {
+                let Some(frame) = frame else {
+                    failure = Some(CdpScreencastFailure::new(
+                        "target_missing",
+                        "source screencast ended before finalization",
+                    ));
+                    break;
+                };
+                let _ = source_page
+                    .execute(ScreencastFrameAckParams::new(frame.session_id))
+                    .await;
+                {
+                    let mut current = progress.lock().unwrap();
+                    current.metrics.received_frames = current.metrics.received_frames.saturating_add(1);
+                }
+                let timestamp = frame
+                    .metadata
+                    .timestamp
+                    .as_ref()
+                    .map(|timestamp| *timestamp.inner())
+                    .unwrap_or_else(|| recording_started.elapsed().as_secs_f64());
+                let due = next_timestamp.is_none_or(|next| timestamp >= next);
+                if due {
+                    let mut next = next_timestamp.unwrap_or(timestamp);
+                    while next <= timestamp {
+                        next += frame_interval;
+                    }
+                    next_timestamp = Some(next);
+                    let encoded: String = frame.data.clone().into();
+                    if frame_tx.try_send(encoded).is_err() {
+                        let mut current = progress.lock().unwrap();
+                        current.metrics.dropped_frames = current.metrics.dropped_frames.saturating_add(1);
+                    }
+                } else {
+                    let mut current = progress.lock().unwrap();
+                    current.metrics.dropped_frames = current.metrics.dropped_frames.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    if failure.is_none() && !cancelled {
+        progress.lock().unwrap().phase = CdpScreencastPhase::Finalizing;
+    }
+    let stop_result = tokio::select! {
+        result = timeout(
+            Duration::from_secs(5),
+            async {
+                match source_page.execute(StopScreencastParams::default()).await {
+                    Ok(_) => Ok(()),
+                    Err(error) if source_screencast_disappeared(&error) => Ok(()),
+                    Err(error) => Err(runtime
+                        .page_error(&source_connection, "stop page screencast", error)
+                        .await),
+                }
+            },
+        ) => Some(result),
+        _ = wait_for_screencast_cancel(&mut control), if !cancelled => {
+            cancelled = true;
+            None
+        },
+    };
+    if stop_result.is_none() {
+        let _ = timeout(
+            Duration::from_secs(1),
+            source_page.execute(StopScreencastParams::default()),
+        )
+        .await;
+    }
+    if failure.is_none() && !cancelled {
+        failure = match stop_result.expect("non-cancelled source stop has a result") {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(CdpScreencastFailure::browser(error)),
+            Err(_) => Some(CdpScreencastFailure::new(
+                "operation_timeout",
+                "stopping source screencast timed out",
+            )),
+        };
+    }
+    if overrides.lock().unwrap().remove(&source_target_id) {
+        let _ = source_page
+            .execute(SetFocusEmulationEnabledParams::new(false))
+            .await;
+    }
+    drop(frame_tx);
+
+    let frame_drain = tokio::select! {
+        result = timeout(Duration::from_secs(5), &mut frame_worker) => Some(result),
+        _ = wait_for_screencast_cancel(&mut control) => None,
+    };
+    let Some(frame_drain) = frame_drain else {
+        frame_worker.abort();
+        chunk_writer.abort();
+        return Err(cancelled_screencast_failure());
+    };
+    match frame_drain {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) if failure.is_none() => {
+            failure = Some(CdpScreencastFailure::browser(error));
+        }
+        Ok(Err(error)) if failure.is_none() => {
+            failure = Some(CdpScreencastFailure::new(
+                "screencast_task_failed",
+                format!("screencast frame worker failed: {error}"),
+            ));
+        }
+        Err(_) if failure.is_none() => {
+            frame_worker.abort();
+            failure = Some(CdpScreencastFailure::new(
+                "finalization_timeout",
+                "screencast frame pipeline did not drain before finalization",
+            ));
+        }
+        _ => {}
+    }
+
+    if cancelled {
+        chunk_writer.abort();
+        return Err(CdpScreencastFailure::new(
+            "recording_cancelled",
+            "screencast recording was cancelled",
+        ));
+    }
+    if let Some(failure) = failure {
+        chunk_writer.abort();
+        return Err(failure);
+    }
+
+    let recorder_stop = tokio::select! {
+        result = timeout(
+            Duration::from_secs(5),
+            evaluate_screencast_expression(
+                &recorder,
+                &recorder_session_id,
+                "window.__vblScreencastRecorder.stop()".to_string(),
+                false,
+                "finalize hidden screencast recorder",
+            ),
+        ) => Some(result),
+        _ = wait_for_screencast_cancel(&mut control) => None,
+    };
+    let Some(recorder_stop) = recorder_stop else {
+        chunk_writer.abort();
+        return Err(cancelled_screencast_failure());
+    };
+    recorder_stop
+        .map_err(|_| {
+            CdpScreencastFailure::new(
+                "finalization_timeout",
+                "hidden screencast recorder did not accept finalization",
+            )
+        })?
+        .map_err(CdpScreencastFailure::browser)?;
+
+    let completion = tokio::select! {
+        result = timeout(SCREENCAST_FINALIZATION_TIMEOUT, &mut chunk_writer) => Some(result),
+        _ = wait_for_screencast_cancel(&mut control) => None,
+    };
+    let Some(completion) = completion else {
+        chunk_writer.abort();
+        return Err(cancelled_screencast_failure());
+    };
+    let completion = completion
+        .map_err(|_| {
+            chunk_writer.abort();
+            CdpScreencastFailure::new(
+                "finalization_timeout",
+                "screencast finalization exceeded 30 seconds",
+            )
+        })?
+        .map_err(|error| {
+            CdpScreencastFailure::new(
+                "screencast_task_failed",
+                format!("screencast chunk writer failed: {error}"),
+            )
+        })?
+        .map_err(CdpScreencastFailure::browser)?;
+    let metrics = progress.lock().unwrap().metrics;
+    if metrics.encoded_frames == 0 || completion.chunks == 0 || completion.bytes == 0 {
+        return Err(CdpScreencastFailure::new(
+            "no_encoded_frames",
+            "screencast completed without an encoded video frame",
+        ));
+    }
+    validate_webm_header(&partial_path)
+        .await
+        .map_err(CdpScreencastFailure::browser)?;
+    Ok(CdpScreencastOutput { metrics })
+}
+
+fn source_screencast_disappeared(error: &CdpError) -> bool {
+    match error {
+        CdpError::NotFound | CdpError::NoResponse | CdpError::ChannelSendError(_) => true,
+        CdpError::Chrome(error) => closed_source_session_message(&error.message),
+        CdpError::ChromeMessage(message) => closed_source_session_message(message),
+        _ => false,
+    }
+}
+
+fn closed_source_session_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("session with given id not found")
+        || message.contains("no session with given id")
+        || message.contains("session closed")
+        || message.contains("target closed")
+        || message.contains("target with given id not found")
+        || message.contains("inspected target navigated or closed")
+}
+
+async fn wait_for_screencast_cancel(control: &mut watch::Receiver<ScreencastControl>) {
+    loop {
+        if *control.borrow() == ScreencastControl::Cancel {
+            return;
+        }
+        if control.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn cancelled_screencast_failure() -> CdpScreencastFailure {
+    CdpScreencastFailure::new("recording_cancelled", "screencast recording was cancelled")
+}
+
+async fn validate_webm_header(path: &Path) -> Result<(), BrowserToolError> {
+    let mut file = File::open(path)
+        .await
+        .map_err(|error| BrowserToolError::artifact_error(error.to_string()))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .await
+        .map_err(|error| BrowserToolError::artifact_error(error.to_string()))?;
+    if magic != [0x1a, 0x45, 0xdf, 0xa3] {
+        return Err(BrowserToolError::artifact_error(
+            "screencast output is not a WebM container",
+        ));
+    }
+    Ok(())
+}
+
 fn navigation_timeout_budget(timeout_ms: u64, waits_for_lifecycle: bool) -> Duration {
     // Lifecycle waits start after listener setup and Page.navigate returns.
     // Keep the outer watchdog as a stuck-command/dialog backstop while giving
@@ -3698,6 +4546,13 @@ fn navigation_timeout_budget(timeout_ms: u64, waits_for_lifecycle: bool) -> Dura
 struct CdpRuntime {
     endpoint: CdpEndpoint,
     state: Mutex<RuntimeState>,
+    /// Serializes target discovery with private recorder creation and cleanup
+    /// so a recorder target cannot appear in caller-visible inventory during
+    /// the gap between Chrome creating it and VBL registering its target id.
+    target_inventory: Mutex<()>,
+    /// Internal recorder targets are implementation details, not browser tabs
+    /// that callers may list, claim, or manipulate.
+    private_targets: StdMutex<PrivateTargetInventory>,
     /// Targets whose screencast has engaged focus emulation to keep frames
     /// flowing while the page is hidden (RFC 00010). The emulation makes the
     /// page report itself focused and visible, so user-focus checks must
@@ -3753,6 +4608,8 @@ impl CdpRuntime {
         Self {
             endpoint,
             state: Mutex::new(RuntimeState::default()),
+            target_inventory: Mutex::new(()),
+            private_targets: StdMutex::new(PrivateTargetInventory::default()),
             screencast_focus_overrides: Arc::new(StdMutex::new(HashSet::new())),
             stale_page_contexts: StdMutex::new(BTreeMap::new()),
             stale_page_context_revision: AtomicU64::new(0),
@@ -3934,6 +4791,42 @@ impl CdpRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct PrivateTargetInventory {
+    target_ids: HashSet<String>,
+    closing_target_ids: HashSet<String>,
+}
+
+impl PrivateTargetInventory {
+    fn insert(&mut self, target_id: String) {
+        self.closing_target_ids.remove(&target_id);
+        self.target_ids.insert(target_id);
+    }
+
+    fn mark_closing(&mut self, target_id: &str) {
+        if self.target_ids.contains(target_id) {
+            self.closing_target_ids.insert(target_id.to_string());
+        }
+    }
+
+    fn target_ids_for_inventory(
+        &mut self,
+        present_target_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        let removed_target_ids = self
+            .closing_target_ids
+            .iter()
+            .filter(|target_id| !present_target_ids.contains(*target_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for target_id in removed_target_ids {
+            self.closing_target_ids.remove(&target_id);
+            self.target_ids.remove(&target_id);
+        }
+        self.target_ids.clone()
+    }
+}
+
 impl Drop for CdpRuntime {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.try_lock()
@@ -3942,6 +4835,14 @@ impl Drop for CdpRuntime {
             connection.handler.abort();
         }
     }
+}
+
+fn is_public_page_target(
+    target_type: &str,
+    target_id: &str,
+    private_target_ids: &HashSet<String>,
+) -> bool {
+    target_type == "page" && !private_target_ids.contains(target_id)
 }
 
 fn invalidates_connection(error: &CdpError) -> bool {
@@ -4062,15 +4963,100 @@ pub struct CdpTraceCapture {
     task: JoinHandle<Vec<Value>>,
 }
 
-pub struct CapturedScreencastFrame {
-    pub bytes: Vec<u8>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CdpScreencastMetrics {
+    pub received_frames: u64,
+    pub encoded_frames: u64,
+    pub dropped_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CdpScreencastPhase {
+    #[default]
+    Recording,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CdpScreencastProgress {
+    pub phase: CdpScreencastPhase,
+    pub metrics: CdpScreencastMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreencastControl {
+    Record,
+    Stop,
+    Cancel,
+}
+
+pub struct CdpScreencastOutput {
+    pub metrics: CdpScreencastMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdpScreencastOptions {
+    pub fps: u32,
+    pub quality: u8,
+    pub max_duration: Duration,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdpScreencastFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl CdpScreencastFailure {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    fn browser(error: BrowserToolError) -> Self {
+        let code = serde_json::to_value(&error.code)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "chrome_unavailable".to_string());
+        Self::new(code, error.message)
+    }
 }
 
 pub struct CdpScreencastCapture {
-    client: CdpClient,
-    target_id: String,
-    done: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Vec<CapturedScreencastFrame>>,
+    controller: CdpScreencastController,
+    task: JoinHandle<Result<CdpScreencastOutput, CdpScreencastFailure>>,
+}
+
+#[derive(Clone)]
+pub struct CdpScreencastController {
+    control: watch::Sender<ScreencastControl>,
+    progress: Arc<StdMutex<CdpScreencastProgress>>,
+}
+
+impl CdpScreencastController {
+    pub fn request_stop(&self) {
+        if *self.control.borrow() == ScreencastControl::Record {
+            self.control.send_replace(ScreencastControl::Stop);
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.control.send_replace(ScreencastControl::Cancel);
+    }
+
+    pub fn progress(&self) -> CdpScreencastProgress {
+        *self.progress.lock().unwrap()
+    }
+}
+
+impl CdpScreencastCapture {
+    pub fn controller(&self) -> CdpScreencastController {
+        self.controller.clone()
+    }
 }
 
 impl CdpDiagnosticsMonitor {
@@ -4674,6 +5660,61 @@ fn wall_timestamp_ms(value: Option<&Value>) -> Option<u64> {
 mod tests {
     use super::*;
     use visible_browser_lab_test_support::{BrowserMode, RealBrowser};
+
+    #[test]
+    fn full_screencast_event_queue_fails_without_waiting() {
+        let (events, _receiver) = mpsc::channel(1);
+        try_forward_binding_event(&events, json!({ "chunk": 1 })).unwrap();
+
+        assert_eq!(
+            try_forward_binding_event(&events, json!({ "chunk": 2 })).unwrap_err(),
+            "hidden screencast recorder event queue overflowed"
+        );
+    }
+
+    #[test]
+    fn missing_source_target_does_not_fail_screencast_finalization() {
+        assert!(source_screencast_disappeared(&CdpError::NotFound));
+        assert!(source_screencast_disappeared(&CdpError::NoResponse));
+        assert!(source_screencast_disappeared(&CdpError::Chrome(
+            chromiumoxide::types::Error {
+                code: -32001,
+                message: "Session with given id not found.".to_string(),
+            }
+        )));
+        assert!(!source_screencast_disappeared(&CdpError::Timeout));
+    }
+
+    #[test]
+    fn private_recorder_targets_are_not_public_page_targets() {
+        let private = HashSet::from(["recorder".to_string()]);
+        assert!(!is_public_page_target("page", "recorder", &private));
+        assert!(is_public_page_target("page", "user-tab", &private));
+        assert!(!is_public_page_target("service_worker", "worker", &private));
+    }
+
+    #[test]
+    fn private_target_markers_only_retire_after_close_and_confirmed_absence() {
+        let mut private = PrivateTargetInventory::default();
+        private.insert("recorder".to_string());
+
+        assert!(
+            private
+                .target_ids_for_inventory(&HashSet::new())
+                .contains("recorder")
+        );
+        private.mark_closing("recorder");
+        assert!(
+            private
+                .target_ids_for_inventory(&HashSet::from(["recorder".to_string()]))
+                .contains("recorder")
+        );
+        assert!(
+            !private
+                .target_ids_for_inventory(&HashSet::new())
+                .contains("recorder")
+        );
+    }
 
     #[test]
     fn builds_cdp_discovery_urls() {

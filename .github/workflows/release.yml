@@ -233,12 +233,17 @@ jobs:
           key: release-binary-${{ matrix.target }}-${{ needs.release-version.outputs.version }}-${{ hashFiles('src/**', 'agent-surface-contract/**', 'Cargo.toml', 'Cargo.lock') }}
 
       - name: Install Rust stable
-        if: steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Install Rust target
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           rustup target add "${{ matrix.target }}"
 
       - name: Install musl tools
@@ -281,6 +286,53 @@ jobs:
             echo "Binary version mismatch: expected '$expected', got '$actual'" >&2
             exit 1
           fi
+
+      - name: Cache Chrome for Testing
+        if: ${{ !contains(matrix.target, 'windows') }}
+        uses: actions/cache@v6
+        with:
+          path: target/chrome-for-testing
+          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
+
+      # Chrome for Testing has no Linux ARM64 download. Use the same native
+      # Playwright Chromium source that passed RFC 0013's six-runner probe.
+      - name: Install Chromium for Linux ARM64 screencast smoke
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes playwright@1.61.1 install chromium
+          chrome="$(find "$HOME/.cache/ms-playwright" -type f -path '*/chrome-linux/chrome' -perm -111 -print -quit)"
+          test -n "$chrome"
+          echo "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" >> "$GITHUB_ENV"
+
+      # Cached Chrome for Testing can retain ACLs that its Windows sandbox
+      # cannot execute after restore. Both native Windows runner images include
+      # Google Chrome, so use that stable executable for packaged smoke tests.
+      - name: Select installed Chrome for Windows screencast smoke
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $chrome = Join-Path $Env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+          if (-not (Test-Path $chrome)) {
+            throw "Windows ARM runner Chrome was not found at $chrome"
+          }
+          "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate packaged durable screencast
+        shell: bash
+        env:
+          VISIBLE_BROWSER_LAB_CFT_CACHE_DIR: target/chrome-for-testing
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="visible-browser-lab-mcp"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          cargo xtask screencast-smoke \
+            --binary "dist/binaries/${target}/${binary}" \
+            --duration-ms 45000
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7

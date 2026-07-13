@@ -244,7 +244,7 @@ fn help_content(topic: &str, operation: Option<&str>) -> (Vec<&'static str>, Str
         ),
         "screencast" => (
             vec!["screencast"],
-            "Start and explicitly stop a silent WebM recording while the tab remains owned.",
+            "Start a silent VP8-in-WebM job. Stop waits briefly; if it returns finalizing, poll status or repeat stop for the same artifact. Maximum width and height are optional, paired, even bounds.",
         ),
         "artifacts" => (
             vec!["artifacts"],
