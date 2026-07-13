@@ -181,10 +181,7 @@ pub fn chrome_for_testing_executable() -> Result<PathBuf> {
 
 fn validate_browser_executable(executable: &Path, source: &str) -> Result<()> {
     if !executable.is_file() {
-        bail!(
-            "{source} `{}` is not a browser executable",
-            executable.display()
-        );
+        bail!("{source} `{}` is not a file", executable.display());
     }
     #[cfg(unix)]
     {
