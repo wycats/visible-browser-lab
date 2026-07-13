@@ -1167,8 +1167,7 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
     browser.shutdown();
     let _ = fs::remove_dir_all(&state_dir);
 
-    let summary = result?;
-    cleanup_result?;
+    let summary = finish_screencast_smoke(result, cleanup_result)?;
     println!(
         "packaged screencast smoke passed: duration_ms={}, stop_ms={}, artifact={}, bytes={}",
         args.duration.as_millis(),
@@ -1177,6 +1176,16 @@ fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
         summary.size_bytes
     );
     Ok(())
+}
+
+fn finish_screencast_smoke<T>(result: Result<T>, cleanup_result: Result<()>) -> Result<T> {
+    match (result, cleanup_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(smoke_error), Err(cleanup_error)) => bail!(
+            "screencast smoke cleanup failed: {cleanup_error:#}\nscreencast smoke also failed: {smoke_error:#}"
+        ),
+    }
 }
 
 fn install_smoke(args: InstallSmokeArgs) -> Result<()> {
@@ -3052,6 +3061,18 @@ fn git_head() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screencast_smoke_reports_cleanup_failure_when_smoke_also_fails() {
+        let error = finish_screencast_smoke::<()>(
+            Err(anyhow::anyhow!("capture failed")),
+            Err(anyhow::anyhow!("hidden target survived")),
+        )
+        .expect_err("combined failures must fail");
+        let message = error.to_string();
+        assert!(message.contains("cleanup failed: hidden target survived"));
+        assert!(message.contains("smoke also failed: capture failed"));
+    }
 
     #[test]
     fn temp_broker_filter_matches_broker_as_a_word_in_any_position() {

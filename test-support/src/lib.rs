@@ -144,12 +144,7 @@ impl Drop for RealBrowser {
 pub fn chrome_for_testing_executable() -> Result<PathBuf> {
     if let Some(configured) = env::var_os(TEST_CHROME_PATH_ENV) {
         let executable = PathBuf::from(configured);
-        if !executable.is_file() {
-            bail!(
-                "{TEST_CHROME_PATH_ENV} `{}` is not a browser executable",
-                executable.display()
-            );
-        }
+        validate_browser_executable(&executable, TEST_CHROME_PATH_ENV)?;
         prepare_chrome_for_testing_executable(&executable)?;
         return Ok(executable);
     }
@@ -182,6 +177,29 @@ pub fn chrome_for_testing_executable() -> Result<PathBuf> {
         prepare_chrome_for_testing_executable(&executable)?;
         Ok(executable)
     })
+}
+
+fn validate_browser_executable(executable: &Path, source: &str) -> Result<()> {
+    if !executable.is_file() {
+        bail!(
+            "{source} `{}` is not a browser executable",
+            executable.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = executable
+            .metadata()
+            .with_context(|| format!("failed to inspect `{}`", executable.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            bail!("{source} `{}` is not executable", executable.display());
+        }
+    }
+    Ok(())
 }
 
 fn chrome_for_testing_arguments(profile_dir: &Path, mode: BrowserMode) -> Vec<OsString> {
@@ -250,6 +268,25 @@ fn remove_macos_quarantine(_executable: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_browser_path_must_be_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = tempfile::NamedTempFile::new().expect("temporary browser file");
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600))
+            .expect("remove executable bits");
+
+        let error = validate_browser_executable(file.path(), TEST_CHROME_PATH_ENV)
+            .expect_err("non-executable browser path must fail");
+        assert!(error.to_string().contains("is not executable"));
+
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o700))
+            .expect("add executable bit");
+        validate_browser_executable(file.path(), TEST_CHROME_PATH_ENV)
+            .expect("executable browser path is accepted");
+    }
 
     #[test]
     fn chrome_for_testing_arguments_include_stable_profile_and_startup_flags() {
