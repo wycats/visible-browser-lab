@@ -886,9 +886,11 @@ fn operation_fields(domain: &str, operation: &str) -> Vec<(&'static str, Value)>
         ],
         ("memory", "close") => vec![("artifact_id", string_schema())],
         ("screencast", "start") => vec![
-            ("fps", integer_schema()),
-            ("quality", integer_schema()),
-            ("max_duration_ms", integer_schema()),
+            ("fps", bounded_integer_schema(1, 30)),
+            ("quality", bounded_integer_schema(1, 100)),
+            ("max_duration_ms", bounded_integer_schema(1_000, 300_000)),
+            ("max_width", even_bounded_integer_schema(16, 3_840)),
+            ("max_height", even_bounded_integer_schema(16, 2_160)),
         ],
         ("artifacts", "list") => vec![
             ("tab_id", string_schema()),
@@ -1350,26 +1352,21 @@ fn operation_output_schema(domain: &str, operation: &str) -> Value {
                 operation,
                 vec![
                     ("recording", json!({"const":true})),
+                    ("state", json!({"const":"recording"})),
                     ("started_at_ms", integer_schema()),
+                    ("metrics", screencast_metrics_schema()),
                 ],
-                &["recording", "started_at_ms"],
+                &["recording", "state", "started_at_ms", "metrics"],
             ),
-            "stop" => operation_result(
-                operation,
-                vec![
-                    ("recording", json!({"const":false})),
-                    ("artifact", artifact_summary_schema()),
-                ],
-                &["recording", "artifact"],
-            ),
-            "status" => operation_result(
-                operation,
-                vec![
-                    ("recording", json!({"type":"boolean"})),
-                    ("started_at_ms", integer_schema()),
-                ],
-                &["recording"],
-            ),
+            "stop" => screencast_job_schema(operation),
+            "status" => json!({"oneOf":[
+                operation_result(
+                    operation,
+                    vec![("recording", json!({"const":false}))],
+                    &["recording"],
+                ),
+                screencast_job_schema(operation),
+            ]}),
             _ => unreachable!("known screencast operation"),
         },
         "artifacts" => match operation {
@@ -1420,6 +1417,62 @@ fn operation_result(operation: &str, mut fields: Vec<(&str, Value)>, required: &
     let mut all_required = vec!["operation"];
     all_required.extend_from_slice(required);
     object_schema(fields, &all_required)
+}
+
+fn screencast_job_schema(operation: &str) -> Value {
+    json!({"oneOf":[
+        screencast_state_schema(operation, "recording", true, None),
+        screencast_state_schema(operation, "finalizing", true, None),
+        screencast_state_schema(
+            operation,
+            "ready",
+            false,
+            Some(("artifact", artifact_summary_schema())),
+        ),
+        screencast_state_schema(
+            operation,
+            "error",
+            false,
+            Some((
+                "error",
+                object_schema(
+                    vec![("code", string_schema()), ("message", string_schema())],
+                    &["code", "message"],
+                ),
+            )),
+        ),
+    ]})
+}
+
+fn screencast_state_schema(
+    operation: &str,
+    state: &str,
+    recording: bool,
+    terminal: Option<(&str, Value)>,
+) -> Value {
+    let mut fields = vec![
+        ("recording", json!({"const":recording})),
+        ("state", json!({"const":state})),
+        ("started_at_ms", integer_schema()),
+        ("metrics", screencast_metrics_schema()),
+    ];
+    let mut required = vec!["recording", "state", "started_at_ms", "metrics"];
+    if let Some((name, schema)) = terminal {
+        fields.push((name, schema));
+        required.push(name);
+    }
+    operation_result(operation, fields, &required)
+}
+
+fn screencast_metrics_schema() -> Value {
+    object_schema(
+        vec![
+            ("received_frames", integer_schema()),
+            ("encoded_frames", integer_schema()),
+            ("dropped_frames", integer_schema()),
+        ],
+        &["received_frames", "encoded_frames", "dropped_frames"],
+    )
 }
 
 fn page_action_properties() -> Vec<(&'static str, Value)> {
@@ -1885,6 +1938,12 @@ fn array_schema(items: Value) -> Value {
 fn integer_schema() -> Value {
     json!({"type":"integer"})
 }
+fn bounded_integer_schema(minimum: u64, maximum: u64) -> Value {
+    json!({"type":"integer","minimum":minimum,"maximum":maximum})
+}
+fn even_bounded_integer_schema(minimum: u64, maximum: u64) -> Value {
+    json!({"type":"integer","minimum":minimum,"maximum":maximum,"multipleOf":2})
+}
 fn number_schema() -> Value {
     json!({"type":"number"})
 }
@@ -2013,13 +2072,13 @@ fn baseline_operation_description(domain: &str, operation: &str, domain_summary:
             "Close an owned heap-snapshot artifact and release its analysis resources."
         }
         ("screencast", "start") => {
-            "Start an owned-tab silent WebM screencast with bounded frame rate, quality, and duration settings."
+            "Start a broker-owned silent VP8-in-WebM job with bounded frame rate, quality, duration, and optional paired maximum dimensions."
         }
         ("screencast", "stop") => {
-            "Stop the active screencast and return its immutable video artifact metadata."
+            "Stop the current screencast job, waiting briefly for its immutable artifact or returning finalizing for status polling."
         }
         ("screencast", "status") => {
-            "Read whether the owned tab has an active screencast and when it started."
+            "Read the current screencast job state, metrics, stable error, or completed immutable artifact."
         }
         ("artifacts", "list") => {
             "List bounded session-owned browser artifacts using tab, kind, cursor, and limit filters."
@@ -2227,6 +2286,31 @@ mod tests {
             assert!(tool.input_schema.is_object());
             assert!(tool.output_schema.is_object());
             assert!(tool.annotations.is_object());
+        }
+    }
+
+    #[test]
+    fn screencast_contract_declares_dimensions_and_durable_states() {
+        let tool = hybrid_catalog()
+            .into_iter()
+            .find(|tool| tool.name == "screencast")
+            .unwrap();
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties["fps"]["minimum"], 1);
+        assert_eq!(properties["fps"]["maximum"], 30);
+        assert_eq!(properties["max_width"]["minimum"], 16);
+        assert_eq!(properties["max_width"]["maximum"], 3_840);
+        assert_eq!(properties["max_width"]["multipleOf"], 2);
+        assert_eq!(properties["max_height"]["maximum"], 2_160);
+        let output = serde_json::to_string(&tool.output_schema).unwrap();
+        for state in ["recording", "finalizing", "ready", "error"] {
+            assert!(output.contains(state), "missing screencast state {state}");
+        }
+        for metric in ["received_frames", "encoded_frames", "dropped_frames"] {
+            assert!(
+                output.contains(metric),
+                "missing screencast metric {metric}"
+            );
         }
     }
 

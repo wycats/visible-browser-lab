@@ -4,7 +4,7 @@ use std::{
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_surface_contract::{PRODUCTION_TOOLS, ToolDefinition, hybrid_catalog};
@@ -87,6 +87,7 @@ fn main() -> Result<()> {
         "vsix-smoke" => vsix_smoke(VsixSmokeArgs::parse(args.collect())?),
         "dogfood" => dogfood(DogfoodArgs::parse(args.collect())?),
         "live-smoke" => live_smoke(LiveSmokeArgs::parse(args.collect())?),
+        "screencast-smoke" => screencast_smoke(ScreencastSmokeArgs::parse(args.collect())?),
         "install-smoke" => install_smoke(InstallSmokeArgs::parse(args.collect())?),
         "broker-survivors" => broker_survivors(),
         "catalog-measurement" => agent_eval::catalog_measurement_command(&repo_root()?),
@@ -121,6 +122,8 @@ usage:
   cargo xtask live-smoke [--cdp-endpoint <url>] [--binary <path>] [--state-dir <dir>] [--allow-focus]
       Omitting --cdp-endpoint exercises managed Chrome mode.
       Omitting --allow-focus keeps native input checks on the focus_required path.
+  cargo xtask screencast-smoke [--binary <path>] [--duration-ms <milliseconds>]
+      Runs an isolated Chrome-for-Testing recording through the packaged binary.
   cargo xtask install-smoke [--archive <path>] [--codex <path>] [--chrome-path <path>] [--invoke-codex] [--auth-source <path>] [--keep-temp]
   cargo xtask broker-survivors
       Fails if any broker process is still running against a state directory
@@ -355,6 +358,45 @@ struct LiveSmokeArgs {
     binary: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     allow_focus: bool,
+}
+
+#[derive(Debug)]
+struct ScreencastSmokeArgs {
+    binary: Option<PathBuf>,
+    duration: Duration,
+}
+
+impl ScreencastSmokeArgs {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut binary = None;
+        let mut duration = Duration::from_secs(45);
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--binary" => {
+                    index += 1;
+                    binary = Some(PathBuf::from(
+                        args.get(index).context("missing value after --binary")?,
+                    ));
+                }
+                "--duration-ms" => {
+                    index += 1;
+                    let millis = args
+                        .get(index)
+                        .context("missing value after --duration-ms")?
+                        .parse::<u64>()
+                        .context("--duration-ms must be an integer")?;
+                    if !(1_000..=270_000).contains(&millis) {
+                        bail!("--duration-ms must be between 1000 and 270000");
+                    }
+                    duration = Duration::from_millis(millis);
+                }
+                arg => bail!("unknown screencast-smoke argument `{arg}`"),
+            }
+            index += 1;
+        }
+        Ok(Self { binary, duration })
+    }
 }
 
 impl LiveSmokeArgs {
@@ -1068,6 +1110,70 @@ fn live_smoke(args: LiveSmokeArgs) -> Result<()> {
     println!(
         "live smoke passed: tools={}, screenshot_bytes={}, global_groups={}",
         summary.tool_count, summary.screenshot_bytes, summary.global_groups
+    );
+    Ok(())
+}
+
+fn screencast_smoke(args: ScreencastSmokeArgs) -> Result<()> {
+    use visible_browser_lab_test_support::{
+        BrowserMode, McpClient, RealBrowser, cdp_target_count_by_type, cleanup_open_tabs,
+        run_screencast_smoke, stop_broker,
+    };
+
+    let root = repo_root()?;
+    if args.binary.is_none() {
+        build_live_smoke_binary(&root)?;
+    }
+    let binary = live_smoke_binary(&root, args.binary.as_deref())?;
+    let state_root = if cfg!(windows) {
+        env::temp_dir()
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let state_dir = state_root.join(format!(
+        "vbl-screencast-smoke-{}-{}",
+        std::process::id(),
+        unix_millis()?
+    ));
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create `{}`", state_dir.display()))?;
+    let mut browser = RealBrowser::launch(BrowserMode::Headless)?;
+    let endpoint = browser.cdp_endpoint().to_string();
+    let baseline_other_targets = cdp_target_count_by_type(&endpoint, "other")?;
+    let mut client = McpClient::spawn(&binary, &endpoint, &state_dir, &root)?;
+    let mut open_tabs = Vec::new();
+    let result = run_screencast_smoke(&mut client, &mut open_tabs, args.duration);
+
+    let cleanup_result = (|| -> Result<()> {
+        cleanup_open_tabs(&mut client, &mut open_tabs);
+        client.shutdown();
+        stop_broker(&state_dir);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = cdp_target_count_by_type(&endpoint, "other")?;
+            if current <= baseline_other_targets {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "hidden screencast target survived cleanup: baseline={baseline_other_targets}, current={current}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    })();
+    browser.shutdown();
+    let _ = fs::remove_dir_all(&state_dir);
+
+    let summary = result?;
+    cleanup_result?;
+    println!(
+        "packaged screencast smoke passed: duration_ms={}, stop_ms={}, artifact={}, bytes={}",
+        args.duration.as_millis(),
+        summary.stop_elapsed.as_millis(),
+        summary.artifact_id,
+        summary.size_bytes
     );
     Ok(())
 }

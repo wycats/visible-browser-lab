@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -25,10 +25,11 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    artifacts::ArtifactRegistry,
+    artifacts::{ArtifactRegistry, ArtifactSummary, ReservedArtifact},
     cdp::{
-        CapturedScreencastFrame, CdpClient, CdpDiagnosticEvent, CdpDiagnosticsMonitor,
-        CdpScreencastCapture, CdpTarget, CdpTraceCapture, ElementEvaluation,
+        CdpClient, CdpDiagnosticEvent, CdpDiagnosticsMonitor, CdpScreencastCapture,
+        CdpScreencastController, CdpScreencastFailure, CdpScreencastOptions, CdpScreencastOutput,
+        CdpScreencastPhase, CdpScreencastProgress, CdpTarget, CdpTraceCapture, ElementEvaluation,
     },
     config::{CHROME_PATH_ENV, RuntimeConfig, RuntimeMode},
     ipc::{self, BrokerEndpoint, BrokerListener, BrokerStream},
@@ -56,12 +57,16 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::cdp::CdpScreencastMetrics;
+#[cfg(test)]
 use crate::protocol::{
     ConsoleMessagesResult, DiagnosticsParams, EvaluateParams, NavigateParams, NetworkEventsResult,
     PressKeyParams, PressKeyResult, TypeTextParams, TypeTextResult,
 };
 #[cfg(test)]
 use crate::semantic::{RawAxFrame, RawAxNode};
+#[cfg(test)]
+use tokio::sync::watch;
 
 const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONNECT_RETRY: Duration = Duration::from_millis(50);
@@ -82,7 +87,7 @@ struct BrokerState {
     references: Arc<Mutex<ElementReferenceRegistry>>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
     traces: Arc<AsyncMutex<HashMap<String, TraceCapture>>>,
-    screencasts: Arc<AsyncMutex<HashMap<String, ActiveScreencast>>>,
+    screencasts: Arc<AsyncMutex<HashMap<TabId, Arc<ActiveScreencast>>>>,
     viewport_overrides: Arc<Mutex<HashMap<String, serde_json::Map<String, Value>>>>,
     focused_target_id: Arc<Mutex<Option<String>>>,
     /// Sessions with a request currently being dispatched, with a count of
@@ -90,6 +95,7 @@ struct BrokerState {
     /// running request is proof of use, however stale the session's last
     /// completed touch looks.
     in_flight_sessions: Arc<Mutex<HashMap<AgentSessionId, usize>>>,
+    shutting_down: Arc<AtomicBool>,
     browser: BrowserBackend,
 }
 
@@ -108,6 +114,7 @@ impl BrokerState {
             viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             in_flight_sessions: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             browser: BrowserBackend::new(config)?,
         })
     }
@@ -125,6 +132,7 @@ impl BrokerState {
             viewport_overrides: Arc::new(Mutex::new(HashMap::new())),
             focused_target_id: Arc::new(Mutex::new(None)),
             in_flight_sessions: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             browser,
         }
     }
@@ -323,14 +331,93 @@ enum TraceCapture {
 enum ScreencastCapture {
     Real(CdpScreencastCapture),
     #[cfg(test)]
-    Fake(Vec<CapturedScreencastFrame>),
+    Fake(FakeScreencastCapture),
+}
+
+#[derive(Clone)]
+enum ScreencastController {
+    Real(CdpScreencastController),
+    #[cfg(test)]
+    Fake(FakeScreencastController),
+}
+
+#[cfg(test)]
+struct FakeScreencastCapture {
+    controller: FakeScreencastController,
+    task: tokio::task::JoinHandle<Result<CdpScreencastOutput, CdpScreencastFailure>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FakeScreencastController {
+    control: watch::Sender<FakeScreencastControl>,
+    progress: Arc<Mutex<CdpScreencastProgress>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakeScreencastControl {
+    Record,
+    Stop,
+    Cancel,
 }
 
 struct ActiveScreencast {
-    capture: ScreencastCapture,
+    session_id: AgentSessionId,
+    target_id: String,
+    controller: ScreencastController,
+    terminal: Mutex<Option<ScreencastTerminal>>,
     started_at_ms: u64,
-    fps: u32,
-    quality: u8,
+}
+
+#[derive(Clone)]
+enum ScreencastTerminal {
+    Ready(ArtifactSummary),
+    Error { code: String, message: String },
+}
+
+impl ScreencastController {
+    fn request_stop(&self) {
+        match self {
+            Self::Real(controller) => controller.request_stop(),
+            #[cfg(test)]
+            Self::Fake(controller) => {
+                if *controller.control.borrow() == FakeScreencastControl::Record {
+                    controller.control.send_replace(FakeScreencastControl::Stop);
+                }
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Real(controller) => controller.cancel(),
+            #[cfg(test)]
+            Self::Fake(controller) => {
+                controller
+                    .control
+                    .send_replace(FakeScreencastControl::Cancel);
+            }
+        }
+    }
+
+    fn progress(&self) -> CdpScreencastProgress {
+        match self {
+            Self::Real(controller) => controller.progress(),
+            #[cfg(test)]
+            Self::Fake(controller) => *controller.progress.lock().unwrap(),
+        }
+    }
+}
+
+impl ScreencastCapture {
+    fn controller(&self) -> ScreencastController {
+        match self {
+            Self::Real(capture) => ScreencastController::Real(capture.controller()),
+            #[cfg(test)]
+            Self::Fake(capture) => ScreencastController::Fake(capture.controller.clone()),
+        }
+    }
 }
 
 fn truncate_front<T>(buffer: &mut VecDeque<T>) {
@@ -355,6 +442,8 @@ struct FakeBrowser {
     pressed_keys: Vec<String>,
     fail_emulation_reset: bool,
     fail_page_targets: bool,
+    screencast_finalization_delay: Duration,
+    screencast_failure: Option<CdpScreencastFailure>,
 }
 
 #[cfg(test)]
@@ -374,7 +463,22 @@ impl FakeBrowser {
             pressed_keys: Vec::new(),
             fail_emulation_reset: false,
             fail_page_targets: false,
+            screencast_finalization_delay: Duration::ZERO,
+            screencast_failure: None,
         }
+    }
+
+    fn with_screencast_finalization_delay(mut self, delay: Duration) -> Self {
+        self.screencast_finalization_delay = delay;
+        self
+    }
+
+    fn with_screencast_failure(mut self, code: &str, message: &str) -> Self {
+        self.screencast_failure = Some(CdpScreencastFailure {
+            code: code.to_string(),
+            message: message.to_string(),
+        });
+        self
     }
 
     fn with_failed_emulation_reset(mut self) -> Self {
@@ -1852,29 +1956,97 @@ impl BrowserBackend {
     async fn start_screencast(
         &self,
         target: &CdpTarget,
-        fps: u32,
-        quality: u8,
-        max_duration: Duration,
+        options: CdpScreencastOptions,
+        partial_path: &Path,
     ) -> Result<ScreencastCapture, BrowserToolError> {
         match self {
             #[cfg(test)]
-            Self::Fake(_) => Ok(ScreencastCapture::Fake(Vec::new())),
+            Self::Fake(browser) => {
+                let (finalization_delay, configured_failure) = {
+                    let browser = browser.lock().unwrap();
+                    (
+                        browser.screencast_finalization_delay,
+                        browser.screencast_failure.clone(),
+                    )
+                };
+                let (control, mut control_rx) = watch::channel(FakeScreencastControl::Record);
+                let progress = Arc::new(Mutex::new(CdpScreencastProgress::default()));
+                let task_progress = Arc::clone(&progress);
+                let partial_path = partial_path.to_path_buf();
+                let task = tokio::spawn(async move {
+                    tokio::select! {
+                        _ = sleep(options.max_duration) => {}
+                        changed = control_rx.changed() => {
+                            if changed.is_err() {
+                                return Err(CdpScreencastFailure {
+                                    code: "recording_cancelled".to_string(),
+                                    message: "fake screencast controller was dropped".to_string(),
+                                });
+                            }
+                            if *control_rx.borrow() == FakeScreencastControl::Cancel {
+                                return Err(CdpScreencastFailure {
+                                    code: "recording_cancelled".to_string(),
+                                    message: "screencast recording was cancelled".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    task_progress.lock().unwrap().phase = CdpScreencastPhase::Finalizing;
+                    tokio::select! {
+                        _ = sleep(finalization_delay) => {}
+                        changed = control_rx.changed() => {
+                            if changed.is_err() || *control_rx.borrow() == FakeScreencastControl::Cancel {
+                                return Err(CdpScreencastFailure {
+                                    code: "recording_cancelled".to_string(),
+                                    message: "screencast recording was cancelled".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(failure) = configured_failure {
+                        return Err(failure);
+                    }
+                    tokio::fs::write(&partial_path, [0x1a, 0x45, 0xdf, 0xa3, 0x01])
+                        .await
+                        .map_err(|error| CdpScreencastFailure {
+                            code: "artifact_error".to_string(),
+                            message: error.to_string(),
+                        })?;
+                    let metrics = CdpScreencastMetrics {
+                        received_frames: 1,
+                        encoded_frames: 1,
+                        dropped_frames: 0,
+                    };
+                    task_progress.lock().unwrap().metrics = metrics;
+                    Ok(CdpScreencastOutput { metrics })
+                });
+                let controller = FakeScreencastController { control, progress };
+                Ok(ScreencastCapture::Fake(FakeScreencastCapture {
+                    controller,
+                    task,
+                }))
+            }
             _ => Ok(ScreencastCapture::Real(
                 self.cdp_client()
                     .await?
-                    .start_screencast(target, fps, quality, max_duration)
+                    .start_screencast(target, options, partial_path)
                     .await?,
             )),
         }
     }
 
-    async fn stop_screencast(
+    async fn finish_screencast(
         capture: ScreencastCapture,
-    ) -> Result<Vec<CapturedScreencastFrame>, BrowserToolError> {
+    ) -> Result<CdpScreencastOutput, CdpScreencastFailure> {
         match capture {
-            ScreencastCapture::Real(capture) => CdpClient::stop_screencast(capture).await,
+            ScreencastCapture::Real(capture) => CdpClient::finish_screencast(capture).await,
             #[cfg(test)]
-            ScreencastCapture::Fake(frames) => Ok(frames),
+            ScreencastCapture::Fake(capture) => {
+                capture.task.await.map_err(|error| CdpScreencastFailure {
+                    code: "screencast_task_failed".to_string(),
+                    message: error.to_string(),
+                })?
+            }
         }
     }
 }
@@ -2496,12 +2668,14 @@ async fn serve_state(
     // always answers "why did the broker exit", then close the listener so new
     // connectors fail fast into the start-lock path, then drain briefly.
     tracing::warn!(reason = %exit.reason(), "visible browser broker shutting down");
+    state.shutting_down.store(true, Ordering::SeqCst);
     drop(listener);
 
     let drain_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
     while open_connections.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
         sleep(Duration::from_millis(50)).await;
     }
+    cancel_all_screencasts(&state).await;
 
     // The claim itself (pid file, socket file) is released by the
     // RuntimeFileGuard in `run`, which re-checks ownership before removing.
@@ -2594,6 +2768,7 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
             closed_tabs = session.closed.len(),
             "session expired; leases reclaimed"
         );
+        cancel_session_screencasts(state, &session.session_id).await;
         state
             .artifacts()
             .lock()
@@ -2634,6 +2809,48 @@ async fn sweep_expired_sessions(state: &BrokerState, ttl: Option<Duration>) {
     }
 }
 
+async fn cancel_session_screencasts(state: &BrokerState, session_id: &AgentSessionId) {
+    let jobs = {
+        let mut screencasts = state.screencasts.lock().await;
+        let tab_ids = screencasts
+            .iter()
+            .filter(|(_, job)| &job.session_id == session_id)
+            .map(|(tab_id, _)| tab_id.clone())
+            .collect::<Vec<_>>();
+        tab_ids
+            .into_iter()
+            .filter_map(|tab_id| screencasts.remove(&tab_id))
+            .collect::<Vec<_>>()
+    };
+    for job in jobs {
+        if job.terminal.lock().unwrap().is_none() {
+            job.controller.cancel();
+        }
+    }
+}
+
+async fn cancel_all_screencasts(state: &BrokerState) {
+    let jobs = {
+        let mut screencasts = state.screencasts.lock().await;
+        std::mem::take(&mut *screencasts)
+            .into_values()
+            .collect::<Vec<_>>()
+    };
+    for job in &jobs {
+        if job.terminal.lock().unwrap().is_none() {
+            job.controller.cancel();
+        }
+    }
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while jobs
+        .iter()
+        .any(|job| job.terminal.lock().unwrap().is_none())
+        && Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Close a target created by VBL after the registry has
 /// reserved it against concurrent claims. This is best-effort maintenance:
 /// the session is already expired, and a close failure must leave the target
@@ -2646,8 +2863,8 @@ async fn close_expired_vbl_target(
     if let Some(capture) = state.traces.lock().await.remove(&lease.target_id) {
         let _ = BrowserBackend::stop_trace(capture).await;
     }
-    if let Some(active) = state.screencasts.lock().await.remove(&lease.target_id) {
-        let _ = BrowserBackend::stop_screencast(active.capture).await;
+    if let Some(job) = state.screencasts.lock().await.remove(&lease.tab_id) {
+        job.controller.cancel();
     }
 
     let closed = match target_by_id(state, &lease.target_id).await {
@@ -3340,8 +3557,16 @@ async fn broker_claim_tab(
         if let Some(capture) = state.traces.lock().await.remove(&target.id) {
             let _ = BrowserBackend::stop_trace(capture).await;
         }
-        if let Some(active) = state.screencasts.lock().await.remove(&target.id) {
-            let _ = BrowserBackend::stop_screencast(active.capture).await;
+        let jobs = state
+            .screencasts
+            .lock()
+            .await
+            .values()
+            .filter(|job| job.target_id == target.id && job.terminal.lock().unwrap().is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        for job in jobs {
+            job.controller.cancel();
         }
         state
             .browser
@@ -3407,7 +3632,11 @@ async fn broker_release_tab(
             .screencasts
             .lock()
             .await
-            .contains_key(&released_target_id)
+            .get(&params.tab_id)
+            .is_some_and(|job| {
+                job.terminal.lock().unwrap().is_none()
+                    && job.controller.progress().phase == CdpScreencastPhase::Recording
+            })
         {
             return Err(BrowserToolError::invalid_input(
                 "stop the active screencast before releasing its tab",
@@ -6335,94 +6564,257 @@ async fn broker_screencast(
         .tab_id
         .as_ref()
         .ok_or_else(|| BrowserToolError::invalid_input("screencast requires tab_id"))?;
-    let target = active_owned_target(state, &params.agent_session_id, tab_id).await?;
     match params.operation.as_str() {
         "start" => {
-            let fps = params
-                .arguments
-                .get("fps")
-                .and_then(Value::as_u64)
-                .unwrap_or(10)
-                .clamp(1, 30) as u32;
-            let quality = params
-                .arguments
-                .get("quality")
-                .and_then(Value::as_u64)
-                .unwrap_or(70)
-                .clamp(1, 100) as u8;
-            let max_duration_ms = params
-                .arguments
-                .get("max_duration_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(30_000)
-                .clamp(1_000, 300_000);
-            let mut captures = state.screencasts.lock().await;
-            if captures.contains_key(&target.id) {
-                return Err(BrowserToolError::invalid_input(
-                    "a screencast is already recording for this tab",
+            if state.shutting_down.load(Ordering::SeqCst) {
+                return Err(BrowserToolError::chrome_unavailable(
+                    "the browser broker is shutting down",
                 ));
             }
-            let started_at_ms = current_time_ms();
-            let capture = state
-                .browser
-                .start_screencast(
-                    &target,
-                    fps,
-                    quality,
-                    Duration::from_millis(max_duration_ms),
-                )
-                .await?;
-            captures.insert(
-                target.id,
-                ActiveScreencast {
-                    capture,
-                    started_at_ms,
-                    fps,
-                    quality,
-                },
-            );
-            Ok(json!({"operation":"start", "recording":true, "started_at_ms":started_at_ms}))
-        }
-        "status" => {
-            let captures = state.screencasts.lock().await;
-            let active = captures.get(&target.id);
-            Ok(json!({
-                "operation":"status",
-                "recording":active.is_some(),
-                "started_at_ms":active.map(|capture| capture.started_at_ms)
-            }))
-        }
-        "stop" => {
-            let active = state
-                .screencasts
-                .lock()
-                .await
-                .remove(&target.id)
-                .ok_or_else(|| BrowserToolError::invalid_input("no screencast is recording"))?;
-            let frames = BrowserBackend::stop_screencast(active.capture).await?;
-            let fps = active.fps;
-            let quality = active.quality;
-            let bytes = tokio::task::spawn_blocking(move || {
-                crate::video::encode_silent_webm(&frames, fps, quality)
-            })
-            .await
-            .map_err(|error| {
-                BrowserToolError::artifact_error(format!("screencast encoder failed: {error}"))
-            })??;
-            let artifact = state.artifacts().lock().unwrap().insert_bytes(
+            let target = active_owned_target(state, &params.agent_session_id, tab_id).await?;
+            let fps = screencast_integer(&params.arguments, "fps", 10, 1, 30)? as u32;
+            let quality = screencast_integer(&params.arguments, "quality", 70, 1, 100)? as u8;
+            let max_duration_ms =
+                screencast_integer(&params.arguments, "max_duration_ms", 30_000, 1_000, 300_000)?;
+            let dimensions = match (
+                params.arguments.get("max_width"),
+                params.arguments.get("max_height"),
+            ) {
+                (None, None) => (1280, 720),
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(BrowserToolError::invalid_input(
+                        "max_width and max_height must be supplied together",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    let width =
+                        screencast_integer(&params.arguments, "max_width", 1280, 16, 3840)? as u32;
+                    let height =
+                        screencast_integer(&params.arguments, "max_height", 720, 16, 2160)? as u32;
+                    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                        return Err(BrowserToolError::invalid_input(
+                            "max_width and max_height must be even integers",
+                        ));
+                    }
+                    (width, height)
+                }
+            };
+            let reservation = state.artifacts().lock().unwrap().reserve(
                 &params.agent_session_id,
                 Some(tab_id),
                 "screencast",
                 "video/webm",
                 "webm",
-                &bytes,
             )?;
-            Ok(json!({"operation":"stop", "recording":false, "artifact":artifact}))
+            let mut jobs = state.screencasts.lock().await;
+            if jobs.values().any(|existing| {
+                existing.target_id == target.id && existing.terminal.lock().unwrap().is_none()
+            }) {
+                state
+                    .artifacts()
+                    .lock()
+                    .unwrap()
+                    .discard_reserved(&reservation);
+                return Err(BrowserToolError::invalid_input(
+                    "a screencast is already recording or finalizing for this target",
+                ));
+            }
+            jobs.remove(tab_id);
+            let started_at_ms = current_time_ms();
+            let capture = match state
+                .browser
+                .start_screencast(
+                    &target,
+                    CdpScreencastOptions {
+                        fps,
+                        quality,
+                        max_duration: Duration::from_millis(max_duration_ms),
+                        max_width: dimensions.0,
+                        max_height: dimensions.1,
+                    },
+                    reservation.partial_path(),
+                )
+                .await
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    state
+                        .artifacts()
+                        .lock()
+                        .unwrap()
+                        .discard_reserved(&reservation);
+                    return Err(error);
+                }
+            };
+            if state.shutting_down.load(Ordering::SeqCst) {
+                capture.controller().cancel();
+                let _ = BrowserBackend::finish_screencast(capture).await;
+                state
+                    .artifacts()
+                    .lock()
+                    .unwrap()
+                    .discard_reserved(&reservation);
+                return Err(BrowserToolError::chrome_unavailable(
+                    "the browser broker is shutting down",
+                ));
+            }
+            let job = Arc::new(ActiveScreencast {
+                session_id: params.agent_session_id.clone(),
+                target_id: target.id,
+                controller: capture.controller(),
+                terminal: Mutex::new(None),
+                started_at_ms,
+            });
+            jobs.insert(tab_id.clone(), Arc::clone(&job));
+            drop(jobs);
+            let finalizer_state = state.clone();
+            let finalizer_job = Arc::clone(&job);
+            tokio::spawn(async move {
+                finalize_screencast_job(finalizer_state, finalizer_job, capture, reservation).await;
+            });
+            Ok(screencast_job_value("start", &job))
+        }
+        "status" => {
+            if let Some(job) = screencast_job_for_tab(state, &params.agent_session_id, tab_id).await
+            {
+                return Ok(screencast_job_value("status", &job));
+            }
+            let _ = active_owned_target(state, &params.agent_session_id, tab_id).await?;
+            Ok(json!({"operation":"status", "recording":false}))
+        }
+        "stop" => {
+            let job = screencast_job_for_tab(state, &params.agent_session_id, tab_id)
+                .await
+                .ok_or_else(|| BrowserToolError::invalid_input("no screencast is recording"))?;
+            if job.terminal.lock().unwrap().is_none() {
+                job.controller.request_stop();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while job.terminal.lock().unwrap().is_none() && Instant::now() < deadline {
+                    sleep(Duration::from_millis(25)).await;
+                }
+            }
+            Ok(screencast_job_value("stop", &job))
         }
         operation => Err(BrowserToolError::invalid_input(format!(
             "unknown screencast operation `{operation}`"
         ))),
     }
+}
+
+fn screencast_integer(
+    arguments: &serde_json::Map<String, Value>,
+    name: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, BrowserToolError> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| BrowserToolError::invalid_input(format!("{name} must be an integer")))?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(BrowserToolError::invalid_input(format!(
+            "{name} must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(value)
+}
+
+async fn screencast_job_for_tab(
+    state: &BrokerState,
+    session_id: &AgentSessionId,
+    tab_id: &TabId,
+) -> Option<Arc<ActiveScreencast>> {
+    state
+        .screencasts
+        .lock()
+        .await
+        .get(tab_id)
+        .filter(|job| &job.session_id == session_id)
+        .cloned()
+}
+
+fn screencast_job_value(operation: &str, job: &ActiveScreencast) -> Value {
+    let progress = job.controller.progress();
+    let metrics = json!({
+        "received_frames":progress.metrics.received_frames,
+        "encoded_frames":progress.metrics.encoded_frames,
+        "dropped_frames":progress.metrics.dropped_frames,
+    });
+    match job.terminal.lock().unwrap().clone() {
+        Some(ScreencastTerminal::Ready(artifact)) => json!({
+            "operation":operation,
+            "recording":false,
+            "state":"ready",
+            "started_at_ms":job.started_at_ms,
+            "artifact":artifact,
+            "metrics":metrics,
+        }),
+        Some(ScreencastTerminal::Error { code, message }) => json!({
+            "operation":operation,
+            "recording":false,
+            "state":"error",
+            "started_at_ms":job.started_at_ms,
+            "error":{"code":code,"message":message},
+            "metrics":metrics,
+        }),
+        None => {
+            let state = match progress.phase {
+                CdpScreencastPhase::Recording => "recording",
+                CdpScreencastPhase::Finalizing => "finalizing",
+            };
+            json!({
+                "operation":operation,
+                "recording":true,
+                "state":state,
+                "started_at_ms":job.started_at_ms,
+                "metrics":metrics,
+            })
+        }
+    }
+}
+
+async fn finalize_screencast_job(
+    state: BrokerState,
+    job: Arc<ActiveScreencast>,
+    capture: ScreencastCapture,
+    reservation: ReservedArtifact,
+) {
+    let terminal = match BrowserBackend::finish_screencast(capture).await {
+        Ok(_) => match state
+            .artifacts()
+            .lock()
+            .unwrap()
+            .publish_reserved(reservation.clone())
+        {
+            Ok(artifact) => ScreencastTerminal::Ready(artifact),
+            Err(error) => {
+                state
+                    .artifacts()
+                    .lock()
+                    .unwrap()
+                    .discard_reserved(&reservation);
+                ScreencastTerminal::Error {
+                    code: "artifact_error".to_string(),
+                    message: error.message,
+                }
+            }
+        },
+        Err(error) => {
+            state
+                .artifacts()
+                .lock()
+                .unwrap()
+                .discard_reserved(&reservation);
+            ScreencastTerminal::Error {
+                code: error.code,
+                message: error.message,
+            }
+        }
+    };
+    *job.terminal.lock().unwrap() = Some(terminal);
 }
 
 fn current_time_ms() -> u64 {
@@ -6501,15 +6893,11 @@ async fn broker_close_tab(
         .lock()
         .unwrap()
         .owned_lease(&params.agent_session_id, &params.tab_id)?;
-    if state
-        .screencasts
-        .lock()
-        .await
-        .contains_key(&lease.target_id)
+    if let Some(job) = state.screencasts.lock().await.get(&params.tab_id).cloned()
+        && job.terminal.lock().unwrap().is_none()
+        && job.controller.progress().phase == CdpScreencastPhase::Recording
     {
-        return Err(BrowserToolError::invalid_input(
-            "stop the active screencast before closing its tab",
-        ));
+        job.controller.cancel();
     }
     if state.traces.lock().await.contains_key(&lease.target_id) {
         return Err(BrowserToolError::invalid_input(
@@ -6658,8 +7046,11 @@ async fn reconcile_missing_targets(state: &BrokerState, targets: &[CdpTarget]) {
             if let Some(capture) = state.traces.lock().await.remove(&lease.target_id) {
                 let _ = BrowserBackend::stop_trace(capture).await;
             }
-            if let Some(active) = state.screencasts.lock().await.remove(&lease.target_id) {
-                drop(active);
+            if let Some(job) = state.screencasts.lock().await.get(&lease.tab_id).cloned()
+                && job.terminal.lock().unwrap().is_none()
+                && job.controller.progress().phase == CdpScreencastPhase::Recording
+            {
+                job.controller.cancel();
             }
             state.clear_focused_target(&lease.target_id);
             state
@@ -7011,6 +7402,61 @@ mod tests {
         BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(
             FakeBrowser::with_targets(targets),
         ))))
+    }
+
+    fn screencast_fixture(browser: FakeBrowser) -> (BrokerState, AgentSessionId, TabId) {
+        let state = BrokerState::with_browser(BrowserBackend::Fake(Arc::new(Mutex::new(browser))));
+        let session = state.registry().lock().unwrap().start_session(None);
+        let tab = state
+            .registry()
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new(
+                    "target-a",
+                    "Screencast target",
+                    "https://example.com",
+                    false,
+                ),
+            )
+            .unwrap();
+        (state, session.agent_session_id, tab.tab_id)
+    }
+
+    fn screencast_params(
+        session_id: &AgentSessionId,
+        tab_id: &TabId,
+        operation: &str,
+        arguments: Value,
+    ) -> DomainParams {
+        DomainParams {
+            agent_session_id: session_id.clone(),
+            tab_id: Some(tab_id.clone()),
+            operation: operation.to_string(),
+            arguments: arguments.as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    async fn wait_for_screencast_state(
+        state: &BrokerState,
+        session_id: &AgentSessionId,
+        tab_id: &TabId,
+        expected: &str,
+    ) -> Value {
+        for _ in 0..100 {
+            let status = broker_screencast(
+                state,
+                Ok(screencast_params(session_id, tab_id, "status", json!({}))),
+            )
+            .await
+            .unwrap();
+            if status.get("state").and_then(Value::as_str) == Some(expected) {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("screencast did not reach {expected}");
     }
 
     #[test]
@@ -9617,6 +10063,390 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, BrowserToolErrorCode::OperationTimeout);
+    }
+
+    #[tokio::test]
+    async fn screencast_stop_and_status_return_one_durable_artifact() {
+        let (state, session_id, tab_id) =
+            screencast_fixture(FakeBrowser::with_targets(vec![fake_target("target-a")]));
+
+        let started = broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &session_id,
+                &tab_id,
+                "start",
+                json!({"fps":10,"quality":70,"max_duration_ms":30_000,"max_width":1280,"max_height":720}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["state"], "recording");
+        assert_eq!(started["metrics"]["received_frames"], 0);
+
+        let stopped = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "stop", json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped["state"], "ready");
+        assert_eq!(stopped["recording"], false);
+        let artifact_id = stopped["artifact"]["artifact_id"].as_str().unwrap();
+
+        for operation in ["status", "stop"] {
+            let repeated = broker_screencast(
+                &state,
+                Ok(screencast_params(
+                    &session_id,
+                    &tab_id,
+                    operation,
+                    json!({}),
+                )),
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeated["state"], "ready");
+            assert_eq!(repeated["artifact"]["artifact_id"], artifact_id);
+        }
+        assert_eq!(
+            state
+                .artifacts()
+                .lock()
+                .unwrap()
+                .list(&session_id, Some(&tab_id), &[])
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screencast_finalization_survives_stop_cancellation_and_target_loss() {
+        let browser = Arc::new(Mutex::new(
+            FakeBrowser::with_targets(vec![fake_target("target-a")])
+                .with_screencast_finalization_delay(Duration::from_secs(10)),
+        ));
+        let state = BrokerState::with_browser(BrowserBackend::Fake(Arc::clone(&browser)));
+        let session = state.registry().lock().unwrap().start_session(None);
+        let tab = state
+            .registry()
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &session.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &session.agent_session_id,
+                &tab.tab_id,
+                "start",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+
+        let stop_state = state.clone();
+        let stop_session = session.agent_session_id.clone();
+        let stop_tab = tab.tab_id.clone();
+        let stop = tokio::spawn(async move {
+            broker_screencast(
+                &stop_state,
+                Ok(screencast_params(
+                    &stop_session,
+                    &stop_tab,
+                    "stop",
+                    json!({}),
+                )),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        wait_for_screencast_state(&state, &session.agent_session_id, &tab.tab_id, "finalizing")
+            .await;
+        stop.abort();
+
+        browser.lock().unwrap().targets.clear();
+        reconcile_missing_targets(&state, &[]).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let ready =
+            wait_for_screencast_state(&state, &session.agent_session_id, &tab.tab_id, "ready")
+                .await;
+        assert_eq!(ready["recording"], false);
+        assert!(ready["artifact"]["artifact_id"].is_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screencast_max_duration_finalizes_without_stop() {
+        let (state, session_id, tab_id) =
+            screencast_fixture(FakeBrowser::with_targets(vec![fake_target("target-a")]));
+        broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &session_id,
+                &tab_id,
+                "start",
+                json!({"max_duration_ms":1_000}),
+            )),
+        )
+        .await
+        .unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let ready = wait_for_screencast_state(&state, &session_id, &tab_id, "ready").await;
+        assert!(ready["artifact"]["artifact_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn screencast_errors_are_stable_and_remove_private_output() {
+        let (state, session_id, tab_id) = screencast_fixture(
+            FakeBrowser::with_targets(vec![fake_target("target-a")]).with_screencast_failure(
+                "finalization_timeout",
+                "screencast finalization exceeded the broker deadline",
+            ),
+        );
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+        let failed = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "stop", json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed["state"], "error");
+        assert_eq!(failed["error"]["code"], "finalization_timeout");
+        let repeated = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "status", json!({}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated["error"], failed["error"]);
+        assert!(
+            state
+                .artifacts()
+                .lock()
+                .unwrap()
+                .list(&session_id, Some(&tab_id), &[])
+                .is_empty()
+        );
+        assert_eq!(state.artifacts().lock().unwrap().reservation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn screencast_rejects_invalid_dimensions_and_concurrent_jobs() {
+        let (state, session_id, tab_id) =
+            screencast_fixture(FakeBrowser::with_targets(vec![fake_target("target-a")]));
+        for arguments in [
+            json!({"max_width":1280}),
+            json!({"max_width":1279,"max_height":720}),
+            json!({"max_width":1280,"max_height":2162}),
+        ] {
+            let error = broker_screencast(
+                &state,
+                Ok(screencast_params(&session_id, &tab_id, "start", arguments)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        }
+
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+        let error = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, BrowserToolErrorCode::InvalidInput);
+        assert_eq!(state.artifacts().lock().unwrap().reservation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn screencast_tombstone_survives_target_adoption_by_a_new_tab() {
+        let state = fake_state(vec![fake_target("target-a")]);
+        let first = state.registry().lock().unwrap().start_session(None);
+        let first_tab = state
+            .registry()
+            .lock()
+            .unwrap()
+            .lease_tab(
+                &first.agent_session_id,
+                TabSnapshot::new("target-a", "Title", "https://example.com", false),
+            )
+            .unwrap();
+        broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &first.agent_session_id,
+                &first_tab.tab_id,
+                "start",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+        let first_ready = broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &first.agent_session_id,
+                &first_tab.tab_id,
+                "stop",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+        broker_release_tab(
+            &state,
+            Ok(ReleaseTabParams {
+                agent_session_id: first.agent_session_id.clone(),
+                tab_id: first_tab.tab_id.clone(),
+                leave_visible: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let second = state.registry().lock().unwrap().start_session(None);
+        let second_tab = broker_claim_tab(
+            &state,
+            Ok(ClaimTabParams {
+                agent_session_id: second.agent_session_id.clone(),
+                target_id: "target-a".to_string(),
+                takeover: false,
+                user_instruction: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .tab;
+        broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &second.agent_session_id,
+                &second_tab.tab_id,
+                "start",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+
+        let original = broker_screencast(
+            &state,
+            Ok(screencast_params(
+                &first.agent_session_id,
+                &first_tab.tab_id,
+                "status",
+                json!({}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(original["state"], "ready");
+        assert_eq!(original["artifact"], first_ready["artifact"]);
+    }
+
+    #[tokio::test]
+    async fn session_expiry_cancels_jobs_and_removes_ready_and_partial_artifacts() {
+        let (state, session_id, tab_id) = screencast_fixture(
+            FakeBrowser::with_targets(vec![fake_target("target-a")])
+                .with_screencast_finalization_delay(Duration::from_secs(60)),
+        );
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+        state
+            .registry()
+            .lock()
+            .unwrap()
+            .backdate_session(&session_id, 3_600_000 * 2);
+
+        sweep_expired_sessions(&state, Some(Duration::from_secs(3_600))).await;
+
+        assert!(state.screencasts.lock().await.is_empty());
+        assert_eq!(state.artifacts().lock().unwrap().reservation_count(), 0);
+        assert!(
+            state
+                .artifacts()
+                .lock()
+                .unwrap()
+                .list(&session_id, Some(&tab_id), &[])
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broker_shutdown_interrupts_finalization_and_removes_partial_output() {
+        let (state, session_id, tab_id) = screencast_fixture(
+            FakeBrowser::with_targets(vec![fake_target("target-a")])
+                .with_screencast_finalization_delay(Duration::from_secs(60)),
+        );
+        broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap();
+        let stop_state = state.clone();
+        let stop_session = session_id.clone();
+        let stop_tab = tab_id.clone();
+        let stop = tokio::spawn(async move {
+            broker_screencast(
+                &stop_state,
+                Ok(screencast_params(
+                    &stop_session,
+                    &stop_tab,
+                    "stop",
+                    json!({}),
+                )),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        wait_for_screencast_state(&state, &session_id, &tab_id, "finalizing").await;
+        stop.abort();
+
+        cancel_all_screencasts(&state).await;
+
+        assert!(state.screencasts.lock().await.is_empty());
+        assert_eq!(state.artifacts().lock().unwrap().reservation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn broker_shutdown_rejects_new_screencast_jobs() {
+        let (state, session_id, tab_id) =
+            screencast_fixture(FakeBrowser::with_targets(vec![fake_target("target-a")]));
+        state.shutting_down.store(true, Ordering::SeqCst);
+
+        let error = broker_screencast(
+            &state,
+            Ok(screencast_params(&session_id, &tab_id, "start", json!({}))),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, BrowserToolErrorCode::ChromeUnavailable);
+        assert!(state.screencasts.lock().await.is_empty());
+        assert_eq!(state.artifacts().lock().unwrap().reservation_count(), 0);
     }
 
     #[test]

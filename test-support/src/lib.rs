@@ -16,8 +16,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrome_for_testing_manager::{ChromeBinary, ChromeForTestingManager, VersionRequest};
-use chromiumoxide::Browser;
+use chromiumoxide::{Browser, cdp::browser_protocol::target::GetTargetsParams};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1586,6 +1587,137 @@ pub struct SmokeSummary {
     pub global_groups: usize,
 }
 
+#[derive(Debug)]
+pub struct ScreencastSmokeSummary {
+    pub artifact_id: String,
+    pub size_bytes: u64,
+    pub stop_elapsed: Duration,
+}
+
+pub fn run_screencast_smoke(
+    client: &mut McpClient,
+    open_tabs: &mut Vec<OpenTab>,
+    duration: Duration,
+) -> Result<ScreencastSmokeSummary> {
+    client.initialize("visible-browser-lab-screencast-smoke")?;
+    let session = client.call_tool(
+        "start_session",
+        json!({
+            "label":"packaged-screencast-smoke",
+            "start_url":data_url("VBL Screencast Smoke", "VBL Screencast Smoke"),
+            "focus":false
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = OpenTab::from_summary(
+        &session_id,
+        session.get("tab").context("start_session omitted tab")?,
+    )?;
+    open_tabs.push(tab.clone());
+    client.call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "source":"window.__vblSmokeTick=0;window.__vblSmokeTimer=setInterval(()=>{window.__vblSmokeTick++;document.body.style.background=`hsl(${window.__vblSmokeTick%360} 70% 45%)`;document.body.textContent=`frame ${window.__vblSmokeTick}`},50);true"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    client.call_tool(
+        "screencast",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "operation":"start",
+            "fps":10,
+            "quality":70,
+            "max_duration_ms":duration.as_millis().saturating_add(30_000),
+            "max_width":1280,
+            "max_height":720
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    thread::sleep(duration);
+
+    let stop_started = Instant::now();
+    let mut result = client.call_tool(
+        "screencast",
+        json!({
+            "agent_session_id":session_id,
+            "tab_id":tab.tab_id,
+            "operation":"stop"
+        }),
+        Duration::from_secs(15),
+        false,
+    )?;
+    let stop_elapsed = stop_started.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(35);
+    while result.get("state").and_then(Value::as_str) == Some("finalizing")
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(250));
+        result = client.call_tool(
+            "screencast",
+            json!({
+                "agent_session_id":session_id,
+                "tab_id":tab.tab_id,
+                "operation":"status"
+            }),
+            Duration::from_secs(10),
+            false,
+        )?;
+    }
+    match result.get("state").and_then(Value::as_str) {
+        Some("ready") => {}
+        Some("error") => bail!(
+            "packaged screencast failed: {}",
+            result.get("error").cloned().unwrap_or(Value::Null)
+        ),
+        state => bail!("packaged screencast did not become ready; state={state:?}"),
+    }
+    let artifact = result
+        .get("artifact")
+        .context("ready screencast omitted artifact")?;
+    let artifact_id = field_str(artifact, "artifact_id")?;
+    if artifact.get("media_type").and_then(Value::as_str) != Some("video/webm") {
+        bail!("packaged screencast artifact did not declare video/webm");
+    }
+    let size_bytes = artifact
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .context("ready screencast omitted artifact size")?;
+    if size_bytes < 1_024 {
+        bail!("packaged screencast artifact was unexpectedly small: {size_bytes} bytes");
+    }
+    let prefix = client.call_tool(
+        "artifacts",
+        json!({
+            "agent_session_id":session_id,
+            "operation":"read",
+            "artifact_id":artifact_id,
+            "offset":0,
+            "length":4
+        }),
+        Duration::from_secs(10),
+        false,
+    )?;
+    let bytes = BASE64
+        .decode(field_str(&prefix, "data_base64")?)
+        .context("failed to decode screencast artifact prefix")?;
+    if bytes != [0x1a, 0x45, 0xdf, 0xa3] {
+        bail!("packaged screencast artifact is not a WebM container");
+    }
+    Ok(ScreencastSmokeSummary {
+        artifact_id,
+        size_bytes,
+        stop_elapsed,
+    })
+}
+
 pub struct McpClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -1944,6 +2076,37 @@ pub fn close_browser_via_cdp(endpoint: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     bail!("managed Chrome endpoint `{endpoint}` remained reachable after Browser.close")
+}
+
+pub fn cdp_target_count_by_type(endpoint: &str, target_type: &str) -> Result<usize> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create target inventory runtime")?;
+    runtime.block_on(async {
+        let (browser, mut handler) = Browser::connect(endpoint)
+            .await
+            .with_context(|| format!("failed to connect to Chrome at `{endpoint}`"))?;
+        let handler_task = tokio::spawn(async move {
+            while let Some(result) = handler.next().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        let count = browser
+            .execute(GetTargetsParams::default())
+            .await
+            .context("failed to inventory Chrome targets")?
+            .result
+            .target_infos
+            .into_iter()
+            .filter(|target| target.r#type == target_type)
+            .count();
+        drop(browser);
+        handler_task.abort();
+        Ok::<usize, anyhow::Error>(count)
+    })
 }
 
 pub fn managed_endpoint(state_dir: &Path) -> Result<String> {

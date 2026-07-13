@@ -233,12 +233,17 @@ jobs:
           key: release-binary-${{ matrix.target }}-${{ needs.release-version.outputs.version }}-${{ hashFiles('src/**', 'agent-surface-contract/**', 'Cargo.toml', 'Cargo.lock') }}
 
       - name: Install Rust stable
-        if: steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Install Rust target
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           rustup target add "${{ matrix.target }}"
 
       - name: Install musl tools
@@ -281,6 +286,27 @@ jobs:
             echo "Binary version mismatch: expected '$expected', got '$actual'" >&2
             exit 1
           fi
+
+      - name: Cache Chrome for Testing
+        uses: actions/cache@v6
+        with:
+          path: target/chrome-for-testing
+          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Validate packaged durable screencast
+        shell: bash
+        env:
+          VISIBLE_BROWSER_LAB_CFT_CACHE_DIR: target/chrome-for-testing
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          binary="visible-browser-lab-mcp"
+          if [[ "$target" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          cargo xtask screencast-smoke \
+            --binary "dist/binaries/${target}/${binary}" \
+            --duration-ms 45000
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7

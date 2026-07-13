@@ -1887,9 +1887,25 @@
           "additionalProperties": false,
           "properties": {
             "fps": {
+              "maximum": 30,
+              "minimum": 1,
               "type": "integer"
             },
             "max_duration_ms": {
+              "maximum": 300000,
+              "minimum": 1000,
+              "type": "integer"
+            },
+            "max_height": {
+              "maximum": 2160,
+              "minimum": 16,
+              "multipleOf": 2,
+              "type": "integer"
+            },
+            "max_width": {
+              "maximum": 3840,
+              "minimum": 16,
+              "multipleOf": 2,
               "type": "integer"
             },
             "operation": {
@@ -1901,6 +1917,8 @@
               "type": "string"
             },
             "quality": {
+              "maximum": 100,
+              "minimum": 1,
               "type": "integer"
             },
             "tab_id": {
