@@ -38,9 +38,9 @@ The default recording fits the source page within 1280×720, preserves its aspec
 
 If finalization does not complete during stop's five-second wait, stop returns a `finalizing` state rather than holding the tool call indefinitely. The agent can call `screencast status` or repeat `stop`; both observe the same job. Once ready, either operation returns the artifact. The agent does not restart the capture or carry an internal encoder handle.
 
-If the source tab navigates while recording, the recording continues as long as the underlying target remains the same. If the target disappears, Chrome becomes unavailable, or the encoder fails, status reports a stable error for that recording and VBL removes its owned partial output.
+If the source tab navigates while recording, the recording continues as long as the underlying target remains the same. If the target disappears, Chrome becomes unavailable, or the encoder fails, status with the same public tab identifier reports a stable error for that recording and VBL removes its owned partial output.
 
-Closing a tab or expiring its session cancels an unfinished recording and removes partial output. No hidden recorder target appears in the user's tab strip, lease inventory, cleanup manifest, tool results, or logs.
+Closing the source tab while the job is `recording` cancels the recording and removes partial output. Closing it after the job reaches `finalizing` releases source-side state while broker-owned completion and publication continue. Expiring the session cancels either nonterminal state. No hidden recorder target appears in the user's tab strip, lease inventory, cleanup manifest, tool results, or logs.
 
 # Reference-level explanation
 
@@ -79,6 +79,8 @@ The existing `recording` boolean remains for compatibility. It is true while the
 
 `stop` is idempotent for the current job. The first call stops source capture and begins finalization. The broker also begins finalization when the job reaches `max_duration_ms`; this deadline does not depend on a later tool call. Repeated calls during `finalizing` observe the same job; repeated calls after `ready` return the same artifact; repeated calls after `error` return the same stable error. `status` has the same observational behavior without initiating stop.
 
+The broker keys the current-job record by the public tab identifier and retains that record after source-target disappearance. `status` and `stop` consult this record before live-target validation, so a caller can observe the terminal error and cleanup result with the same `tab_id` even after the lease no longer resolves to a Chrome target. Other page-scoped operations retain their existing live-target validation. This narrow tombstone does not add a recording handle to the public API.
+
 A tab cannot start another screencast while its current job is recording or finalizing. After a terminal state, a new start replaces that tab's current-job status while any completed artifact remains available through the artifact registry.
 
 ## Acquisition and backpressure
@@ -91,11 +93,11 @@ Source navigation does not restart the job or create a new artifact. If the CDP 
 
 ## Hidden Chrome recorder
 
-The primary backend creates a broker-private target with `Target.createTarget({ url: "about:blank", hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, letterboxes them into the configured canvas without distortion, and calls `requestFrame()` on the `CanvasCaptureMediaStreamTrack` returned by `canvas.captureStream(0)` to commit each frame to `MediaRecorder`.
+The primary backend creates a broker-private target with `Target.createTarget({ url: "about:blank", hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, and letterboxes them into the configured canvas without distortion. It creates a `MediaStream` with `canvas.captureStream(0)`, obtains its sole video track as a `CanvasCaptureMediaStreamTrack`, and calls `track.requestFrame()` after each draw to commit that frame to `MediaRecorder`.
 
 `MediaRecorder` emits timesliced `video/webm;codecs=vp8` chunks through a private CDP binding. The broker appends each chunk to the reserved partial file. No duration-sized frame or video buffer crosses back into Rust.
 
-The recorder target is separate from the source document, so source navigation does not destroy its encoder context. VBL explicitly closes the recorder target when the job terminates. Losing the creating CDP session also closes it by Chrome's hidden-target lifetime contract.
+The recorder target is separate from the source document, so source navigation does not destroy its encoder context. VBL creates it from a broker-owned browser-level CDP session whose lifetime is independent of the source target's attached session. Source-target closure therefore cannot trigger Chrome's creating-session cleanup while the job is finalizing. VBL explicitly closes the recorder target when the job terminates; losing the broker-owned creating session also closes it by Chrome's hidden-target lifetime contract.
 
 The target and binding are private broker machinery. They do not enter the tab registry, create cleanup provenance, consume a user lease, or appear in VBL's global tab projections. A separate headed macOS probe confirmed that the hidden target has protocol type `other` and does not appear in Chrome's tab strip.
 
@@ -157,7 +159,7 @@ RFC 00005 continues to define the `screencast` tool and session-owned artifact s
 
 RFC 00010 continues to define the source tab's frame guarantee and focus-emulation teardown. This RFC extends that stewardship: the broker-owned recording job also owns frame memory, recorder lifetime, partial output, and final publication.
 
-RFCs 00009, 00011, and 00012 remain unchanged. Session TTL, conversation-scoped identity, target cleanup provenance, and explicit preservation do not depend on the video backend.
+RFCs 00011 and 00012 remain unchanged. Conversation-scoped identity, target cleanup provenance, and explicit preservation do not depend on the video backend. This RFC narrowly supersedes RFC 00009's rule that target-keyed screencast recordings are untouched when a session dies: durable screencast jobs are session-associated resources, and session expiry cancels any nonterminal job through the cleanup path above. RFC 00009's TTL, lease, artifact-removal, and target-keyed diagnostics rules remain unchanged.
 
 # Set A: backend feasibility evidence
 
@@ -202,8 +204,10 @@ The backend matrix does not claim to prove VBL product behavior that does not ex
 
 - caller cancellation during stop does not cancel broker-owned finalization;
 - status and repeated stop recover the same ready artifact after caller cancellation;
+- status and repeated stop remain addressable by the public tab identifier after source-target loss;
 - reaching `max_duration_ms` begins finalization without a stop call;
 - source-tab closure during finalization does not cancel recorder completion or publication;
+- the hidden recorder's creating CDP session remains alive independently of source-target closure;
 - finalization timeout and zero-frame output transition to stable errors and remove partial output;
 - only one recording or finalization job exists per target;
 - tab closure, target disappearance, session expiry, Chrome loss, broker shutdown, and finalization timeout use the same idempotent cleanup path;
