@@ -2197,9 +2197,9 @@ impl CdpTargetInventory {
         })
     }
 
-    pub fn count_by_type(&self, target_type: &str) -> Result<usize> {
+    pub fn target_snapshot_by_types(&self, target_types: &[&str]) -> Result<Vec<String>> {
         self.runtime.block_on(async {
-            let count = self
+            let mut targets = self
                 .browser
                 .execute(GetTargetsParams::default())
                 .await
@@ -2207,9 +2207,11 @@ impl CdpTargetInventory {
                 .result
                 .target_infos
                 .into_iter()
-                .filter(|target| target.r#type == target_type)
-                .count();
-            Ok::<usize, anyhow::Error>(count)
+                .filter(|target| target_types.contains(&target.r#type.as_str()))
+                .map(|target| format!("{} ({})", target.target_id.as_ref(), target.r#type))
+                .collect::<Vec<_>>();
+            targets.sort();
+            Ok::<Vec<String>, anyhow::Error>(targets)
         })
     }
 }

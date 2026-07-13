@@ -104,7 +104,7 @@ test("global start_session cannot create an inaccessible explicit session", () =
   );
 });
 
-test("uses the active workspace fallback only without token-derived context", () => {
+test("fills a missing token working directory from the active workspace", () => {
   const identityOnly = {
     conversation_identity: {
       version: 1 as const,
@@ -112,7 +112,17 @@ test("uses the active workspace fallback only without token-derived context", ()
       id: "vscode-chat-session://authority/path",
     },
   };
-  assert.deepEqual(withWorkspaceFallback(identityOnly, "/active/workspace"), identityOnly);
+  assert.deepEqual(withWorkspaceFallback(identityOnly, "/active/workspace"), {
+    ...identityOnly,
+    workspace_root: "/active/workspace",
+  });
+  assert.deepEqual(
+    withWorkspaceFallback(
+      { ...identityOnly, workspace_root: "/token/workspace" },
+      "/active/workspace",
+    ),
+    { ...identityOnly, workspace_root: "/token/workspace" },
+  );
   assert.deepEqual(withWorkspaceFallback(undefined, "/active/workspace"), {
     workspace_root: "/active/workspace",
   });
