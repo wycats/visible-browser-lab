@@ -77,7 +77,7 @@ The public states are:
 
 The existing `recording` boolean remains for compatibility. It is true while the job is `recording` or `finalizing`, indicating that the tab cannot start another recording, and false in terminal states. The new `state` field is authoritative.
 
-`stop` is idempotent for the current job. The first call stops source capture and begins finalization. Repeated calls during `finalizing` observe the same job; repeated calls after `ready` return the same artifact; repeated calls after `error` return the same stable error. `status` has the same observational behavior without initiating stop.
+`stop` is idempotent for the current job. The first call stops source capture and begins finalization. The broker also begins finalization when the job reaches `max_duration_ms`; this deadline does not depend on a later tool call. Repeated calls during `finalizing` observe the same job; repeated calls after `ready` return the same artifact; repeated calls after `error` return the same stable error. `status` has the same observational behavior without initiating stop.
 
 A tab cannot start another screencast while its current job is recording or finalizing. After a terminal state, a new start replaces that tab's current-job status while any completed artifact remains available through the artifact registry.
 
@@ -110,18 +110,18 @@ The first stop request signals source capture to stop and waits up to five secon
   "state": "ready",
   "artifact": { "...": "existing ArtifactSummary" },
   "metrics": {
-    "received_frames": 0,
-    "encoded_frames": 0,
+    "received_frames": 1,
+    "encoded_frames": 1,
     "dropped_frames": 0
   }
 }
 ```
 
-If finalization is still active, stop returns `recording: true`, `state: "finalizing"`, and current metrics without an artifact. The broker-owned job continues after the request returns or is cancelled.
+If finalization is still active, stop returns `recording: true`, `state: "finalizing"`, and current metrics without an artifact. The broker-owned job continues after the request returns or is cancelled. Finalization has a broker-owned 30-second deadline; if the recorder does not finish and deliver its final chunk by then, the job transitions to `error` with code `finalization_timeout` and runs cleanup.
 
 The artifact registry exposes only completed immutable artifacts. The reserved partial file and provisional artifact identity remain private. `artifacts list`, `metadata`, `read`, and `export` therefore require no provisional-state extension.
 
-On success, the broker closes the partial file, validates non-empty WebM output, computes size and SHA-256, atomically publishes the existing `ArtifactSummary`, and transitions the job to `ready`.
+On success, the broker closes the partial file, validates non-empty WebM output containing at least one encoded video frame, computes size and SHA-256, atomically publishes the existing `ArtifactSummary`, and transitions the job to `ready`. A container with no encoded video frame transitions to `error` with code `no_encoded_frames` and is not published.
 
 ## Diagnostics
 
@@ -139,9 +139,9 @@ VBL does not expose queue depth, frame bytes, partial paths, hidden target ident
 
 ## Cleanup and failures
 
-Stopping, tab closure, session expiry, target disappearance, Chrome loss, and broker shutdown use one job-owned cleanup path. That path stops source capture when possible, disengages focus emulation, closes the private recorder target, closes the partial file, and either publishes a complete artifact or removes the partial output.
+Stopping, tab closure, session expiry, target disappearance, Chrome loss, broker shutdown, and a finalization timeout use one job-owned cleanup path. That path stops source capture when possible, disengages focus emulation, closes the private recorder target, closes the partial file, and either publishes a complete artifact or removes the partial output.
 
-Tab closure, session expiry, and broker shutdown cancel a recording that is still recording or finalizing. VBL does not finish an artifact for an expired or unreachable session. The existing ready artifact follows normal session retention and is removed when its session expires.
+Closing or losing the source tab while the job is still `recording` cancels the recording. Once the job is `finalizing`, source capture is already complete: closing or losing the source tab releases source-side state but does not cancel the broker-owned recorder or publication task. Session expiry and broker shutdown cancel a job in either nonterminal state. VBL does not finish an artifact for an expired or unreachable session. The existing ready artifact follows normal session retention and is removed when its session expires.
 
 If Chrome fails while a recording is active, the job records a stable error, removes partial output, and releases broker state without replaying source actions. A later Chrome recovery starts with no orphan recorder targets or phantom active screencasts.
 
@@ -202,8 +202,11 @@ The backend matrix does not claim to prove VBL product behavior that does not ex
 
 - caller cancellation during stop does not cancel broker-owned finalization;
 - status and repeated stop recover the same ready artifact after caller cancellation;
+- reaching `max_duration_ms` begins finalization without a stop call;
+- source-tab closure during finalization does not cancel recorder completion or publication;
+- finalization timeout and zero-frame output transition to stable errors and remove partial output;
 - only one recording or finalization job exists per target;
-- tab closure, target disappearance, session expiry, Chrome loss, and broker shutdown use the same idempotent cleanup path;
+- tab closure, target disappearance, session expiry, Chrome loss, broker shutdown, and finalization timeout use the same idempotent cleanup path;
 - partial output and hidden recorder targets never survive cleanup;
 - a ready artifact remains session-owned and follows existing retention;
 - schema, catalog, VS Code projection, help, and skill guidance agree on dimensions and lifecycle states;
