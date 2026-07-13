@@ -293,6 +293,18 @@ jobs:
           path: target/chrome-for-testing
           key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}
 
+      # Chrome for Testing has no Linux ARM64 download. Use the same native
+      # Playwright Chromium source that passed RFC 0013's six-runner probe.
+      - name: Install Chromium for Linux ARM64 screencast smoke
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes playwright@1.61.1 install chromium
+          chrome="$(find "$HOME/.cache/ms-playwright" -type f -path '*/chrome-linux/chrome' -perm -111 -print -quit)"
+          test -n "$chrome"
+          echo "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH=$chrome" >> "$GITHUB_ENV"
+
       - name: Validate packaged durable screencast
         shell: bash
         env:

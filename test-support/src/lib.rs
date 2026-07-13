@@ -26,6 +26,7 @@ use tempfile::TempDir;
 pub const BINARY_NAME: &str = "visible-browser-lab-mcp";
 pub const BROWSER_MODE_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_BROWSER_MODE";
 pub const CFT_CACHE_DIR_ENV: &str = "VISIBLE_BROWSER_LAB_CFT_CACHE_DIR";
+pub const TEST_CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH";
 
 static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
 const FIXTURE_CONNECTION_POLL: Duration = Duration::from_millis(100);
@@ -141,6 +142,17 @@ impl Drop for RealBrowser {
 }
 
 pub fn chrome_for_testing_executable() -> Result<PathBuf> {
+    if let Some(configured) = env::var_os(TEST_CHROME_PATH_ENV) {
+        let executable = PathBuf::from(configured);
+        if !executable.is_file() {
+            bail!(
+                "{TEST_CHROME_PATH_ENV} `{}` is not a browser executable",
+                executable.display()
+            );
+        }
+        prepare_chrome_for_testing_executable(&executable)?;
+        return Ok(executable);
+    }
     static CHROME_FOR_TESTING_LOCK: Mutex<()> = Mutex::new(());
     let _guard = CHROME_FOR_TESTING_LOCK
         .lock()

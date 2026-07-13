@@ -1,4 +1,9 @@
-use std::{env, path::PathBuf, thread, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use proptest::{
@@ -435,12 +440,22 @@ fn complete_v03_domain_surface() -> Result<()> {
         false,
     )?;
     std::thread::sleep(Duration::from_millis(800));
-    let stopped = harness.client_mut().call_tool(
+    let mut stopped = harness.client_mut().call_tool(
         "screencast",
         json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"stop"}),
         Duration::from_secs(60),
         false,
     )?;
+    let completion_deadline = Instant::now() + Duration::from_secs(35);
+    while stopped["state"] == "finalizing" && Instant::now() < completion_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        stopped = harness.client_mut().call_tool(
+            "screencast",
+            json!({"agent_session_id":session_id,"tab_id":tab.tab_id,"operation":"status"}),
+            Duration::from_secs(10),
+            false,
+        )?;
+    }
     assert_eq!(stopped["state"], "ready");
     assert_eq!(stopped["artifact"]["media_type"], "video/webm");
     assert!(stopped["metrics"]["encoded_frames"].as_u64().unwrap() > 0);
