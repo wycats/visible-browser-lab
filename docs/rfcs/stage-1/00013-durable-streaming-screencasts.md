@@ -91,7 +91,7 @@ Source navigation does not restart the job or create a new artifact. If the CDP 
 
 ## Hidden Chrome recorder
 
-The primary backend creates a broker-private target with `Target.createTarget({ hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, letterboxes them into the configured canvas without distortion, and requests frames from `canvas.captureStream(0)`.
+The primary backend creates a broker-private target with `Target.createTarget({ url: "about:blank", hidden: true, background: true })`. The target hosts a canvas and `MediaRecorder`. It receives bounded JPEG frames, decodes them with `createImageBitmap`, letterboxes them into the configured canvas without distortion, and requests frames from `canvas.captureStream(0)`.
 
 `MediaRecorder` emits timesliced `video/webm;codecs=vp8` chunks through a private CDP binding. The broker appends each chunk to the reserved partial file. No duration-sized frame or video buffer crosses back into Rust.
 
