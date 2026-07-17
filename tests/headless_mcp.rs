@@ -570,6 +570,115 @@ fn complete_v03_domain_surface() -> Result<()> {
 }
 
 #[test]
+fn closed_shadow_controls_accept_trusted_background_input() -> Result<()> {
+    let mut harness = BrowserMcpHarness::start("visible-browser-lab-closed-shadow", true)?;
+    let start_url = harness.fixture.url("/closed-shadow");
+    let session = harness.client_mut().call_tool(
+        "start_session",
+        json!({
+            "label": "closed-shadow-background-input",
+            "start_url": start_url,
+            "focus": false
+        }),
+        Duration::from_secs(45),
+        false,
+    )?;
+    let session_id = field_str(&session, "agent_session_id")?;
+    let tab = OpenTab::from_summary(
+        &session_id,
+        session.get("tab").context("start_session omitted tab")?,
+    )?;
+    harness.client_mut().call_tool(
+        "wait_for",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "condition": {
+                "kind": "element",
+                "target": { "css": "#closed-overlay-host" },
+                "state": "visible"
+            },
+            "timeout_ms": 20_000,
+            "observe": "none"
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
+    let snapshot = harness.client_mut().call_tool(
+        "snapshot",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "mode": "meaningful"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let tree = field_str(&snapshot, "tree")?;
+    let open_apply_ref = snapshot_element_ref(&tree, "button \"Open overlay Apply\"")?;
+    let apply_ref = snapshot_element_ref(&tree, "button \"Closed overlay Apply\"")?;
+
+    harness.client_mut().call_tool(
+        "click",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "target": { "ref": open_apply_ref },
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "click",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "target": { "ref": apply_ref },
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    harness.client_mut().call_tool(
+        "press_key",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "target": { "ref": apply_ref },
+            "key": "Enter",
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let result = harness.client_mut().call_tool(
+        "evaluate",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "source": "({ openClicked: document.body.dataset.openOverlayClicked, openClickTrusted: document.body.dataset.openOverlayClickTrusted, clicked: document.body.dataset.closedOverlayClicked, clickTrusted: document.body.dataset.closedOverlayClickTrusted, key: document.body.dataset.closedOverlayKey, keyTrusted: document.body.dataset.closedOverlayKeyTrusted })"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    assert_eq!(result["value"]["openClicked"], "yes");
+    assert_eq!(result["value"]["openClickTrusted"], "true");
+    assert_eq!(result["value"]["clicked"], "yes");
+    assert_eq!(result["value"]["clickTrusted"], "true");
+    assert_eq!(result["value"]["key"], "Enter");
+    assert_eq!(result["value"]["keyTrusted"], "true");
+
+    harness.client_mut().call_tool(
+        "close_tab",
+        json!({"agent_session_id":session_id,"tab_id":tab.tab_id}),
+        Duration::from_secs(20),
+        false,
+    )?;
+    Ok(())
+}
+
+#[test]
 fn explicit_focus_contract() -> Result<()> {
     let mut harness = BrowserMcpHarness::start("visible-browser-lab-focus-contract", true)?;
     let url = harness.fixture.url("/page");

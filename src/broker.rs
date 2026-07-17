@@ -811,6 +811,18 @@ impl FakeBrowser {
         Ok(())
     }
 
+    fn focus_key_target(&self, target: &CdpTarget) -> Result<(), BrowserToolError> {
+        if self
+            .targets
+            .iter()
+            .any(|candidate| candidate.id == target.id)
+        {
+            return Ok(());
+        }
+
+        Err(BrowserToolError::target_missing_for_target(&target.id))
+    }
+
     fn remove_target(&mut self, target_id: &str) {
         self.targets.retain(|target| target.id != target_id);
     }
@@ -1586,6 +1598,40 @@ impl BrowserBackend {
                 self.cdp_client()
                     .await?
                     .type_text_css(target, selector, text)
+                    .await
+            }
+        }
+    }
+
+    async fn focus_key_target_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().focus_key_target(target),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .focus_key_target_backend_node(target, backend_node_id)
+                    .await
+            }
+        }
+    }
+
+    async fn focus_key_target_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+    ) -> Result<(), BrowserToolError> {
+        match self {
+            #[cfg(test)]
+            Self::Fake(browser) => browser.lock().unwrap().focus_key_target(target),
+            _ => {
+                self.cdp_client()
+                    .await?
+                    .focus_key_target_css(target, selector)
                     .await
             }
         }
@@ -4997,13 +5043,13 @@ async fn broker_press_key_v3(
                 retry_element_action(params.timeout_ms, || {
                     state
                         .browser
-                        .type_text_backend_node(&target, element.backend_node_id, "")
+                        .focus_key_target_backend_node(&target, element.backend_node_id)
                 })
                 .await?;
             }
             ResolvedElementTarget::Css(selector) => {
                 retry_element_action(params.timeout_ms, || {
-                    state.browser.type_text_css(&target, &selector, "")
+                    state.browser.focus_key_target_css(&target, &selector)
                 })
                 .await?;
             }

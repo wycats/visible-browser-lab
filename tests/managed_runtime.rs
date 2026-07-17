@@ -197,6 +197,61 @@ mod macos {
                 bail!("background press_key did not update the fixture page: {background_actions}");
             }
         }
+        let snapshot = client.call_tool(
+            "snapshot",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "mode": "meaningful"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        let tree = field_str(&snapshot, "tree")?;
+        let closed_overlay_ref = snapshot_element_ref(&tree, "button \"Closed overlay Apply\"")?;
+        client
+            .call_tool(
+                "click",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": tab.tab_id,
+                    "target": { "ref": closed_overlay_ref },
+                    "observe": "none"
+                }),
+                Duration::from_secs(20),
+                false,
+            )
+            .context("closed-overlay background click")?;
+        assert_frontmost(&original_frontmost, "closed-overlay background click")?;
+        client
+            .call_tool(
+                "press_key",
+                json!({
+                    "agent_session_id": session_id,
+                    "tab_id": tab.tab_id,
+                    "target": { "ref": closed_overlay_ref },
+                    "key": "Enter",
+                    "observe": "none"
+                }),
+                Duration::from_secs(20),
+                false,
+            )
+            .context("closed-overlay background press_key")?;
+        assert_frontmost(&original_frontmost, "closed-overlay background press_key")?;
+        let closed_overlay_actions = client.call_tool(
+            "evaluate",
+            json!({
+                "agent_session_id": session_id,
+                "tab_id": tab.tab_id,
+                "source": "({ clicked: document.body.dataset.closedOverlayClicked, clickTrusted: document.body.dataset.closedOverlayClickTrusted, key: document.body.dataset.closedOverlayKey, keyTrusted: document.body.dataset.closedOverlayKeyTrusted })"
+            }),
+            Duration::from_secs(20),
+            false,
+        )?;
+        assert_eq!(closed_overlay_actions["value"]["clicked"], "yes");
+        assert_eq!(closed_overlay_actions["value"]["clickTrusted"], "true");
+        assert_eq!(closed_overlay_actions["value"]["key"], "Enter");
+        assert_eq!(closed_overlay_actions["value"]["keyTrusted"], "true");
         client.call_tool(
             "focus_tab",
             json!({ "agent_session_id": session_id, "tab_id": tab.tab_id }),
@@ -816,6 +871,25 @@ mod macos {
             name: name.to_string(),
             bundle_id: bundle_id.to_string(),
         })
+    }
+
+    fn snapshot_element_ref(tree: &str, marker: &str) -> Result<String> {
+        let mut matches = tree.lines().filter(|line| line.contains(marker));
+        let line = matches
+            .next()
+            .with_context(|| format!("snapshot omitted `{marker}`:\n{tree}"))?;
+        if matches.next().is_some() {
+            bail!("snapshot marker `{marker}` matched more than one node:\n{tree}");
+        }
+        let start = line
+            .find("[ref=")
+            .map(|index| index + 5)
+            .context("snapshot node omitted an element reference")?;
+        let end = line[start..]
+            .find(']')
+            .map(|index| start + index)
+            .context("snapshot element reference omitted closing bracket")?;
+        Ok(line[start..end].to_string())
     }
 
     fn assert_frontmost(expected: &FrontmostApplication, operation: &str) -> Result<()> {

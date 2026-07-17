@@ -1772,8 +1772,36 @@ impl CdpClient {
   if ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && this.readOnly) return { state: "not_editable" };
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
-  const hit = this.ownerDocument.elementFromPoint(x, y);
-  if (hit !== this && !this.contains(hit)) return { state: "obscured" };
+  const containsHit = (container, candidate) => {
+    let node = candidate;
+    while (node) {
+      if (node === container) return true;
+      if (node.parentNode) {
+        node = node.parentNode;
+        continue;
+      }
+      const nodeRoot = typeof node.getRootNode === "function" ? node.getRootNode() : null;
+      node = nodeRoot && nodeRoot.host ? nodeRoot.host : null;
+    }
+    return false;
+  };
+  const root = this.getRootNode();
+  const hit = root && typeof root.elementFromPoint === "function"
+    ? root.elementFromPoint(x, y)
+    : this.ownerDocument.elementFromPoint(x, y);
+  if (!containsHit(this, hit)) return { state: "obscured" };
+  let composedNode = root && root.host ? root.host : this;
+  let composedRoot = composedNode.getRootNode();
+  while (composedRoot && composedRoot.host) {
+    const composedHit = typeof composedRoot.elementFromPoint === "function"
+      ? composedRoot.elementFromPoint(x, y)
+      : null;
+    if (!containsHit(composedNode, composedHit)) return { state: "obscured" };
+    composedNode = composedRoot.host;
+    composedRoot = composedNode.getRootNode();
+  }
+  const documentHit = this.ownerDocument.elementFromPoint(x, y);
+  if (!containsHit(composedNode, documentHit)) return { state: "obscured" };
   const tagName = this.tagName ? this.tagName.toLowerCase() : "";
   const type = (this.getAttribute("type") || (tagName === "button" ? "submit" : "")).toLowerCase();
   const form = this.form || this.closest("form");
@@ -2029,6 +2057,79 @@ impl CdpClient {
             _ => actionable_state(result)?,
         }
         self.type_text(target, text).await
+    }
+
+    pub async fn focus_key_target_backend_node(
+        &self,
+        target: &CdpTarget,
+        backend_node_id: i64,
+    ) -> Result<(), BrowserToolError> {
+        let (page, connection) = self.page(&target.id).await?;
+        let (object_id, object_group) = self
+            .resolve_backend_node(&page, &connection, backend_node_id)
+            .await?;
+        let result = self
+            .call_on_element(
+                &page,
+                &connection,
+                object_id,
+                &object_group,
+                r#"function() {
+  if (!this.isConnected) return { state: "stale" };
+  const rect = this.getBoundingClientRect();
+  const style = this.ownerDocument.defaultView.getComputedStyle(this);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return { state: "hidden" };
+  if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
+  if (typeof this.focus !== "function") return { state: "not_focusable" };
+  this.focus({ preventScroll: true });
+  const root = this.getRootNode();
+  if (root.activeElement !== this && this.ownerDocument.activeElement !== this) return { state: "not_focusable" };
+  return { state: "ready" };
+}"#,
+                Vec::new(),
+            )
+            .await?;
+        actionable_state(result)
+    }
+
+    pub async fn focus_key_target_css(
+        &self,
+        target: &CdpTarget,
+        selector: &str,
+    ) -> Result<(), BrowserToolError> {
+        let selector_json = serde_json::to_string(selector)
+            .map_err(|error| BrowserToolError::invalid_input(error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+  const matches = document.querySelectorAll({selector_json});
+  if (matches.length === 0) return {{ state: "not_found" }};
+  if (matches.length > 1) return {{ state: "ambiguous", count: matches.length }};
+  const element = matches[0];
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return {{ state: "hidden" }};
+  if (element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") return {{ state: "disabled" }};
+  if (typeof element.focus !== "function") return {{ state: "not_focusable" }};
+  element.focus({{ preventScroll: true }});
+  if (document.activeElement !== element) return {{ state: "not_focusable" }};
+  return {{ state: "ready" }};
+}})()"#
+        );
+        let result = self
+            .evaluate(target, &expression, true)
+            .await?
+            .value
+            .ok_or_else(|| {
+                BrowserToolError::chrome_unavailable("focus CSS key target omitted result")
+            })?;
+        match result.get("state").and_then(Value::as_str) {
+            Some("not_found") => Err(BrowserToolError::element_not_found(selector)),
+            Some("ambiguous") => Err(BrowserToolError::element_ambiguous(
+                selector,
+                result.get("count").and_then(Value::as_u64).unwrap_or(2) as usize,
+            )),
+            _ => actionable_state(result),
+        }
     }
 
     pub async fn set_checked_backend_node(
@@ -5176,6 +5277,9 @@ fn actionable_state(value: Value) -> Result<(), BrowserToolError> {
         )),
         Some("not_editable") => Err(BrowserToolError::element_not_actionable(
             "element is not editable",
+        )),
+        Some("not_focusable") => Err(BrowserToolError::element_not_actionable(
+            "element cannot receive targeted keyboard input",
         )),
         Some("not_checkable") => Err(BrowserToolError::element_not_actionable(
             "element is not a checkbox or radio control",
