@@ -588,6 +588,22 @@ fn closed_shadow_controls_accept_trusted_background_input() -> Result<()> {
         &session_id,
         session.get("tab").context("start_session omitted tab")?,
     )?;
+    harness.client_mut().call_tool(
+        "wait_for",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "condition": {
+                "kind": "element",
+                "target": { "css": "#closed-overlay-host" },
+                "state": "visible"
+            },
+            "timeout_ms": 20_000,
+            "observe": "none"
+        }),
+        Duration::from_secs(30),
+        false,
+    )?;
     let snapshot = harness.client_mut().call_tool(
         "snapshot",
         json!({
