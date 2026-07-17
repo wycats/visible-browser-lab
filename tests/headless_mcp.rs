@@ -615,8 +615,20 @@ fn closed_shadow_controls_accept_trusted_background_input() -> Result<()> {
         false,
     )?;
     let tree = field_str(&snapshot, "tree")?;
+    let open_apply_ref = snapshot_element_ref(&tree, "button \"Open overlay Apply\"")?;
     let apply_ref = snapshot_element_ref(&tree, "button \"Closed overlay Apply\"")?;
 
+    harness.client_mut().call_tool(
+        "click",
+        json!({
+            "agent_session_id": session_id,
+            "tab_id": tab.tab_id,
+            "target": { "ref": open_apply_ref },
+            "observe": "none"
+        }),
+        Duration::from_secs(20),
+        false,
+    )?;
     harness.client_mut().call_tool(
         "click",
         json!({
@@ -645,11 +657,13 @@ fn closed_shadow_controls_accept_trusted_background_input() -> Result<()> {
         json!({
             "agent_session_id": session_id,
             "tab_id": tab.tab_id,
-            "source": "({ clicked: document.body.dataset.closedOverlayClicked, clickTrusted: document.body.dataset.closedOverlayClickTrusted, key: document.body.dataset.closedOverlayKey, keyTrusted: document.body.dataset.closedOverlayKeyTrusted })"
+            "source": "({ openClicked: document.body.dataset.openOverlayClicked, openClickTrusted: document.body.dataset.openOverlayClickTrusted, clicked: document.body.dataset.closedOverlayClicked, clickTrusted: document.body.dataset.closedOverlayClickTrusted, key: document.body.dataset.closedOverlayKey, keyTrusted: document.body.dataset.closedOverlayKeyTrusted })"
         }),
         Duration::from_secs(20),
         false,
     )?;
+    assert_eq!(result["value"]["openClicked"], "yes");
+    assert_eq!(result["value"]["openClickTrusted"], "true");
     assert_eq!(result["value"]["clicked"], "yes");
     assert_eq!(result["value"]["clickTrusted"], "true");
     assert_eq!(result["value"]["key"], "Enter");

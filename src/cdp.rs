@@ -1772,7 +1772,19 @@ impl CdpClient {
   if ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && this.readOnly) return { state: "not_editable" };
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
-  const containsHit = (container, candidate) => candidate && (candidate === container || container.contains(candidate));
+  const containsHit = (container, candidate) => {
+    let node = candidate;
+    while (node) {
+      if (node === container) return true;
+      if (node.parentNode) {
+        node = node.parentNode;
+        continue;
+      }
+      const nodeRoot = typeof node.getRootNode === "function" ? node.getRootNode() : null;
+      node = nodeRoot && nodeRoot.host ? nodeRoot.host : null;
+    }
+    return false;
+  };
   const root = this.getRootNode();
   const hit = root && typeof root.elementFromPoint === "function"
     ? root.elementFromPoint(x, y)
