@@ -1580,8 +1580,22 @@ fn handle_fixture_connection(mut stream: TcpStream, accepting: Arc<AtomicBool>) 
 <div id="file-drop" role="button" tabindex="0" ondragover="event.preventDefault()" ondrop="event.preventDefault(); document.body.dataset.files=event.dataTransfer.files.length">File drop</div>
 <div id="scroll-box" tabindex="0" style="height:40px;overflow:auto"><div style="height:200px">Scrollable content</div></div>
 <button id="dialog" onclick="document.body.dataset.dialog=confirm('Continue?')">Dialog</button>
+<div id="closed-overlay-host"></div>
 <iframe src="/frame" title="Embedded fixture"></iframe>
 <script>
+const closedOverlayHost = document.querySelector('#closed-overlay-host');
+const closedOverlayRoot = closedOverlayHost.attachShadow({ mode: 'closed' });
+const closedOverlayButton = document.createElement('button');
+closedOverlayButton.textContent = 'Closed overlay Apply';
+closedOverlayButton.addEventListener('click', (event) => {
+  document.body.dataset.closedOverlayClicked = 'yes';
+  document.body.dataset.closedOverlayClickTrusted = String(event.isTrusted);
+});
+closedOverlayButton.addEventListener('keydown', (event) => {
+  document.body.dataset.closedOverlayKey = event.key;
+  document.body.dataset.closedOverlayKeyTrusted = String(event.isTrusted);
+});
+closedOverlayRoot.append(closedOverlayButton);
 document.querySelector('#entry').addEventListener('keydown', (event) => {
   document.body.dataset.key = event.key;
 });
