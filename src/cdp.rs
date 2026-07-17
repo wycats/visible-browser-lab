@@ -2066,7 +2066,7 @@ impl CdpClient {
   if (!this.isConnected) return { state: "stale" };
   const rect = this.getBoundingClientRect();
   const style = this.ownerDocument.defaultView.getComputedStyle(this);
-  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none") return { state: "hidden" };
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return { state: "hidden" };
   if (this.matches(":disabled") || this.getAttribute("aria-disabled") === "true") return { state: "disabled" };
   if (typeof this.focus !== "function") return { state: "not_focusable" };
   this.focus({ preventScroll: true });
@@ -2095,7 +2095,7 @@ impl CdpClient {
   const element = matches[0];
   const rect = element.getBoundingClientRect();
   const style = getComputedStyle(element);
-  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none") return {{ state: "hidden" }};
+  if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity || "1") === 0) return {{ state: "hidden" }};
   if (element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") return {{ state: "disabled" }};
   if (typeof element.focus !== "function") return {{ state: "not_focusable" }};
   element.focus({{ preventScroll: true }});
