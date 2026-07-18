@@ -2111,12 +2111,23 @@ fn activate_managed_chrome_if_available(config: &RuntimeConfig) {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
-    prepare_state(&config).await?;
+    let prepared = prepare_broker_runtime(&config).await?;
+    serve_prepared(config, prepared).await
+}
 
-    let endpoint = broker_endpoint(&config)?;
+struct PreparedBrokerRuntime {
+    listener: BrokerListener,
+    _runtime_files: RuntimeFileGuard,
+    stale_path: Option<PathBuf>,
+}
+
+async fn prepare_broker_runtime(config: &RuntimeConfig) -> Result<PreparedBrokerRuntime> {
+    prepare_state(config).await?;
+
+    let endpoint = broker_endpoint(config)?;
     let listener = endpoint.listen()?;
-    write_pid_file(&config).await?;
-    let _runtime_files = RuntimeFileGuard::new(
+    write_pid_file(config).await?;
+    let runtime_files = RuntimeFileGuard::new(
         config.pid_path.clone(),
         endpoint.stale_path().map(Path::to_path_buf),
     );
@@ -2131,7 +2142,22 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
     );
 
     let stale_path = endpoint.stale_path().map(Path::to_path_buf);
-    serve(config, listener, stale_path, TENANCY_TICK_INTERVAL).await
+    Ok(PreparedBrokerRuntime {
+        listener,
+        _runtime_files: runtime_files,
+        stale_path,
+    })
+}
+
+async fn serve_prepared(config: RuntimeConfig, prepared: PreparedBrokerRuntime) -> Result<()> {
+    let PreparedBrokerRuntime {
+        listener,
+        _runtime_files: runtime_files,
+        stale_path,
+    } = prepared;
+    let result = serve(config, listener, stale_path, TENANCY_TICK_INTERVAL).await;
+    drop(runtime_files);
+    result
 }
 
 pub async fn run_with_migration_guard(config: RuntimeConfig) -> Result<()> {
@@ -2155,7 +2181,12 @@ pub async fn run_with_migration_guard(config: RuntimeConfig) -> Result<()> {
         .into());
     }
 
-    run(config).await
+    // Bind the isolated endpoint while the legacy startup locks still close
+    // the migration race, then release those locks before serving for the
+    // broker's potentially unbounded lifetime.
+    let prepared = prepare_broker_runtime(&config).await?;
+    drop(migration_guard);
+    serve_prepared(config, prepared).await
 }
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
@@ -2278,7 +2309,7 @@ async fn connect_implicit_external_fallback_locked(
 
     let legacy = legacy_broker_config(fallback)?;
     if let Some(client) = connect_broker_if_present(&legacy).await? {
-        let (_, status) = ping_preserved_fallback(client, fallback).await?;
+        let (_, status) = ping_preserved_fallback(client, &legacy).await?;
         if implicit_external_status_matches(config, &status)? {
             return Err(implicit_external_protocol_conflict(fallback, &status).into());
         }
@@ -2377,7 +2408,23 @@ fn implicit_external_status_matches(config: &RuntimeConfig, status: &BrokerStatu
         .cdp_endpoint
         .as_deref()
         .context("implicit external runtime omitted its CDP endpoint")?;
-    Ok(status.runtime_mode == RuntimeMode::External && status.cdp_endpoint == expected)
+    if status.cdp_endpoint.is_empty() {
+        return Ok(false);
+    }
+    let actual = crate::config::canonical_cdp_endpoint(&status.cdp_endpoint)?;
+    if actual != expected {
+        return Ok(false);
+    }
+    if status.runtime_mode == RuntimeMode::Managed {
+        return Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous managed broker at `{}` already controls CDP endpoint `{expected}`. The endpoint-specific external broker was not started because a second lease registry could act on the same tabs. Continue through the managed broker, or stop it deliberately after confirming its sessions are no longer needed, then retry.",
+                status.ipc_endpoint,
+            ),
+        }
+        .into());
+    }
+    Ok(true)
 }
 
 fn legacy_broker_config(config: &RuntimeConfig) -> Result<RuntimeConfig> {
@@ -2592,13 +2639,16 @@ pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
     tokio::fs::create_dir_all(&config.state_dir).await?;
     tokio::fs::create_dir_all(&config.log_dir).await?;
     #[cfg(unix)]
-    if config.implicit_external_fallback_state_dir.is_some() {
+    if let Some(socket_parent) = config.implicit_external_socket_parent.as_deref() {
         use std::os::unix::fs::PermissionsExt;
 
-        let socket_parent = config
-            .socket_path
-            .parent()
-            .context("implicit external socket omitted its parent directory")?;
+        if config.socket_path.parent() != Some(socket_parent) {
+            bail!(
+                "generated implicit external socket parent `{}` does not match socket `{}`",
+                socket_parent.display(),
+                config.socket_path.display()
+            );
+        }
         match tokio::fs::symlink_metadata(socket_parent).await {
             Ok(metadata) if !metadata.file_type().is_dir() => bail!(
                 "implicit external socket parent `{}` is not a directory",
@@ -2606,14 +2656,33 @@ pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
             ),
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                tokio::fs::create_dir(socket_parent)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to create implicit external socket directory `{}`",
-                            socket_parent.display()
-                        )
-                    })?;
+                match tokio::fs::create_dir(socket_parent).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                        let metadata = tokio::fs::symlink_metadata(socket_parent)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to re-inspect concurrently created implicit external socket directory `{}`",
+                                    socket_parent.display()
+                                )
+                            })?;
+                        if !metadata.file_type().is_dir() {
+                            bail!(
+                                "implicit external socket parent `{}` is not a directory",
+                                socket_parent.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to create implicit external socket directory `{}`",
+                                socket_parent.display()
+                            )
+                        });
+                    }
+                }
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -8002,6 +8071,42 @@ mod tests {
         fs::remove_dir(socket_parent).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_accepts_concurrent_private_socket_directory_creation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = implicit_external_test_config(tempdir.path().join("default-state"));
+
+        let (first, second) = tokio::join!(prepare_state(&config), prepare_state(&config));
+
+        first.unwrap();
+        second.unwrap();
+        fs::remove_dir(config.socket_path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_does_not_harden_a_custom_socket_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::set_permissions(tempdir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let config = crate::config::BrokerArgs {
+            socket: Some(tempdir.path().join("lab.sock").display().to_string()),
+            idle_timeout_secs: None,
+            session_ttl_secs: None,
+        }
+        .apply(implicit_external_test_config(
+            tempdir.path().join("default-state"),
+        ));
+
+        prepare_state(&config).await.unwrap();
+
+        let mode = fs::metadata(tempdir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert!(config.implicit_external_fallback_state_dir.is_some());
+    }
+
     #[tokio::test]
     async fn broker_protocol_responds_to_ping() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -8073,6 +8178,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_fallback_probe_failure_names_the_legacy_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let isolated = implicit_external_test_config(tempdir.path().join("default-state"));
+        let fallback = isolated
+            .implicit_external_fallback_config()
+            .unwrap()
+            .unwrap();
+        prepare_state(&fallback).await.unwrap();
+        let legacy = legacy_broker_config(&fallback).unwrap();
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let accept = tokio::spawn(async move {
+            let _stream = ipc::accept(&listener).await.unwrap();
+        });
+
+        let error = match connect_implicit_external_fallback_locked(&isolated, &fallback).await {
+            Ok(_) => panic!("broken legacy probe should fail"),
+            Err(error) => error,
+        };
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("broken legacy probe should be a migration conflict");
+
+        assert!(conflict.to_string().contains(&legacy.ipc_endpoint));
+        assert!(!conflict.to_string().contains(&fallback.ipc_endpoint));
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn implicit_external_migration_waits_for_the_previous_startup_lock() {
         let tempdir = tempfile::tempdir().unwrap();
         let default_state_dir = tempdir.path().join("default-state");
@@ -8082,13 +8216,14 @@ mod tests {
             .unwrap()
             .expect("test should own the previous startup lock");
         let isolated = implicit_external_test_config(default_state_dir);
-        let isolated_task = isolated.clone();
-        let mut ensure = tokio::spawn(async move { ensure_running(&isolated_task).await });
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut ensure)
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                acquire_implicit_external_migration_guard(&isolated),
+            )
+            .await
+            .is_err(),
             "isolated startup must wait while the previous broker is starting"
         );
 
@@ -8102,10 +8237,9 @@ mod tests {
         ));
         drop(startup_lock);
 
-        let mut client = tokio::time::timeout(Duration::from_secs(2), ensure)
+        let mut client = tokio::time::timeout(Duration::from_secs(2), ensure_running(&isolated))
             .await
             .expect("migration did not finish after the previous startup completed")
-            .unwrap()
             .unwrap();
         let status = client.ping().await.unwrap();
         assert_eq!(status.ipc_endpoint, fallback.ipc_endpoint);
@@ -8183,6 +8317,31 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn direct_implicit_external_broker_releases_migration_locks_after_binding() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_state_dir = tempdir.path().join("default-state");
+        let fallback = test_config(default_state_dir.clone());
+        let isolated = implicit_external_test_config(default_state_dir);
+        let isolated_task = isolated.clone();
+        let server = tokio::spawn(async move { run_with_migration_guard(isolated_task).await });
+
+        let _client = wait_for_broker(&isolated, Duration::from_secs(2))
+            .await
+            .expect("direct isolated broker did not start");
+        let fallback_lock = BrokerStartLock::try_acquire(&fallback.lock_path)
+            .unwrap()
+            .expect("serving broker retained the previous v4 startup lock");
+        let legacy = legacy_broker_config(&fallback).unwrap();
+        let legacy_lock = BrokerStartLock::try_acquire(&legacy.lock_path)
+            .unwrap()
+            .expect("serving broker retained the previous v3 startup lock");
+
+        drop(fallback_lock);
+        drop(legacy_lock);
+        server.abort();
+    }
+
     #[test]
     fn implicit_external_migration_accepts_a_matching_older_package() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -8198,6 +8357,31 @@ mod tests {
         };
 
         assert!(implicit_external_status_matches(&config, &status).unwrap());
+    }
+
+    #[test]
+    fn implicit_external_migration_rejects_a_managed_broker_on_the_same_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("external/endpoint-hash"));
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.10".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::Managed,
+            cdp_endpoint: format!(
+                "{}/json/version?fresh=1",
+                config.cdp_endpoint.as_ref().unwrap()
+            ),
+            ipc_endpoint: "managed-fallback".to_string(),
+            socket_path: tempdir.path().join("broker-v4.sock"),
+        };
+
+        let error = implicit_external_status_matches(&config, &status).unwrap_err();
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("managed endpoint collision should be a configuration conflict");
+        assert!(conflict.to_string().contains("second lease registry"));
+        assert!(conflict.to_string().contains("managed-fallback"));
     }
 
     #[tokio::test]
