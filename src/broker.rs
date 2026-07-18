@@ -2640,8 +2640,6 @@ pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
     tokio::fs::create_dir_all(&config.log_dir).await?;
     #[cfg(unix)]
     if let Some(socket_parent) = config.implicit_external_socket_parent.as_deref() {
-        use std::os::unix::fs::PermissionsExt;
-
         if config.socket_path.parent() != Some(socket_parent) {
             bail!(
                 "generated implicit external socket parent `{}` does not match socket `{}`",
@@ -2649,59 +2647,54 @@ pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
                 config.socket_path.display()
             );
         }
-        match tokio::fs::symlink_metadata(socket_parent).await {
-            Ok(metadata) if !metadata.file_type().is_dir() => bail!(
-                "implicit external socket parent `{}` is not a directory",
-                socket_parent.display()
-            ),
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                match tokio::fs::create_dir(socket_parent).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                        let metadata = tokio::fs::symlink_metadata(socket_parent)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to re-inspect concurrently created implicit external socket directory `{}`",
-                                    socket_parent.display()
-                                )
-                            })?;
-                        if !metadata.file_type().is_dir() {
-                            bail!(
-                                "implicit external socket parent `{}` is not a directory",
-                                socket_parent.display()
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "failed to create implicit external socket directory `{}`",
-                                socket_parent.display()
-                            )
-                        });
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to inspect implicit external socket directory `{}`",
-                        socket_parent.display()
-                    )
-                });
-            }
-        }
-        tokio::fs::set_permissions(socket_parent, fs::Permissions::from_mode(0o700))
-            .await
-            .with_context(|| {
+        secure_implicit_external_socket_parent(socket_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_implicit_external_socket_parent(socket_parent: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(socket_parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
                 format!(
-                    "failed to secure implicit external socket directory `{}`",
+                    "failed to create implicit external socket directory `{}`",
                     socket_parent.display()
                 )
-            })?;
+            });
+        }
     }
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(socket_parent)
+        .with_context(|| {
+            format!(
+                "failed to securely open implicit external socket directory `{}`",
+                socket_parent.display()
+            )
+        })?;
+    if !directory.metadata()?.is_dir() {
+        bail!(
+            "implicit external socket parent `{}` is not a directory",
+            socket_parent.display()
+        );
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .with_context(|| {
+            format!(
+                "failed to secure implicit external socket directory `{}`",
+                socket_parent.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -2807,7 +2800,9 @@ fn broker_status_mismatch(
             .cdp_endpoint
             .as_deref()
             .context("external runtime omitted its CDP endpoint")?;
-        if status.cdp_endpoint != expected {
+        let actual = crate::config::canonical_cdp_endpoint(&status.cdp_endpoint)
+            .unwrap_or_else(|_| status.cdp_endpoint.clone());
+        if actual != expected {
             return Ok(Some(BrokerMismatch {
                 message: format!(
                     "broker configuration conflict: state directory `{}` already hosts an external broker for {}. Reuse that CDP endpoint, or pass a separate `--state-dir` for {expected}. The existing broker was left running.",
@@ -8117,6 +8112,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn prepare_state_rejects_a_symlinked_implicit_external_socket_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = implicit_external_test_config(tempdir.path().join("default-state"));
+        let socket_parent = config.socket_path.parent().unwrap().to_path_buf();
+        let target = tempdir.path().join("unrelated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(socket_parent.parent().unwrap()).unwrap();
+        symlink(&target, &socket_parent).unwrap();
+
+        let error = prepare_state(&config).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to securely open implicit external socket directory")
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_file(&socket_parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn prepare_state_does_not_harden_a_custom_socket_parent() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -10876,6 +10899,37 @@ mod tests {
         assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
         assert!(mismatch.message.contains("broker configuration conflict"));
         assert!(mismatch.message.contains("Reuse that CDP endpoint"));
+    }
+
+    #[test]
+    fn external_broker_status_canonicalizes_a_stored_cdp_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            tempdir.path().join("state"),
+        )
+        .unwrap();
+        let current = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222/json/version?legacy=1".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        assert!(broker_status_mismatch(&config, &current).unwrap().is_none());
+
+        let stale = BrokerStatus {
+            package_version: "0.4.0".to_string(),
+            ..current
+        };
+        let mismatch = broker_status_mismatch(&config, &stale)
+            .unwrap()
+            .expect("a same-origin old broker should advance to package replacement");
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Replace);
+        assert!(mismatch.message.contains("broker package version mismatch"));
     }
 
     #[tokio::test]
