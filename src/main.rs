@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     .into_config()?;
 
     match command {
-        Some(Command::Broker(args)) => broker::run(args.apply(config)).await,
+        Some(Command::Broker(args)) => broker::run_with_migration_guard(args.apply(config)).await,
         Some(Command::Surface(args)) => surface_cli::run(config, args).await,
         None => mcp::run(config, conversation_identity_compatibility).await,
     }
