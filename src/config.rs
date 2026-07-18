@@ -363,7 +363,7 @@ fn resolve_runtime_state_dir(
 
 fn external_state_dir(default_state_dir: &std::path::Path, cdp_endpoint: &str) -> PathBuf {
     let digest = format!("{:x}", Sha256::digest(cdp_endpoint.as_bytes()));
-    default_state_dir.join("external").join(&digest[..16])
+    default_state_dir.join("external").join(&digest[..32])
 }
 
 fn normalize_cdp_endpoint(endpoint: &str) -> Result<String> {
@@ -504,6 +504,14 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert!(first.starts_with(default_state_dir.join("external")));
+        assert_eq!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .len(),
+            32
+        );
         assert_ne!(first, other);
     }
 
