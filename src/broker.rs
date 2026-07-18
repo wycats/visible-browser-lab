@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -2111,12 +2111,23 @@ fn activate_managed_chrome_if_available(config: &RuntimeConfig) {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<()> {
-    prepare_state(&config).await?;
+    let prepared = prepare_broker_runtime(&config).await?;
+    serve_prepared(config, prepared).await
+}
 
-    let endpoint = broker_endpoint(&config)?;
+struct PreparedBrokerRuntime {
+    listener: BrokerListener,
+    _runtime_files: RuntimeFileGuard,
+    stale_path: Option<PathBuf>,
+}
+
+async fn prepare_broker_runtime(config: &RuntimeConfig) -> Result<PreparedBrokerRuntime> {
+    prepare_state(config).await?;
+
+    let endpoint = broker_endpoint(config)?;
     let listener = endpoint.listen()?;
-    write_pid_file(&config).await?;
-    let _runtime_files = RuntimeFileGuard::new(
+    write_pid_file(config).await?;
+    let runtime_files = RuntimeFileGuard::new(
         config.pid_path.clone(),
         endpoint.stale_path().map(Path::to_path_buf),
     );
@@ -2131,7 +2142,51 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
     );
 
     let stale_path = endpoint.stale_path().map(Path::to_path_buf);
-    serve(config, listener, stale_path, TENANCY_TICK_INTERVAL).await
+    Ok(PreparedBrokerRuntime {
+        listener,
+        _runtime_files: runtime_files,
+        stale_path,
+    })
+}
+
+async fn serve_prepared(config: RuntimeConfig, prepared: PreparedBrokerRuntime) -> Result<()> {
+    let PreparedBrokerRuntime {
+        listener,
+        _runtime_files: runtime_files,
+        stale_path,
+    } = prepared;
+    let result = serve(config, listener, stale_path, TENANCY_TICK_INTERVAL).await;
+    drop(runtime_files);
+    result
+}
+
+pub async fn run_with_migration_guard(config: RuntimeConfig) -> Result<()> {
+    let migration_guard = acquire_implicit_external_migration_guard(&config).await?;
+    if let Some(guard) = migration_guard.as_ref()
+        && connect_implicit_external_fallback_locked(&config, &guard.fallback)
+            .await?
+            .is_some()
+    {
+        return Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous implicit external broker at `{}` is still serving {}. The endpoint-specific broker was not started. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                guard.fallback.ipc_endpoint,
+                guard
+                    .fallback
+                    .cdp_endpoint
+                    .as_deref()
+                    .unwrap_or("the requested CDP endpoint"),
+            ),
+        }
+        .into());
+    }
+
+    // Bind the isolated endpoint while the legacy startup locks still close
+    // the migration race, then release those locks before serving for the
+    // broker's potentially unbounded lifetime.
+    let prepared = prepare_broker_runtime(&config).await?;
+    drop(migration_guard);
+    serve_prepared(config, prepared).await
 }
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
@@ -2142,14 +2197,36 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
         return Ok(client);
     }
 
+    let migration_guard = acquire_implicit_external_migration_guard(config).await?;
+
+    // A broker may have finished starting while this invocation waited for
+    // the pre-isolation startup locks. Prefer the endpoint-isolated registry
+    // whenever it exists so its leases never disappear behind the fallback.
+    match probe_broker(config).await {
+        Ok(BrokerProbe::Compatible(client)) => return Ok(client),
+        Ok(BrokerProbe::Incompatible { .. }) => {
+            // The isolated endpoint has an authoritative broker claim. The
+            // normal startup-lock path below will either upgrade it or report
+            // its configuration conflict; a fallback must not mask it.
+        }
+        Err(_) => {
+            if let Some(guard) = migration_guard.as_ref()
+                && let Some(client) =
+                    connect_implicit_external_fallback_locked(config, &guard.fallback).await?
+            {
+                return Ok(client);
+            }
+        }
+    }
+
     let deadline = Instant::now() + BROKER_START_TIMEOUT;
 
     loop {
         if let Some(_lock) = BrokerStartLock::try_acquire(&config.lock_path)? {
             match probe_broker(config).await {
                 Ok(BrokerProbe::Compatible(client)) => return Ok(client),
-                Ok(BrokerProbe::Incompatible { status, message }) => {
-                    restart_incompatible_broker(config, &status, &message).await?;
+                Ok(BrokerProbe::Incompatible { status, mismatch }) => {
+                    reconcile_incompatible_broker(config, &status, mismatch).await?;
                 }
                 Err(_) => {}
             }
@@ -2174,20 +2251,206 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
     }
 }
 
-fn legacy_broker_config(config: &RuntimeConfig) -> RuntimeConfig {
+struct ImplicitExternalMigrationGuard {
+    fallback: RuntimeConfig,
+    _current_lock: BrokerStartLock,
+    _legacy_lock: BrokerStartLock,
+}
+
+async fn acquire_implicit_external_migration_guard(
+    config: &RuntimeConfig,
+) -> Result<Option<ImplicitExternalMigrationGuard>> {
+    let Some(fallback) = config.implicit_external_fallback_config()? else {
+        return Ok(None);
+    };
+    prepare_state(&fallback).await?;
+    let current_lock = acquire_broker_start_lock(
+        &fallback.lock_path,
+        "previous implicit external broker startup",
+    )
+    .await?;
+    let legacy = legacy_broker_config(&fallback)?;
+    let legacy_lock = acquire_broker_start_lock(
+        &legacy.lock_path,
+        "previous implicit external legacy broker startup",
+    )
+    .await?;
+
+    Ok(Some(ImplicitExternalMigrationGuard {
+        fallback,
+        _current_lock: current_lock,
+        _legacy_lock: legacy_lock,
+    }))
+}
+
+async fn acquire_broker_start_lock(lock_path: &Path, purpose: &str) -> Result<BrokerStartLock> {
+    let deadline = Instant::now() + BROKER_START_TIMEOUT;
+    loop {
+        if let Some(lock) = BrokerStartLock::try_acquire(lock_path)? {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for {purpose} lock `{}`",
+                lock_path.display()
+            );
+        }
+        sleep(BROKER_CONNECT_RETRY).await;
+    }
+}
+
+async fn connect_implicit_external_fallback_locked(
+    config: &RuntimeConfig,
+    fallback: &RuntimeConfig,
+) -> Result<Option<BrokerClient>> {
+    if let Some(client) = connect_matching_implicit_external_broker(config, fallback).await? {
+        return Ok(Some(client));
+    }
+
+    let legacy = legacy_broker_config(fallback)?;
+    if let Some(client) = connect_broker_if_present(&legacy).await? {
+        let (_, status) = ping_preserved_fallback(client, &legacy).await?;
+        if implicit_external_status_matches(config, &status)? {
+            return Err(implicit_external_protocol_conflict(fallback, &status).into());
+        }
+    }
+
+    Ok(None)
+}
+
+async fn connect_matching_implicit_external_broker(
+    config: &RuntimeConfig,
+    fallback: &RuntimeConfig,
+) -> Result<Option<BrokerClient>> {
+    let Some(client) = connect_broker_if_present(fallback).await? else {
+        return Ok(None);
+    };
+    let (client, status) = ping_preserved_fallback(client, fallback).await?;
+    if !implicit_external_status_matches(config, &status)? {
+        return Ok(None);
+    }
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        return Err(implicit_external_protocol_conflict(fallback, &status).into());
+    }
+
+    tracing::info!(
+        pid = status.pid,
+        package_version = %status.package_version,
+        cdp_endpoint = %status.cdp_endpoint,
+        state_dir = %fallback.state_dir.display(),
+        "reusing pre-isolation implicit external broker"
+    );
+    Ok(Some(client))
+}
+
+async fn ping_preserved_fallback(
+    mut client: BrokerClient,
+    fallback: &RuntimeConfig,
+) -> Result<(BrokerClient, BrokerStatus)> {
+    match tokio::time::timeout(Duration::from_secs(1), client.ping()).await {
+        Ok(Ok(status)) => Ok((client, status)),
+        Ok(Err(error)) => Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous implicit external broker at `{}` accepted a connection but its health probe failed: {error}. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                fallback.ipc_endpoint,
+            ),
+        }
+        .into()),
+        Err(_) => Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous implicit external broker at `{}` accepted a connection but did not answer its health probe within one second. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                fallback.ipc_endpoint,
+            ),
+        }
+        .into()),
+    }
+}
+
+fn implicit_external_protocol_conflict(
+    fallback: &RuntimeConfig,
+    status: &BrokerStatus,
+) -> BrokerConfigurationConflict {
+    BrokerConfigurationConflict {
+        message: format!(
+            "broker migration required: the previous implicit external state directory `{}` still hosts protocol v{} for {}. It was left running to preserve its leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry; the endpoint-specific broker was not started.",
+            fallback.state_dir.display(),
+            status.protocol_version,
+            status.cdp_endpoint,
+        ),
+    }
+}
+
+async fn connect_broker_if_present(config: &RuntimeConfig) -> Result<Option<BrokerClient>> {
+    let endpoint = broker_endpoint(config)?;
+    match BrokerClient::connect(&endpoint).await {
+        Ok(client) => Ok(Some(client)),
+        Err(error) => {
+            if let Some(pid) = read_pid(&config.pid_path)?
+                && process_is_running(pid)
+                && process_looks_like_broker_for_state(pid, &config.state_dir)
+            {
+                return Err(BrokerConfigurationConflict {
+                    message: format!(
+                        "broker migration blocked: the previous implicit external broker pid {pid} still owns state directory `{}`, but its endpoint `{}` is unreachable: {error}. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                        config.state_dir.display(),
+                        config.ipc_endpoint,
+                    ),
+                }
+                .into());
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn implicit_external_status_matches(config: &RuntimeConfig, status: &BrokerStatus) -> Result<bool> {
+    let expected = config
+        .cdp_endpoint
+        .as_deref()
+        .context("implicit external runtime omitted its CDP endpoint")?;
+    if status.cdp_endpoint.is_empty() {
+        return Ok(false);
+    }
+    let actual = crate::config::canonical_cdp_endpoint(&status.cdp_endpoint)?;
+    if actual != expected {
+        return Ok(false);
+    }
+    if status.runtime_mode == RuntimeMode::Managed {
+        return Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous managed broker at `{}` already controls CDP endpoint `{expected}`. The endpoint-specific external broker was not started because a second lease registry could act on the same tabs. Continue through the managed broker, or stop it deliberately after confirming its sessions are no longer needed, then retry.",
+                status.ipc_endpoint,
+            ),
+        }
+        .into());
+    }
+    Ok(true)
+}
+
+fn legacy_broker_config(config: &RuntimeConfig) -> Result<RuntimeConfig> {
     let mut legacy = config.clone();
-    legacy.ipc_endpoint =
-        ipc::endpoint_display_for_protocol(&config.state_dir, LEGACY_BROKER_PROTOCOL_VERSION);
-    legacy.socket_path = config
-        .state_dir
-        .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.sock"));
+    legacy.ipc_endpoint = config
+        .implicit_external_ipc_endpoint_for_protocol(LEGACY_BROKER_PROTOCOL_VERSION)?
+        .unwrap_or_else(|| {
+            ipc::endpoint_display_for_protocol(&config.state_dir, LEGACY_BROKER_PROTOCOL_VERSION)
+        });
+    #[cfg(not(windows))]
+    {
+        legacy.socket_path = PathBuf::from(&legacy.ipc_endpoint);
+    }
+    #[cfg(windows)]
+    {
+        legacy.socket_path = config
+            .state_dir
+            .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.sock"));
+    }
     legacy.lock_path = config
         .state_dir
         .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.lock"));
     legacy.pid_path = config
         .state_dir
         .join(format!("broker-v{LEGACY_BROKER_PROTOCOL_VERSION}.pid"));
-    legacy
+    Ok(legacy)
 }
 
 /// A protocol-versioned socket prevents an old client from speaking the new
@@ -2197,7 +2460,7 @@ fn legacy_broker_config(config: &RuntimeConfig) -> RuntimeConfig {
 /// race; repeating the check on every call also retires an old client that is
 /// launched again after the upgrade.
 async fn retire_legacy_broker(config: &RuntimeConfig) -> Result<()> {
-    let legacy = legacy_broker_config(config);
+    let legacy = legacy_broker_config(config)?;
     let deadline = Instant::now() + BROKER_START_TIMEOUT;
 
     loop {
@@ -2375,6 +2638,63 @@ fn process_command_line(pid: u32) -> Option<String> {
 pub async fn prepare_state(config: &RuntimeConfig) -> Result<()> {
     tokio::fs::create_dir_all(&config.state_dir).await?;
     tokio::fs::create_dir_all(&config.log_dir).await?;
+    #[cfg(unix)]
+    if let Some(socket_parent) = config.implicit_external_socket_parent.as_deref() {
+        if config.socket_path.parent() != Some(socket_parent) {
+            bail!(
+                "generated implicit external socket parent `{}` does not match socket `{}`",
+                socket_parent.display(),
+                config.socket_path.display()
+            );
+        }
+        secure_implicit_external_socket_parent(socket_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_implicit_external_socket_parent(socket_parent: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(socket_parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create implicit external socket directory `{}`",
+                    socket_parent.display()
+                )
+            });
+        }
+    }
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(socket_parent)
+        .with_context(|| {
+            format!(
+                "failed to securely open implicit external socket directory `{}`",
+                socket_parent.display()
+            )
+        })?;
+    if !directory.metadata()?.is_dir() {
+        bail!(
+            "implicit external socket parent `{}` is not a directory",
+            socket_parent.display()
+        );
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .with_context(|| {
+            format!(
+                "failed to secure implicit external socket directory `{}`",
+                socket_parent.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -2418,7 +2738,7 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
 async fn connect_and_ping(config: &RuntimeConfig) -> Result<BrokerClient> {
     match probe_broker(config).await? {
         BrokerProbe::Compatible(client) => Ok(client),
-        BrokerProbe::Incompatible { message, .. } => bail!("{message}"),
+        BrokerProbe::Incompatible { mismatch, .. } => bail!(mismatch.message),
     }
 }
 
@@ -2426,57 +2746,131 @@ enum BrokerProbe {
     Compatible(BrokerClient),
     Incompatible {
         status: BrokerStatus,
-        message: String,
+        mismatch: BrokerMismatch,
     },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerMismatchDisposition {
+    Replace,
+    Preserve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrokerMismatch {
+    message: String,
+    disposition: BrokerMismatchDisposition,
+}
+
+#[derive(Debug)]
+pub struct BrokerConfigurationConflict {
+    message: String,
+}
+
+impl std::fmt::Display for BrokerConfigurationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BrokerConfigurationConflict {}
 
 async fn probe_broker(config: &RuntimeConfig) -> Result<BrokerProbe> {
     let endpoint = broker_endpoint(config)?;
     let mut client = BrokerClient::connect(&endpoint).await?;
     let status = client.ping().await?;
-    if let Some(message) = broker_status_mismatch(config, &status)? {
-        return Ok(BrokerProbe::Incompatible { status, message });
+    if let Some(mismatch) = broker_status_mismatch(config, &status)? {
+        return Ok(BrokerProbe::Incompatible { status, mismatch });
     }
     Ok(BrokerProbe::Compatible(client))
 }
 
-fn broker_status_mismatch(config: &RuntimeConfig, status: &BrokerStatus) -> Result<Option<String>> {
-    if status.protocol_version != BROKER_PROTOCOL_VERSION {
-        return Ok(Some(format!(
-            "broker protocol mismatch: expected {}, got {}",
-            BROKER_PROTOCOL_VERSION, status.protocol_version
-        )));
-    }
-    if status.package_version != env!("CARGO_PKG_VERSION") {
-        return Ok(Some(format!(
-            "broker package version mismatch: expected {}, got {}",
-            env!("CARGO_PKG_VERSION"),
-            if status.package_version.is_empty() {
-                "pre-0.4.3 (unversioned)"
-            } else {
-                &status.package_version
-            }
-        )));
-    }
+fn broker_status_mismatch(
+    config: &RuntimeConfig,
+    status: &BrokerStatus,
+) -> Result<Option<BrokerMismatch>> {
     if status.runtime_mode != config.runtime_mode {
-        return Ok(Some(format!(
-            "broker runtime mismatch: requested {:?}, existing broker is {:?} at {}",
-            config.runtime_mode, status.runtime_mode, status.ipc_endpoint
-        )));
+        return Ok(Some(BrokerMismatch {
+            message: runtime_mode_conflict_message(config, status),
+            disposition: BrokerMismatchDisposition::Preserve,
+        }));
     }
     if config.runtime_mode == RuntimeMode::External {
         let expected = config
             .cdp_endpoint
             .as_deref()
             .context("external runtime omitted its CDP endpoint")?;
-        if status.cdp_endpoint != expected {
-            return Ok(Some(format!(
-                "broker CDP endpoint mismatch: requested {expected}, existing broker uses {} at {}",
-                status.cdp_endpoint, status.ipc_endpoint
-            )));
+        let actual = crate::config::canonical_cdp_endpoint(&status.cdp_endpoint)
+            .unwrap_or_else(|_| status.cdp_endpoint.clone());
+        if actual != expected {
+            return Ok(Some(BrokerMismatch {
+                message: format!(
+                    "broker configuration conflict: state directory `{}` already hosts an external broker for {}. Reuse that CDP endpoint, or pass a separate `--state-dir` for {expected}. The existing broker was left running.",
+                    config.state_dir.display(),
+                    status.cdp_endpoint,
+                ),
+                disposition: BrokerMismatchDisposition::Preserve,
+            }));
         }
     }
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        return Ok(Some(BrokerMismatch {
+            message: format!(
+                "broker protocol mismatch: expected {}, got {}",
+                BROKER_PROTOCOL_VERSION, status.protocol_version
+            ),
+            disposition: BrokerMismatchDisposition::Replace,
+        }));
+    }
+    if status.package_version != env!("CARGO_PKG_VERSION") {
+        return Ok(Some(BrokerMismatch {
+            message: format!(
+                "broker package version mismatch: expected {}, got {}",
+                env!("CARGO_PKG_VERSION"),
+                if status.package_version.is_empty() {
+                    "pre-0.4.3 (unversioned)"
+                } else {
+                    &status.package_version
+                }
+            ),
+            disposition: BrokerMismatchDisposition::Replace,
+        }));
+    }
     Ok(None)
+}
+
+fn runtime_mode_conflict_message(config: &RuntimeConfig, status: &BrokerStatus) -> String {
+    let recovery = match (config.runtime_mode, status.runtime_mode) {
+        (RuntimeMode::External, RuntimeMode::Managed) => {
+            "Omit `--cdp-endpoint` to use the existing managed broker, or pass a separate `--state-dir` for the external endpoint."
+        }
+        (RuntimeMode::Managed, RuntimeMode::External) => {
+            "Restore the existing external CDP configuration, or pass a separate `--state-dir` for managed Chrome."
+        }
+        _ => "Pass a separate `--state-dir` for the requested runtime.",
+    };
+    format!(
+        "broker configuration conflict: state directory `{}` already hosts a {:?} broker, but this invocation requested {:?}. {recovery} The existing broker was left running.",
+        config.state_dir.display(),
+        status.runtime_mode,
+        config.runtime_mode,
+    )
+}
+
+async fn reconcile_incompatible_broker(
+    config: &RuntimeConfig,
+    status: &BrokerStatus,
+    mismatch: BrokerMismatch,
+) -> Result<()> {
+    match mismatch.disposition {
+        BrokerMismatchDisposition::Replace => {
+            restart_incompatible_broker(config, status, &mismatch.message).await
+        }
+        BrokerMismatchDisposition::Preserve => Err(BrokerConfigurationConflict {
+            message: mismatch.message,
+        }
+        .into()),
+    }
 }
 
 async fn restart_incompatible_broker(
@@ -7377,6 +7771,20 @@ pub enum StaleEndpointCleanup {
 
 struct BrokerStartLock {
     _file: File,
+    lock_path: PathBuf,
+}
+
+static IN_PROCESS_BROKER_START_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn in_process_broker_start_locks() -> &'static Mutex<HashSet<PathBuf>> {
+    IN_PROCESS_BROKER_START_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn release_in_process_broker_start_lock(lock_path: &Path) {
+    in_process_broker_start_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(lock_path);
 }
 
 impl BrokerStartLock {
@@ -7389,10 +7797,26 @@ impl BrokerStartLock {
             .open(lock_path)
             .with_context(|| format!("failed to open broker lock `{}`", lock_path.display()))?;
 
+        {
+            let mut active = in_process_broker_start_locks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !active.insert(lock_path.to_path_buf()) {
+                return Ok(None);
+            }
+        }
+
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+            Ok(()) => Ok(Some(Self {
+                _file: file,
+                lock_path: lock_path.to_path_buf(),
+            })),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                release_in_process_broker_start_lock(lock_path);
+                Ok(None)
+            }
             Err(error) => {
+                release_in_process_broker_start_lock(lock_path);
                 Err(error).with_context(|| format!("failed to lock `{}`", lock_path.display()))
             }
         }
@@ -7402,6 +7826,7 @@ impl BrokerStartLock {
 impl Drop for BrokerStartLock {
     fn drop(&mut self) {
         let _ = self._file.unlock();
+        release_in_process_broker_start_lock(&self.lock_path);
     }
 }
 
@@ -7450,6 +7875,15 @@ mod tests {
 
     fn test_config(state_dir: PathBuf) -> RuntimeConfig {
         RuntimeConfig::from_parts("http://127.0.0.1:9222".to_string(), state_dir).unwrap()
+    }
+
+    fn implicit_external_test_config(default_state_dir: PathBuf) -> RuntimeConfig {
+        RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222".to_string(),
+            default_state_dir,
+            None,
+        )
+        .unwrap()
     }
 
     fn fake_target(id: &str) -> CdpTarget {
@@ -7646,6 +8080,87 @@ mod tests {
         assert!(state_dir.join("logs").is_dir());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_secures_the_short_implicit_external_socket_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = implicit_external_test_config(tempdir.path().join("default-state"));
+        let socket_parent = config.socket_path.parent().unwrap().to_path_buf();
+
+        prepare_state(&config).await.unwrap();
+
+        let metadata = fs::metadata(&socket_parent).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        fs::remove_dir(socket_parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_accepts_concurrent_private_socket_directory_creation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = implicit_external_test_config(tempdir.path().join("default-state"));
+
+        let (first, second) = tokio::join!(prepare_state(&config), prepare_state(&config));
+
+        first.unwrap();
+        second.unwrap();
+        fs::remove_dir(config.socket_path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_rejects_a_symlinked_implicit_external_socket_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = implicit_external_test_config(tempdir.path().join("default-state"));
+        let socket_parent = config.socket_path.parent().unwrap().to_path_buf();
+        let target = tempdir.path().join("unrelated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(socket_parent.parent().unwrap()).unwrap();
+        symlink(&target, &socket_parent).unwrap();
+
+        let error = prepare_state(&config).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to securely open implicit external socket directory")
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_file(&socket_parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_state_does_not_harden_a_custom_socket_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::set_permissions(tempdir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let config = crate::config::BrokerArgs {
+            socket: Some(tempdir.path().join("lab.sock").display().to_string()),
+            idle_timeout_secs: None,
+            session_ttl_secs: None,
+        }
+        .apply(implicit_external_test_config(
+            tempdir.path().join("default-state"),
+        ));
+
+        prepare_state(&config).await.unwrap();
+
+        let mode = fs::metadata(tempdir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert!(config.implicit_external_fallback_state_dir.is_some());
+    }
+
     #[tokio::test]
     async fn broker_protocol_responds_to_ping() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -7664,6 +8179,263 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn implicit_external_migration_reuses_the_existing_broker_and_leases() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let fallback = test_config(tempdir.path().join("default-state"));
+        prepare_state(&fallback).await.unwrap();
+        let endpoint = broker_endpoint(&fallback).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let server = tokio::spawn(serve(
+            fallback.clone(),
+            listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+
+        let mut original = BrokerClient::connect(&endpoint).await.unwrap();
+        let session: StartSessionResult = original
+            .request(
+                "start_session",
+                StartSessionParams {
+                    label: Some("pre-isolation".to_string()),
+                    start_url: None,
+                    focus: false,
+                    workspace_root: None,
+                },
+            )
+            .await
+            .unwrap();
+        let isolated = test_config(tempdir.path().join("external/endpoint-hash"));
+
+        let mut migrated = connect_matching_implicit_external_broker(&isolated, &fallback)
+            .await
+            .unwrap()
+            .expect("matching pre-isolation broker should be reused");
+        let artifacts = migrated
+            .request_response(
+                "artifacts",
+                DomainParams {
+                    agent_session_id: session.agent_session_id,
+                    tab_id: None,
+                    operation: "list".to_string(),
+                    arguments: serde_json::Map::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(artifacts.ok, "migrated client lost the existing session");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_fallback_probe_failure_names_the_legacy_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let isolated = implicit_external_test_config(tempdir.path().join("default-state"));
+        let fallback = isolated
+            .implicit_external_fallback_config()
+            .unwrap()
+            .unwrap();
+        prepare_state(&fallback).await.unwrap();
+        let legacy = legacy_broker_config(&fallback).unwrap();
+        let endpoint = broker_endpoint(&legacy).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let accept = tokio::spawn(async move {
+            let _stream = ipc::accept(&listener).await.unwrap();
+        });
+
+        let error = match connect_implicit_external_fallback_locked(&isolated, &fallback).await {
+            Ok(_) => panic!("broken legacy probe should fail"),
+            Err(error) => error,
+        };
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("broken legacy probe should be a migration conflict");
+
+        assert!(conflict.to_string().contains(&legacy.ipc_endpoint));
+        assert!(!conflict.to_string().contains(&fallback.ipc_endpoint));
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn implicit_external_migration_waits_for_the_previous_startup_lock() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_state_dir = tempdir.path().join("default-state");
+        let fallback = test_config(default_state_dir.clone());
+        prepare_state(&fallback).await.unwrap();
+        let startup_lock = BrokerStartLock::try_acquire(&fallback.lock_path)
+            .unwrap()
+            .expect("test should own the previous startup lock");
+        let isolated = implicit_external_test_config(default_state_dir);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                acquire_implicit_external_migration_guard(&isolated),
+            )
+            .await
+            .is_err(),
+            "isolated startup must wait while the previous broker is starting"
+        );
+
+        let endpoint = broker_endpoint(&fallback).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let server = tokio::spawn(serve(
+            fallback.clone(),
+            listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+        drop(startup_lock);
+
+        let mut client = tokio::time::timeout(Duration::from_secs(2), ensure_running(&isolated))
+            .await
+            .expect("migration did not finish after the previous startup completed")
+            .unwrap();
+        let status = client.ping().await.unwrap();
+        assert_eq!(status.ipc_endpoint, fallback.ipc_endpoint);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn implicit_external_migration_prefers_an_existing_isolated_broker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_state_dir = tempdir.path().join("default-state");
+        let fallback = test_config(default_state_dir.clone());
+        let isolated = implicit_external_test_config(default_state_dir);
+        prepare_state(&fallback).await.unwrap();
+        prepare_state(&isolated).await.unwrap();
+
+        let fallback_endpoint = broker_endpoint(&fallback).unwrap();
+        let fallback_listener = fallback_endpoint.listen().unwrap();
+        let fallback_server = tokio::spawn(serve(
+            fallback,
+            fallback_listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+        let isolated_endpoint = broker_endpoint(&isolated).unwrap();
+        let isolated_listener = isolated_endpoint.listen().unwrap();
+        let isolated_server = tokio::spawn(serve(
+            isolated.clone(),
+            isolated_listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+
+        let mut client = ensure_running(&isolated).await.unwrap();
+        let status = client.ping().await.unwrap();
+        assert_eq!(status.ipc_endpoint, isolated.ipc_endpoint);
+
+        fallback_server.abort();
+        isolated_server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_implicit_external_broker_respects_the_migration_guard() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_state_dir = tempdir.path().join("default-state");
+        let fallback = test_config(default_state_dir.clone());
+        prepare_state(&fallback).await.unwrap();
+        let endpoint = broker_endpoint(&fallback).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let server = tokio::spawn(serve(
+            fallback.clone(),
+            listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+
+        let isolated = implicit_external_test_config(default_state_dir);
+        let error = run_with_migration_guard(isolated.clone())
+            .await
+            .unwrap_err();
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("direct broker startup should report a migration conflict");
+
+        assert!(
+            conflict
+                .to_string()
+                .contains("previous implicit external broker")
+        );
+        assert!(!isolated.socket_path.exists());
+        let mut fallback_client = BrokerClient::connect(&endpoint).await.unwrap();
+        assert_eq!(
+            fallback_client.ping().await.unwrap().ipc_endpoint,
+            fallback.ipc_endpoint
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_implicit_external_broker_releases_migration_locks_after_binding() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_state_dir = tempdir.path().join("default-state");
+        let fallback = test_config(default_state_dir.clone());
+        let isolated = implicit_external_test_config(default_state_dir);
+        let isolated_task = isolated.clone();
+        let server = tokio::spawn(async move { run_with_migration_guard(isolated_task).await });
+
+        let _client = wait_for_broker(&isolated, Duration::from_secs(2))
+            .await
+            .expect("direct isolated broker did not start");
+        let fallback_lock = BrokerStartLock::try_acquire(&fallback.lock_path)
+            .unwrap()
+            .expect("serving broker retained the previous v4 startup lock");
+        let legacy = legacy_broker_config(&fallback).unwrap();
+        let legacy_lock = BrokerStartLock::try_acquire(&legacy.lock_path)
+            .unwrap()
+            .expect("serving broker retained the previous v3 startup lock");
+
+        drop(fallback_lock);
+        drop(legacy_lock);
+        server.abort();
+    }
+
+    #[test]
+    fn implicit_external_migration_accepts_a_matching_older_package() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("external/endpoint-hash"));
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.10".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: config.cdp_endpoint.clone().unwrap(),
+            ipc_endpoint: tempdir.path().join("broker-v4.sock").display().to_string(),
+            socket_path: tempdir.path().join("broker-v4.sock"),
+        };
+
+        assert!(implicit_external_status_matches(&config, &status).unwrap());
+    }
+
+    #[test]
+    fn implicit_external_migration_rejects_a_managed_broker_on_the_same_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("external/endpoint-hash"));
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.10".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::Managed,
+            cdp_endpoint: format!(
+                "{}/json/version?fresh=1",
+                config.cdp_endpoint.as_ref().unwrap()
+            ),
+            ipc_endpoint: "managed-fallback".to_string(),
+            socket_path: tempdir.path().join("broker-v4.sock"),
+        };
+
+        let error = implicit_external_status_matches(&config, &status).unwrap_err();
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("managed endpoint collision should be a configuration conflict");
+        assert!(conflict.to_string().contains("second lease registry"));
+        assert!(conflict.to_string().contains("managed-fallback"));
     }
 
     #[tokio::test]
@@ -8911,7 +9683,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
 
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
 
         assert_eq!(legacy.socket_path, config.state_dir.join("broker-v3.sock"));
         assert_eq!(legacy.lock_path, config.state_dir.join("broker-v3.lock"));
@@ -8932,7 +9704,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
         let endpoint = broker_endpoint(&legacy).unwrap();
         let listener = endpoint.listen().unwrap();
 
@@ -8990,7 +9762,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
         let endpoint = broker_endpoint(&legacy).unwrap();
         let listener = endpoint.listen().unwrap();
 
@@ -9047,7 +9819,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
         let endpoint = broker_endpoint(&legacy).unwrap();
         let listener = endpoint.listen().unwrap();
         drop(listener);
@@ -9119,7 +9891,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
         let marker = format!(
             "visible-browser-lab-mcp broker --socket {} --state-dir {}",
             config.ipc_endpoint,
@@ -9168,7 +9940,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config = test_config(tempdir.path().join("state"));
         prepare_state(&config).await.unwrap();
-        let legacy = legacy_broker_config(&config);
+        let legacy = legacy_broker_config(&config).unwrap();
         fs::write(&legacy.pid_path, std::process::id().to_string()).unwrap();
 
         retire_legacy_broker(&config).await.unwrap();
@@ -10030,21 +10802,22 @@ mod tests {
             package_version: "0.4.0".to_string(),
             ..current.clone()
         };
-        let message = broker_status_mismatch(&config, &stale)
+        let mismatch = broker_status_mismatch(&config, &stale)
             .unwrap()
             .expect("older package version must be rejected");
-        assert!(message.contains("broker package version mismatch"));
-        assert!(message.contains("0.4.0"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Replace);
+        assert!(mismatch.message.contains("broker package version mismatch"));
+        assert!(mismatch.message.contains("0.4.0"));
 
         // Pre-0.4.3 brokers omit the field entirely; serde defaults it to "".
         let unversioned = BrokerStatus {
             package_version: String::new(),
             ..current
         };
-        let message = broker_status_mismatch(&config, &unversioned)
+        let mismatch = broker_status_mismatch(&config, &unversioned)
             .unwrap()
             .expect("unversioned broker must be rejected");
-        assert!(message.contains("pre-0.4.3 (unversioned)"));
+        assert!(mismatch.message.contains("pre-0.4.3 (unversioned)"));
     }
 
     #[test]
@@ -10066,16 +10839,40 @@ mod tests {
             socket_path: managed_config.socket_path.clone(),
         };
 
-        let message = broker_status_mismatch(&managed_config, &status)
+        let mismatch = broker_status_mismatch(&managed_config, &status)
             .unwrap()
             .expect("managed startup should reject an external broker");
-        assert!(message.contains("broker runtime mismatch"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("broker configuration conflict"));
+        assert!(mismatch.message.contains("left running"));
 
         assert!(
             broker_status_mismatch(&external_config, &status)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn runtime_ownership_conflict_takes_precedence_over_package_replacement() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.0".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        let mismatch = broker_status_mismatch(&config, &status)
+            .unwrap()
+            .expect("runtime modes should conflict");
+
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("left running"));
     }
 
     #[test]
@@ -10096,10 +10893,70 @@ mod tests {
             socket_path: config.socket_path.clone(),
         };
 
-        let message = broker_status_mismatch(&config, &status)
+        let mismatch = broker_status_mismatch(&config, &status)
             .unwrap()
             .expect("external startup should reject a different endpoint");
-        assert!(message.contains("broker CDP endpoint mismatch"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("broker configuration conflict"));
+        assert!(mismatch.message.contains("Reuse that CDP endpoint"));
+    }
+
+    #[test]
+    fn external_broker_status_canonicalizes_a_stored_cdp_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            tempdir.path().join("state"),
+        )
+        .unwrap();
+        let current = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222/json/version?legacy=1".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        assert!(broker_status_mismatch(&config, &current).unwrap().is_none());
+
+        let stale = BrokerStatus {
+            package_version: "0.4.0".to_string(),
+            ..current
+        };
+        let mismatch = broker_status_mismatch(&config, &stale)
+            .unwrap()
+            .expect("a same-origin old broker should advance to package replacement");
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Replace);
+        assert!(mismatch.message.contains("broker package version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn runtime_configuration_conflict_preserves_the_existing_broker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: u32::MAX,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+        let mismatch = broker_status_mismatch(&config, &status)
+            .unwrap()
+            .expect("runtime modes should conflict");
+
+        let error = reconcile_incompatible_broker(&config, &status, mismatch)
+            .await
+            .unwrap_err();
+
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("configuration mismatch should be a typed conflict");
+        assert!(conflict.to_string().contains("left running"));
     }
 
     #[tokio::test]

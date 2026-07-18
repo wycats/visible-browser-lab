@@ -30,6 +30,65 @@ fn identity_free_managed_call_requires_a_session_without_launching_chrome() -> R
     Ok(())
 }
 
+#[test]
+fn external_runtime_conflict_preserves_the_shared_managed_broker() -> Result<()> {
+    let state = tempfile::tempdir()?;
+    let missing_chrome = state.path().join("missing-chrome");
+    let mut managed =
+        McpClient::spawn_managed(&test_binary(), state.path(), &repo_root(), &missing_chrome)?;
+    managed.initialize("visible-browser-lab-managed-owner")?;
+    managed.call_tool(
+        "start_session",
+        json!({ "label": "managed-owner" }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let original_pid = std::fs::read_to_string(state.path().join("broker-v4.pid"))?;
+
+    let mut external = McpClient::spawn(
+        &test_binary(),
+        "http://127.0.0.1:65535",
+        state.path(),
+        &repo_root(),
+    )?;
+    external.initialize("visible-browser-lab-conflicting-external")?;
+    let conflict = external.call_tool(
+        "start_session",
+        json!({ "label": "conflicting-external" }),
+        Duration::from_secs(20),
+        true,
+    )?;
+
+    assert_eq!(
+        conflict.get("code").and_then(|value| value.as_str()),
+        Some("invalid_input"),
+        "runtime conflict returned an unexpected error: {conflict}"
+    );
+    assert!(
+        conflict
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.contains("existing broker was left running")),
+        "runtime conflict omitted the safe disposition: {conflict}"
+    );
+
+    managed.call_tool(
+        "start_session",
+        json!({ "label": "managed-owner-after-conflict" }),
+        Duration::from_secs(20),
+        false,
+    )?;
+    let retained_pid = std::fs::read_to_string(state.path().join("broker-v4.pid"))?;
+    assert_eq!(
+        retained_pid, original_pid,
+        "runtime conflict replaced the shared managed broker"
+    );
+
+    external.shutdown();
+    managed.shutdown();
+    Ok(())
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

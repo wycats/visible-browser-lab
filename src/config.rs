@@ -4,9 +4,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::conversation_identity::ConversationIdentityCompatibility;
+use crate::{
+    conversation_identity::ConversationIdentityCompatibility, protocol::BROKER_PROTOCOL_VERSION,
+};
 
 pub const DEFAULT_CDP_ORIGIN: &str = "http://127.0.0.1";
 pub const RELEASE_VERSION: &str = match option_env!("VISIBLE_BROWSER_LAB_RELEASE_VERSION") {
@@ -38,10 +41,20 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    #[arg(long, global = true, value_name = "URL")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        help = "Connect to an external Chrome CDP endpoint; without --state-dir, uses a stable endpoint-specific broker state directory"
+    )]
     pub cdp_endpoint: Option<String>,
 
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help = "Override broker state; a directory already used by another runtime or CDP endpoint is preserved and rejected"
+    )]
     pub state_dir: Option<PathBuf>,
 
     #[arg(
@@ -76,7 +89,12 @@ pub struct BrokerArgs {
 impl BrokerArgs {
     pub fn apply(self, mut config: RuntimeConfig) -> RuntimeConfig {
         if let Some(ipc_endpoint) = self.socket {
+            #[cfg(not(windows))]
+            {
+                config.socket_path = PathBuf::from(&ipc_endpoint);
+            }
             config.ipc_endpoint = ipc_endpoint;
+            config.implicit_external_socket_parent = None;
         }
         if let Some(secs) = self.idle_timeout_secs {
             config.idle_timeout = idle_timeout_from_secs(secs);
@@ -132,12 +150,16 @@ impl RuntimeOptions {
         )?;
 
         let env_state_dir = env::var_os(STATE_DIR_ENV).map(PathBuf::from);
+        let state_dir_is_explicit = self.state_dir.is_some() || env_state_dir.is_some();
         let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
         let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
         let idle_timeout = resolve_idle_timeout(env::var(BROKER_IDLE_TIMEOUT_ENV).ok().as_deref())?;
         let session_ttl = resolve_session_ttl(env::var(SESSION_TTL_ENV).ok().as_deref())?;
 
         let mut config = match cdp_endpoint {
+            Some(cdp_endpoint) if !state_dir_is_explicit => {
+                RuntimeConfig::implicit_external(cdp_endpoint, state_dir, chrome_path)?
+            }
             Some(cdp_endpoint) => {
                 RuntimeConfig::external_with_chrome(cdp_endpoint, state_dir, chrome_path)?
             }
@@ -176,6 +198,11 @@ pub struct RuntimeConfig {
     /// How long a session may go untouched before the expiry sweep releases
     /// its tabs and removes it. `None` disables expiry.
     pub session_ttl: Option<Duration>,
+    pub(crate) implicit_external_fallback_state_dir: Option<PathBuf>,
+    /// The private parent created for VBL's generated short Unix socket.
+    /// Custom `--socket` paths retain migration provenance but clear this
+    /// marker so their parent directory is never chmodded by VBL.
+    pub(crate) implicit_external_socket_parent: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -188,7 +215,7 @@ impl RuntimeConfig {
         state_dir: PathBuf,
         chrome_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let cdp_endpoint = normalize_cdp_endpoint(&cdp_endpoint)?;
+        let cdp_endpoint = canonical_cdp_endpoint(&cdp_endpoint)?;
         let chrome_profile_dir = state_dir.join("chrome-profile");
 
         Ok(Self {
@@ -206,6 +233,8 @@ impl RuntimeConfig {
             state_dir,
             idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
             session_ttl: Some(DEFAULT_SESSION_TTL),
+            implicit_external_fallback_state_dir: None,
+            implicit_external_socket_parent: None,
         })
     }
 
@@ -226,7 +255,76 @@ impl RuntimeConfig {
             state_dir,
             idle_timeout: Some(DEFAULT_BROKER_IDLE_TIMEOUT),
             session_ttl: Some(DEFAULT_SESSION_TTL),
+            implicit_external_fallback_state_dir: None,
+            implicit_external_socket_parent: None,
         }
+    }
+
+    pub(crate) fn implicit_external(
+        cdp_endpoint: String,
+        default_state_dir: PathBuf,
+        chrome_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let cdp_endpoint = canonical_cdp_endpoint(&cdp_endpoint)?;
+        let state_dir = external_state_dir(&default_state_dir, &cdp_endpoint);
+        let mut config = Self::external_with_chrome(cdp_endpoint, state_dir, chrome_path)?;
+        config.implicit_external_fallback_state_dir = Some(default_state_dir.clone());
+        config.ipc_endpoint =
+            implicit_external_ipc_endpoint(&default_state_dir, &config, BROKER_PROTOCOL_VERSION)?;
+        #[cfg(not(windows))]
+        {
+            config.socket_path = PathBuf::from(&config.ipc_endpoint);
+            config.implicit_external_socket_parent = config
+                .socket_path
+                .parent()
+                .map(std::path::Path::to_path_buf);
+        }
+        Ok(config)
+    }
+
+    pub(crate) fn implicit_external_ipc_endpoint_for_protocol(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Option<String>> {
+        let Some(default_state_dir) = self.implicit_external_fallback_state_dir.as_deref() else {
+            return Ok(None);
+        };
+        implicit_external_ipc_endpoint(default_state_dir, self, protocol_version).map(Some)
+    }
+
+    pub(crate) fn implicit_external_fallback_config(&self) -> Result<Option<Self>> {
+        // Transitional lookup for brokers created before implicit external
+        // endpoints received their own state namespace. The broker layer
+        // reuses only a matching protocol/runtime/endpoint and never moves or
+        // terminates the old registry while it may still own leases.
+        let Some(default_state_dir) = self.implicit_external_fallback_state_dir.as_deref() else {
+            return Ok(None);
+        };
+        self.implicit_external_fallback_config_for(default_state_dir)
+    }
+
+    fn implicit_external_fallback_config_for(
+        &self,
+        default_state_dir: &std::path::Path,
+    ) -> Result<Option<Self>> {
+        let Some(cdp_endpoint) = self.cdp_endpoint.as_deref() else {
+            return Ok(None);
+        };
+        if self.runtime_mode != RuntimeMode::External
+            || self.implicit_external_fallback_state_dir.as_deref() != Some(default_state_dir)
+            || self.state_dir != external_state_dir(default_state_dir, cdp_endpoint)
+        {
+            return Ok(None);
+        }
+
+        let mut fallback = Self::external_with_chrome(
+            cdp_endpoint.to_string(),
+            default_state_dir.to_path_buf(),
+            self.chrome_path.clone(),
+        )?;
+        fallback.idle_timeout = self.idle_timeout;
+        fallback.session_ttl = self.session_ttl;
+        Ok(Some(fallback))
     }
 }
 
@@ -274,15 +372,15 @@ pub fn resolve_cdp_endpoint(
     env_port: Option<&str>,
 ) -> Result<Option<String>> {
     if let Some(endpoint) = non_empty(cli_endpoint) {
-        return normalize_cdp_endpoint(endpoint).map(Some);
+        return canonical_cdp_endpoint(endpoint).map(Some);
     }
 
     if let Some(endpoint) = non_empty(env_endpoint) {
-        return normalize_cdp_endpoint(endpoint).map(Some);
+        return canonical_cdp_endpoint(endpoint).map(Some);
     }
 
     if let Some(port) = non_empty(env_port) {
-        return normalize_cdp_endpoint(&format!("{DEFAULT_CDP_ORIGIN}:{port}")).map(Some);
+        return canonical_cdp_endpoint(&format!("{DEFAULT_CDP_ORIGIN}:{port}")).map(Some);
     }
 
     Ok(None)
@@ -301,13 +399,59 @@ pub fn resolve_state_dir(
     Ok(base_dirs.cache_dir().join("visible-browser-lab"))
 }
 
-fn normalize_cdp_endpoint(endpoint: &str) -> Result<String> {
-    let trimmed = endpoint.trim().trim_end_matches('/');
+fn external_state_dir(default_state_dir: &std::path::Path, cdp_endpoint: &str) -> PathBuf {
+    let digest = format!("{:x}", Sha256::digest(cdp_endpoint.as_bytes()));
+    default_state_dir.join("external").join(&digest[..32])
+}
+
+fn implicit_external_ipc_endpoint(
+    default_state_dir: &std::path::Path,
+    config: &RuntimeConfig,
+    protocol_version: u32,
+) -> Result<String> {
+    #[cfg(windows)]
+    {
+        let _ = default_state_dir;
+        Ok(crate::ipc::endpoint_display_for_protocol(
+            &config.state_dir,
+            protocol_version,
+        ))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let endpoint = config
+            .cdp_endpoint
+            .as_deref()
+            .context("implicit external runtime omitted its CDP endpoint")?;
+        let user_digest = format!(
+            "{:x}",
+            Sha256::digest(default_state_dir.to_string_lossy().as_bytes())
+        );
+        let endpoint_digest = format!("{:x}", Sha256::digest(endpoint.as_bytes()));
+        Ok(format!(
+            "/tmp/vbl-{}/v{protocol_version}-{}.sock",
+            &user_digest[..16],
+            &endpoint_digest[..32]
+        ))
+    }
+}
+
+pub(crate) fn canonical_cdp_endpoint(endpoint: &str) -> Result<String> {
+    let trimmed = endpoint.trim();
     let parsed =
         Url::parse(trimmed).with_context(|| format!("invalid CDP endpoint `{endpoint}`"))?;
 
     match parsed.scheme() {
-        "http" => Ok(trimmed.to_string()),
+        "http" => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                bail!("CDP endpoint must not contain credentials");
+            }
+            if parsed.host_str().is_none() {
+                bail!("CDP endpoint must include a host");
+            }
+            Ok(parsed.origin().ascii_serialization())
+        }
         scheme => bail!("CDP endpoint must use http, not `{scheme}`"),
     }
 }
@@ -351,6 +495,19 @@ mod tests {
             resolve_cdp_endpoint(None, Some("http://127.0.0.1:9444/"), Some("9555")).unwrap();
 
         assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9444"));
+    }
+
+    #[test]
+    fn endpoint_paths_queries_and_fragments_share_one_canonical_origin() {
+        let root = resolve_cdp_endpoint(Some("http://127.0.0.1:9222"), None, None).unwrap();
+        let version = resolve_cdp_endpoint(
+            Some("http://127.0.0.1:9222/json/version?fresh=1#ignored"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(version, root);
     }
 
     #[test]
@@ -430,6 +587,135 @@ mod tests {
     }
 
     #[test]
+    fn implicit_external_runtime_uses_a_deterministic_isolated_state_dir() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let first = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222".to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+        let repeated = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222".to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+        let other = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9333".to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(first.state_dir, repeated.state_dir);
+        assert_eq!(first.ipc_endpoint, repeated.ipc_endpoint);
+        assert!(
+            first
+                .state_dir
+                .starts_with(default_state_dir.join("external"))
+        );
+        assert_eq!(
+            first
+                .state_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_ne!(first.state_dir, other.state_dir);
+        assert_ne!(first.ipc_endpoint, other.ipc_endpoint);
+        #[cfg(not(windows))]
+        {
+            assert!(first.ipc_endpoint.starts_with("/tmp/vbl-"));
+            assert!(first.ipc_endpoint.contains("/v4-"));
+            assert!(
+                first
+                    .implicit_external_ipc_endpoint_for_protocol(3)
+                    .unwrap()
+                    .unwrap()
+                    .contains("/v3-")
+            );
+            assert!(
+                first.ipc_endpoint.len() < derive_ipc_endpoint(&first.state_dir).len(),
+                "implicit external socket should be shorter than a socket nested under its state"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_external_runtime_hashes_the_canonical_cdp_origin() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let root = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222".to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+        let version = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222/json/version?fresh=1".to_string(),
+            default_state_dir,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(version.cdp_endpoint, root.cdp_endpoint);
+        assert_eq!(version.state_dir, root.state_dir);
+        assert_eq!(version.ipc_endpoint, root.ipc_endpoint);
+    }
+
+    #[test]
+    fn explicit_state_dir_wins_for_external_runtime() {
+        let explicit = PathBuf::from("/tmp/vbl-external");
+
+        let config =
+            RuntimeConfig::from_parts("http://127.0.0.1:9222".to_string(), explicit.clone())
+                .unwrap();
+
+        assert_eq!(config.state_dir, explicit);
+        assert!(config.implicit_external_fallback_state_dir.is_none());
+    }
+
+    #[test]
+    fn implicit_external_runtime_retains_the_previous_default_state_as_a_fallback() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let cdp_endpoint = "http://127.0.0.1:9222";
+        let config = RuntimeConfig::implicit_external(
+            cdp_endpoint.to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+
+        let fallback = config
+            .implicit_external_fallback_config_for(&default_state_dir)
+            .unwrap()
+            .expect("implicit external config should retain its prior state location");
+
+        assert_eq!(fallback.state_dir, default_state_dir);
+        assert_eq!(fallback.runtime_mode, RuntimeMode::External);
+        assert_eq!(fallback.cdp_endpoint, config.cdp_endpoint);
+    }
+
+    #[test]
+    fn explicit_external_state_has_no_implicit_fallback() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            PathBuf::from("/tmp/vbl-external"),
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .implicit_external_fallback_config_for(&default_state_dir)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn global_options_parse_after_broker_subcommand() {
         let cli = Cli::try_parse_from([
             "visible-browser-lab-mcp",
@@ -451,6 +737,39 @@ mod tests {
         };
 
         assert_eq!(args.socket.as_deref(), Some("/tmp/lab.sock"));
+        let applied = args.apply(
+            RuntimeConfig::from_parts(
+                "http://127.0.0.1:9333".to_string(),
+                PathBuf::from("/tmp/lab"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(applied.ipc_endpoint, "/tmp/lab.sock");
+        #[cfg(not(windows))]
+        assert_eq!(applied.socket_path, PathBuf::from("/tmp/lab.sock"));
+    }
+
+    #[test]
+    fn custom_socket_keeps_migration_provenance_without_generated_socket_hardening() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let config = RuntimeConfig::implicit_external(
+            "http://127.0.0.1:9222".to_string(),
+            default_state_dir.clone(),
+            None,
+        )
+        .unwrap();
+        let applied = BrokerArgs {
+            socket: Some("/tmp/lab.sock".to_string()),
+            idle_timeout_secs: None,
+            session_ttl_secs: None,
+        }
+        .apply(config);
+
+        assert_eq!(
+            applied.implicit_external_fallback_state_dir.as_deref(),
+            Some(default_state_dir.as_path())
+        );
+        assert!(applied.implicit_external_socket_parent.is_none());
     }
 
     #[test]
