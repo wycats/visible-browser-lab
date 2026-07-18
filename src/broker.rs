@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -7776,6 +7776,20 @@ pub enum StaleEndpointCleanup {
 
 struct BrokerStartLock {
     _file: File,
+    lock_path: PathBuf,
+}
+
+static IN_PROCESS_BROKER_START_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn in_process_broker_start_locks() -> &'static Mutex<HashSet<PathBuf>> {
+    IN_PROCESS_BROKER_START_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn release_in_process_broker_start_lock(lock_path: &Path) {
+    in_process_broker_start_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(lock_path);
 }
 
 impl BrokerStartLock {
@@ -7788,10 +7802,26 @@ impl BrokerStartLock {
             .open(lock_path)
             .with_context(|| format!("failed to open broker lock `{}`", lock_path.display()))?;
 
+        {
+            let mut active = in_process_broker_start_locks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !active.insert(lock_path.to_path_buf()) {
+                return Ok(None);
+            }
+        }
+
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+            Ok(()) => Ok(Some(Self {
+                _file: file,
+                lock_path: lock_path.to_path_buf(),
+            })),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                release_in_process_broker_start_lock(lock_path);
+                Ok(None)
+            }
             Err(error) => {
+                release_in_process_broker_start_lock(lock_path);
                 Err(error).with_context(|| format!("failed to lock `{}`", lock_path.display()))
             }
         }
@@ -7801,6 +7831,7 @@ impl BrokerStartLock {
 impl Drop for BrokerStartLock {
     fn drop(&mut self) {
         let _ = self._file.unlock();
+        release_in_process_broker_start_lock(&self.lock_path);
     }
 }
 
