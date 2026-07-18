@@ -2148,8 +2148,8 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
         if let Some(_lock) = BrokerStartLock::try_acquire(&config.lock_path)? {
             match probe_broker(config).await {
                 Ok(BrokerProbe::Compatible(client)) => return Ok(client),
-                Ok(BrokerProbe::Incompatible { status, message }) => {
-                    restart_incompatible_broker(config, &status, &message).await?;
+                Ok(BrokerProbe::Incompatible { status, mismatch }) => {
+                    reconcile_incompatible_broker(config, &status, mismatch).await?;
                 }
                 Err(_) => {}
             }
@@ -2418,7 +2418,7 @@ pub fn cleanup_stale_endpoint(config: &RuntimeConfig) -> Result<StaleEndpointCle
 async fn connect_and_ping(config: &RuntimeConfig) -> Result<BrokerClient> {
     match probe_broker(config).await? {
         BrokerProbe::Compatible(client) => Ok(client),
-        BrokerProbe::Incompatible { message, .. } => bail!("{message}"),
+        BrokerProbe::Incompatible { mismatch, .. } => bail!(mismatch.message),
     }
 }
 
@@ -2426,43 +2426,54 @@ enum BrokerProbe {
     Compatible(BrokerClient),
     Incompatible {
         status: BrokerStatus,
-        message: String,
+        mismatch: BrokerMismatch,
     },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerMismatchDisposition {
+    Replace,
+    Preserve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrokerMismatch {
+    message: String,
+    disposition: BrokerMismatchDisposition,
+}
+
+#[derive(Debug)]
+pub struct BrokerConfigurationConflict {
+    message: String,
+}
+
+impl std::fmt::Display for BrokerConfigurationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BrokerConfigurationConflict {}
 
 async fn probe_broker(config: &RuntimeConfig) -> Result<BrokerProbe> {
     let endpoint = broker_endpoint(config)?;
     let mut client = BrokerClient::connect(&endpoint).await?;
     let status = client.ping().await?;
-    if let Some(message) = broker_status_mismatch(config, &status)? {
-        return Ok(BrokerProbe::Incompatible { status, message });
+    if let Some(mismatch) = broker_status_mismatch(config, &status)? {
+        return Ok(BrokerProbe::Incompatible { status, mismatch });
     }
     Ok(BrokerProbe::Compatible(client))
 }
 
-fn broker_status_mismatch(config: &RuntimeConfig, status: &BrokerStatus) -> Result<Option<String>> {
-    if status.protocol_version != BROKER_PROTOCOL_VERSION {
-        return Ok(Some(format!(
-            "broker protocol mismatch: expected {}, got {}",
-            BROKER_PROTOCOL_VERSION, status.protocol_version
-        )));
-    }
-    if status.package_version != env!("CARGO_PKG_VERSION") {
-        return Ok(Some(format!(
-            "broker package version mismatch: expected {}, got {}",
-            env!("CARGO_PKG_VERSION"),
-            if status.package_version.is_empty() {
-                "pre-0.4.3 (unversioned)"
-            } else {
-                &status.package_version
-            }
-        )));
-    }
+fn broker_status_mismatch(
+    config: &RuntimeConfig,
+    status: &BrokerStatus,
+) -> Result<Option<BrokerMismatch>> {
     if status.runtime_mode != config.runtime_mode {
-        return Ok(Some(format!(
-            "broker runtime mismatch: requested {:?}, existing broker is {:?} at {}",
-            config.runtime_mode, status.runtime_mode, status.ipc_endpoint
-        )));
+        return Ok(Some(BrokerMismatch {
+            message: runtime_mode_conflict_message(config, status),
+            disposition: BrokerMismatchDisposition::Preserve,
+        }));
     }
     if config.runtime_mode == RuntimeMode::External {
         let expected = config
@@ -2470,13 +2481,74 @@ fn broker_status_mismatch(config: &RuntimeConfig, status: &BrokerStatus) -> Resu
             .as_deref()
             .context("external runtime omitted its CDP endpoint")?;
         if status.cdp_endpoint != expected {
-            return Ok(Some(format!(
-                "broker CDP endpoint mismatch: requested {expected}, existing broker uses {} at {}",
-                status.cdp_endpoint, status.ipc_endpoint
-            )));
+            return Ok(Some(BrokerMismatch {
+                message: format!(
+                    "broker configuration conflict: state directory `{}` already hosts an external broker for {}. Reuse that CDP endpoint, or pass a separate `--state-dir` for {expected}. The existing broker was left running.",
+                    config.state_dir.display(),
+                    status.cdp_endpoint,
+                ),
+                disposition: BrokerMismatchDisposition::Preserve,
+            }));
         }
     }
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        return Ok(Some(BrokerMismatch {
+            message: format!(
+                "broker protocol mismatch: expected {}, got {}",
+                BROKER_PROTOCOL_VERSION, status.protocol_version
+            ),
+            disposition: BrokerMismatchDisposition::Replace,
+        }));
+    }
+    if status.package_version != env!("CARGO_PKG_VERSION") {
+        return Ok(Some(BrokerMismatch {
+            message: format!(
+                "broker package version mismatch: expected {}, got {}",
+                env!("CARGO_PKG_VERSION"),
+                if status.package_version.is_empty() {
+                    "pre-0.4.3 (unversioned)"
+                } else {
+                    &status.package_version
+                }
+            ),
+            disposition: BrokerMismatchDisposition::Replace,
+        }));
+    }
     Ok(None)
+}
+
+fn runtime_mode_conflict_message(config: &RuntimeConfig, status: &BrokerStatus) -> String {
+    let recovery = match (config.runtime_mode, status.runtime_mode) {
+        (RuntimeMode::External, RuntimeMode::Managed) => {
+            "Omit `--cdp-endpoint` to use the existing managed broker, or pass a separate `--state-dir` for the external endpoint."
+        }
+        (RuntimeMode::Managed, RuntimeMode::External) => {
+            "Restore the existing external CDP configuration, or pass a separate `--state-dir` for managed Chrome."
+        }
+        _ => "Pass a separate `--state-dir` for the requested runtime.",
+    };
+    format!(
+        "broker configuration conflict: state directory `{}` already hosts a {:?} broker, but this invocation requested {:?}. {recovery} The existing broker was left running.",
+        config.state_dir.display(),
+        status.runtime_mode,
+        config.runtime_mode,
+    )
+}
+
+async fn reconcile_incompatible_broker(
+    config: &RuntimeConfig,
+    status: &BrokerStatus,
+    mismatch: BrokerMismatch,
+) -> Result<()> {
+    match mismatch.disposition {
+        BrokerMismatchDisposition::Replace => {
+            restart_incompatible_broker(config, status, &mismatch.message).await
+        }
+        BrokerMismatchDisposition::Preserve => Err(BrokerConfigurationConflict {
+            message: mismatch.message,
+        }
+        .into()),
+    }
 }
 
 async fn restart_incompatible_broker(
@@ -10030,21 +10102,22 @@ mod tests {
             package_version: "0.4.0".to_string(),
             ..current.clone()
         };
-        let message = broker_status_mismatch(&config, &stale)
+        let mismatch = broker_status_mismatch(&config, &stale)
             .unwrap()
             .expect("older package version must be rejected");
-        assert!(message.contains("broker package version mismatch"));
-        assert!(message.contains("0.4.0"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Replace);
+        assert!(mismatch.message.contains("broker package version mismatch"));
+        assert!(mismatch.message.contains("0.4.0"));
 
         // Pre-0.4.3 brokers omit the field entirely; serde defaults it to "".
         let unversioned = BrokerStatus {
             package_version: String::new(),
             ..current
         };
-        let message = broker_status_mismatch(&config, &unversioned)
+        let mismatch = broker_status_mismatch(&config, &unversioned)
             .unwrap()
             .expect("unversioned broker must be rejected");
-        assert!(message.contains("pre-0.4.3 (unversioned)"));
+        assert!(mismatch.message.contains("pre-0.4.3 (unversioned)"));
     }
 
     #[test]
@@ -10066,16 +10139,40 @@ mod tests {
             socket_path: managed_config.socket_path.clone(),
         };
 
-        let message = broker_status_mismatch(&managed_config, &status)
+        let mismatch = broker_status_mismatch(&managed_config, &status)
             .unwrap()
             .expect("managed startup should reject an external broker");
-        assert!(message.contains("broker runtime mismatch"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("broker configuration conflict"));
+        assert!(mismatch.message.contains("left running"));
 
         assert!(
             broker_status_mismatch(&external_config, &status)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn runtime_ownership_conflict_takes_precedence_over_package_replacement() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.0".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+
+        let mismatch = broker_status_mismatch(&config, &status)
+            .unwrap()
+            .expect("runtime modes should conflict");
+
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("left running"));
     }
 
     #[test]
@@ -10096,10 +10193,39 @@ mod tests {
             socket_path: config.socket_path.clone(),
         };
 
-        let message = broker_status_mismatch(&config, &status)
+        let mismatch = broker_status_mismatch(&config, &status)
             .unwrap()
             .expect("external startup should reject a different endpoint");
-        assert!(message.contains("broker CDP endpoint mismatch"));
+        assert_eq!(mismatch.disposition, BrokerMismatchDisposition::Preserve);
+        assert!(mismatch.message.contains("broker configuration conflict"));
+        assert!(mismatch.message.contains("Reuse that CDP endpoint"));
+    }
+
+    #[tokio::test]
+    async fn runtime_configuration_conflict_preserves_the_existing_broker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig::managed(tempdir.path().join("state"), None);
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: u32::MAX,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: "http://127.0.0.1:9222".to_string(),
+            ipc_endpoint: config.ipc_endpoint.clone(),
+            socket_path: config.socket_path.clone(),
+        };
+        let mismatch = broker_status_mismatch(&config, &status)
+            .unwrap()
+            .expect("runtime modes should conflict");
+
+        let error = reconcile_incompatible_broker(&config, &status, mismatch)
+            .await
+            .unwrap_err();
+
+        let conflict = error
+            .downcast_ref::<BrokerConfigurationConflict>()
+            .expect("configuration mismatch should be a typed conflict");
+        assert!(conflict.to_string().contains("left running"));
     }
 
     #[tokio::test]

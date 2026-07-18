@@ -171,9 +171,14 @@ impl VisibleBrowserLabSurface {
         let mut client = broker::ensure_running(&self.config)
             .await
             .map_err(|error| {
-                BrowserToolError::chrome_unavailable(format!(
-                    "visible-browser-lab broker is unavailable: {error}"
-                ))
+                if let Some(conflict) = error.downcast_ref::<broker::BrokerConfigurationConflict>()
+                {
+                    BrowserToolError::invalid_input(conflict.to_string())
+                } else {
+                    BrowserToolError::chrome_unavailable(format!(
+                        "visible-browser-lab broker is unavailable: {error}"
+                    ))
+                }
             })?;
 
         client

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::conversation_identity::ConversationIdentityCompatibility;
@@ -38,10 +39,20 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    #[arg(long, global = true, value_name = "URL")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        help = "Connect to an external Chrome CDP endpoint; without --state-dir, uses a stable endpoint-specific broker state directory"
+    )]
     pub cdp_endpoint: Option<String>,
 
-    #[arg(long, global = true, value_name = "DIR")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help = "Override broker state; a directory already used by another runtime or CDP endpoint is preserved and rejected"
+    )]
     pub state_dir: Option<PathBuf>,
 
     #[arg(
@@ -132,7 +143,8 @@ impl RuntimeOptions {
         )?;
 
         let env_state_dir = env::var_os(STATE_DIR_ENV).map(PathBuf::from);
-        let state_dir = resolve_state_dir(self.state_dir, env_state_dir)?;
+        let state_dir =
+            resolve_runtime_state_dir(self.state_dir, env_state_dir, cdp_endpoint.as_deref())?;
         let chrome_path = env::var_os(CHROME_PATH_ENV).map(PathBuf::from);
         let idle_timeout = resolve_idle_timeout(env::var(BROKER_IDLE_TIMEOUT_ENV).ok().as_deref())?;
         let session_ttl = resolve_session_ttl(env::var(SESSION_TTL_ENV).ok().as_deref())?;
@@ -301,6 +313,27 @@ pub fn resolve_state_dir(
     Ok(base_dirs.cache_dir().join("visible-browser-lab"))
 }
 
+fn resolve_runtime_state_dir(
+    cli_state_dir: Option<PathBuf>,
+    env_state_dir: Option<PathBuf>,
+    cdp_endpoint: Option<&str>,
+) -> Result<PathBuf> {
+    let state_dir_is_explicit = cli_state_dir.is_some() || env_state_dir.is_some();
+    let default_state_dir = resolve_state_dir(cli_state_dir, env_state_dir)?;
+    if state_dir_is_explicit {
+        return Ok(default_state_dir);
+    }
+
+    Ok(cdp_endpoint.map_or(default_state_dir.clone(), |endpoint| {
+        external_state_dir(&default_state_dir, endpoint)
+    }))
+}
+
+fn external_state_dir(default_state_dir: &std::path::Path, cdp_endpoint: &str) -> PathBuf {
+    let digest = format!("{:x}", Sha256::digest(cdp_endpoint.as_bytes()));
+    default_state_dir.join("external").join(&digest[..16])
+}
+
 fn normalize_cdp_endpoint(endpoint: &str) -> Result<String> {
     let trimmed = endpoint.trim().trim_end_matches('/');
     let parsed =
@@ -426,6 +459,30 @@ mod tests {
                 .unwrap()
                 .cache_dir()
                 .join("visible-browser-lab")
+        );
+    }
+
+    #[test]
+    fn implicit_external_runtime_uses_a_deterministic_isolated_state_dir() {
+        let default_state_dir = resolve_state_dir(None, None).unwrap();
+        let first = resolve_runtime_state_dir(None, None, Some("http://127.0.0.1:9222")).unwrap();
+        let repeated =
+            resolve_runtime_state_dir(None, None, Some("http://127.0.0.1:9222")).unwrap();
+        let other = resolve_runtime_state_dir(None, None, Some("http://127.0.0.1:9333")).unwrap();
+
+        assert_eq!(first, repeated);
+        assert!(first.starts_with(default_state_dir.join("external")));
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn explicit_state_dir_wins_for_external_runtime() {
+        let explicit = PathBuf::from("/tmp/vbl-external");
+
+        assert_eq!(
+            resolve_runtime_state_dir(Some(explicit.clone()), None, Some("http://127.0.0.1:9222"),)
+                .unwrap(),
+            explicit
         );
     }
 
