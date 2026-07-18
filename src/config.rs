@@ -240,6 +240,38 @@ impl RuntimeConfig {
             session_ttl: Some(DEFAULT_SESSION_TTL),
         }
     }
+
+    pub(crate) fn implicit_external_fallback_config(&self) -> Result<Option<Self>> {
+        // Transitional lookup for brokers created before implicit external
+        // endpoints received their own state namespace. The broker layer
+        // reuses only a matching protocol/runtime/endpoint and never moves or
+        // terminates the old registry while it may still own leases.
+        let default_state_dir = resolve_state_dir(None, None)?;
+        self.implicit_external_fallback_config_for(&default_state_dir)
+    }
+
+    fn implicit_external_fallback_config_for(
+        &self,
+        default_state_dir: &std::path::Path,
+    ) -> Result<Option<Self>> {
+        let Some(cdp_endpoint) = self.cdp_endpoint.as_deref() else {
+            return Ok(None);
+        };
+        if self.runtime_mode != RuntimeMode::External
+            || self.state_dir != external_state_dir(default_state_dir, cdp_endpoint)
+        {
+            return Ok(None);
+        }
+
+        let mut fallback = Self::external_with_chrome(
+            cdp_endpoint.to_string(),
+            default_state_dir.to_path_buf(),
+            self.chrome_path.clone(),
+        )?;
+        fallback.idle_timeout = self.idle_timeout;
+        fallback.session_ttl = self.session_ttl;
+        Ok(Some(fallback))
+    }
 }
 
 /// Resolve the idle window from the environment. Zero disables idle exit,
@@ -483,6 +515,43 @@ mod tests {
             resolve_runtime_state_dir(Some(explicit.clone()), None, Some("http://127.0.0.1:9222"),)
                 .unwrap(),
             explicit
+        );
+    }
+
+    #[test]
+    fn implicit_external_runtime_retains_the_previous_default_state_as_a_fallback() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let cdp_endpoint = "http://127.0.0.1:9222";
+        let config = RuntimeConfig::from_parts(
+            cdp_endpoint.to_string(),
+            external_state_dir(&default_state_dir, cdp_endpoint),
+        )
+        .unwrap();
+
+        let fallback = config
+            .implicit_external_fallback_config_for(&default_state_dir)
+            .unwrap()
+            .expect("implicit external config should retain its prior state location");
+
+        assert_eq!(fallback.state_dir, default_state_dir);
+        assert_eq!(fallback.runtime_mode, RuntimeMode::External);
+        assert_eq!(fallback.cdp_endpoint, config.cdp_endpoint);
+    }
+
+    #[test]
+    fn explicit_external_state_has_no_implicit_fallback() {
+        let default_state_dir = PathBuf::from("/cache/visible-browser-lab");
+        let config = RuntimeConfig::from_parts(
+            "http://127.0.0.1:9222".to_string(),
+            PathBuf::from("/tmp/vbl-external"),
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .implicit_external_fallback_config_for(&default_state_dir)
+                .unwrap()
+                .is_none()
         );
     }
 

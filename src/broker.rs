@@ -2135,6 +2135,10 @@ pub async fn run(config: RuntimeConfig) -> Result<()> {
 }
 
 pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
+    if let Some(client) = connect_implicit_external_fallback(config).await? {
+        return Ok(client);
+    }
+
     prepare_state(config).await?;
     retire_legacy_broker(config).await?;
 
@@ -2172,6 +2176,120 @@ pub async fn ensure_running(config: &RuntimeConfig) -> Result<BrokerClient> {
 
         sleep(BROKER_CONNECT_RETRY).await;
     }
+}
+
+async fn connect_implicit_external_fallback(
+    config: &RuntimeConfig,
+) -> Result<Option<BrokerClient>> {
+    let Some(fallback) = config.implicit_external_fallback_config()? else {
+        return Ok(None);
+    };
+    if let Some(client) = connect_matching_implicit_external_broker(config, &fallback).await? {
+        return Ok(Some(client));
+    }
+
+    let legacy = legacy_broker_config(&fallback);
+    if let Some(client) = connect_broker_if_present(&legacy).await? {
+        let (_, status) = ping_preserved_fallback(client, &fallback).await?;
+        if implicit_external_status_matches(config, &status)? {
+            return Err(implicit_external_protocol_conflict(&fallback, &status).into());
+        }
+    }
+
+    Ok(None)
+}
+
+async fn connect_matching_implicit_external_broker(
+    config: &RuntimeConfig,
+    fallback: &RuntimeConfig,
+) -> Result<Option<BrokerClient>> {
+    let Some(client) = connect_broker_if_present(fallback).await? else {
+        return Ok(None);
+    };
+    let (client, status) = ping_preserved_fallback(client, fallback).await?;
+    if !implicit_external_status_matches(config, &status)? {
+        return Ok(None);
+    }
+    if status.protocol_version != BROKER_PROTOCOL_VERSION {
+        return Err(implicit_external_protocol_conflict(fallback, &status).into());
+    }
+
+    tracing::info!(
+        pid = status.pid,
+        package_version = %status.package_version,
+        cdp_endpoint = %status.cdp_endpoint,
+        state_dir = %fallback.state_dir.display(),
+        "reusing pre-isolation implicit external broker"
+    );
+    Ok(Some(client))
+}
+
+async fn ping_preserved_fallback(
+    mut client: BrokerClient,
+    fallback: &RuntimeConfig,
+) -> Result<(BrokerClient, BrokerStatus)> {
+    match tokio::time::timeout(Duration::from_secs(1), client.ping()).await {
+        Ok(Ok(status)) => Ok((client, status)),
+        Ok(Err(error)) => Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous implicit external broker at `{}` accepted a connection but its health probe failed: {error}. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                fallback.ipc_endpoint,
+            ),
+        }
+        .into()),
+        Err(_) => Err(BrokerConfigurationConflict {
+            message: format!(
+                "broker migration blocked: the previous implicit external broker at `{}` accepted a connection but did not answer its health probe within one second. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                fallback.ipc_endpoint,
+            ),
+        }
+        .into()),
+    }
+}
+
+fn implicit_external_protocol_conflict(
+    fallback: &RuntimeConfig,
+    status: &BrokerStatus,
+) -> BrokerConfigurationConflict {
+    BrokerConfigurationConflict {
+        message: format!(
+            "broker migration required: the previous implicit external state directory `{}` still hosts protocol v{} for {}. It was left running to preserve its leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry; the endpoint-specific broker was not started.",
+            fallback.state_dir.display(),
+            status.protocol_version,
+            status.cdp_endpoint,
+        ),
+    }
+}
+
+async fn connect_broker_if_present(config: &RuntimeConfig) -> Result<Option<BrokerClient>> {
+    let endpoint = broker_endpoint(config)?;
+    match BrokerClient::connect(&endpoint).await {
+        Ok(client) => Ok(Some(client)),
+        Err(error) => {
+            if let Some(pid) = read_pid(&config.pid_path)?
+                && process_is_running(pid)
+                && process_looks_like_broker_for_state(pid, &config.state_dir)
+            {
+                return Err(BrokerConfigurationConflict {
+                    message: format!(
+                        "broker migration blocked: the previous implicit external broker pid {pid} still owns state directory `{}`, but its endpoint `{}` is unreachable: {error}. It was left running to preserve any leases. Let its existing sessions finish and the broker exit, or stop it deliberately after confirming those sessions are no longer needed, then retry.",
+                        config.state_dir.display(),
+                        config.ipc_endpoint,
+                    ),
+                }
+                .into());
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn implicit_external_status_matches(config: &RuntimeConfig, status: &BrokerStatus) -> Result<bool> {
+    let expected = config
+        .cdp_endpoint
+        .as_deref()
+        .context("implicit external runtime omitted its CDP endpoint")?;
+    Ok(status.runtime_mode == RuntimeMode::External && status.cdp_endpoint == expected)
 }
 
 fn legacy_broker_config(config: &RuntimeConfig) -> RuntimeConfig {
@@ -7736,6 +7854,73 @@ mod tests {
         assert_eq!(status.ipc_endpoint, config.ipc_endpoint);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn implicit_external_migration_reuses_the_existing_broker_and_leases() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let fallback = test_config(tempdir.path().join("default-state"));
+        prepare_state(&fallback).await.unwrap();
+        let endpoint = broker_endpoint(&fallback).unwrap();
+        let listener = endpoint.listen().unwrap();
+        let server = tokio::spawn(serve(
+            fallback.clone(),
+            listener,
+            None,
+            TENANCY_TICK_INTERVAL,
+        ));
+
+        let mut original = BrokerClient::connect(&endpoint).await.unwrap();
+        let session: StartSessionResult = original
+            .request(
+                "start_session",
+                StartSessionParams {
+                    label: Some("pre-isolation".to_string()),
+                    start_url: None,
+                    focus: false,
+                    workspace_root: None,
+                },
+            )
+            .await
+            .unwrap();
+        let isolated = test_config(tempdir.path().join("external/endpoint-hash"));
+
+        let mut migrated = connect_matching_implicit_external_broker(&isolated, &fallback)
+            .await
+            .unwrap()
+            .expect("matching pre-isolation broker should be reused");
+        let artifacts = migrated
+            .request_response(
+                "artifacts",
+                DomainParams {
+                    agent_session_id: session.agent_session_id,
+                    tab_id: None,
+                    operation: "list".to_string(),
+                    arguments: serde_json::Map::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(artifacts.ok, "migrated client lost the existing session");
+        server.abort();
+    }
+
+    #[test]
+    fn implicit_external_migration_accepts_a_matching_older_package() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = test_config(tempdir.path().join("external/endpoint-hash"));
+        let status = BrokerStatus {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            package_version: "0.4.10".to_string(),
+            pid: 123,
+            runtime_mode: RuntimeMode::External,
+            cdp_endpoint: config.cdp_endpoint.clone().unwrap(),
+            ipc_endpoint: tempdir.path().join("broker-v4.sock").display().to_string(),
+            socket_path: tempdir.path().join("broker-v4.sock"),
+        };
+
+        assert!(implicit_external_status_matches(&config, &status).unwrap());
     }
 
     #[tokio::test]
