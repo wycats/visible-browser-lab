@@ -357,6 +357,20 @@ mod tests {
         assert!(error.to_string().contains("DevToolsActivePort"));
     }
 
+    #[test]
+    fn devtools_wait_rechecks_browser_exit_at_the_deadline() {
+        let profile = tempfile::tempdir().expect("temporary browser profile");
+        let mut checks = 0;
+        let error = wait_for_devtools_endpoint_with(profile.path(), Duration::ZERO, || {
+            checks += 1;
+            Ok(Some("exit code: 9".to_string()))
+        })
+        .expect_err("the deadline check must report an exited browser");
+
+        assert_eq!(checks, 1);
+        assert!(error.to_string().contains("exited with exit code: 9"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn chrome_for_testing_uses_mock_keychain_on_macos() {
@@ -550,12 +564,7 @@ fn wait_for_devtools_endpoint_with(
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
     while Instant::now() < deadline {
-        if let Some(status) = exited()? {
-            bail!(
-                "Chrome for Testing exited with {status} before `{}` became available",
-                active_port.display()
-            );
-        }
+        require_browser_running(&active_port, &mut exited)?;
         match fs::read_to_string(&active_port) {
             Ok(contents) => {
                 let parsed = contents
@@ -576,21 +585,35 @@ fn wait_for_devtools_endpoint_with(
         }
         thread::sleep(REAL_BROWSER_START_POLL);
     }
+    require_browser_running(&active_port, &mut exited)?;
 
     match last_error {
         Some(error) => Err(error).with_context(|| {
             format!(
-                "timed out after {} seconds waiting for `{}` while Chrome for Testing remained running",
+                "timed out after {} seconds waiting for `{}` without observing Chrome for Testing exit",
                 timeout.as_secs_f64(),
                 active_port.display()
             )
         }),
         None => bail!(
-            "timed out after {} seconds waiting for `{}` while Chrome for Testing remained running",
+            "timed out after {} seconds waiting for `{}` without observing Chrome for Testing exit",
             timeout.as_secs_f64(),
             active_port.display()
         ),
     }
+}
+
+fn require_browser_running(
+    active_port: &Path,
+    exited: &mut impl FnMut() -> Result<Option<String>>,
+) -> Result<()> {
+    if let Some(status) = exited()? {
+        bail!(
+            "Chrome for Testing exited with {status} before `{}` became available",
+            active_port.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn run_live_smoke(
