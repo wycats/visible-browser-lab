@@ -31,6 +31,8 @@ pub const TEST_CHROME_PATH_ENV: &str = "VISIBLE_BROWSER_LAB_TEST_CHROME_PATH";
 static REAL_BROWSER_IN_USE: AtomicBool = AtomicBool::new(false);
 const FIXTURE_CONNECTION_POLL: Duration = Duration::from_millis(100);
 const FIXTURE_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REAL_BROWSER_START_TIMEOUT: Duration = Duration::from_secs(60);
+const REAL_BROWSER_START_POLL: Duration = Duration::from_millis(100);
 
 struct RealBrowserPermit;
 
@@ -79,7 +81,7 @@ pub struct RealBrowser {
     _exclusive: RealBrowserPermit,
     child: Child,
     profile_dir: TempDir,
-    cdp_endpoint: String,
+    cdp_endpoint: Option<String>,
 }
 
 impl RealBrowser {
@@ -108,18 +110,35 @@ impl RealBrowser {
                 chrome_executable.display()
             )
         })?;
-        let cdp_endpoint = wait_for_devtools_endpoint(profile_dir.path())?;
-
-        Ok(Self {
+        // Establish ownership before the readiness wait so every error path
+        // runs `Drop` and terminates the browser before its temporary profile
+        // is removed.
+        let mut browser = Self {
             _exclusive: exclusive,
             child,
             profile_dir,
-            cdp_endpoint,
-        })
+            cdp_endpoint: None,
+        };
+        let cdp_endpoint = wait_for_devtools_endpoint(
+            browser.profile_dir.path(),
+            &mut browser.child,
+            REAL_BROWSER_START_TIMEOUT,
+        )
+        .with_context(|| {
+            format!(
+                "Chrome for Testing `{}` failed to start with profile `{}`",
+                chrome_executable.display(),
+                browser.profile_dir.path().display()
+            )
+        })?;
+        browser.cdp_endpoint = Some(cdp_endpoint);
+        Ok(browser)
     }
 
     pub fn cdp_endpoint(&self) -> &str {
-        &self.cdp_endpoint
+        self.cdp_endpoint
+            .as_deref()
+            .expect("a constructed real browser has a CDP endpoint")
     }
 
     pub fn profile_dir(&self) -> &Path {
@@ -300,6 +319,58 @@ mod tests {
         assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
     }
 
+    #[test]
+    fn real_browser_start_budget_covers_slow_ci_launches() {
+        assert!(
+            REAL_BROWSER_START_TIMEOUT >= Duration::from_secs(45),
+            "real-browser fixtures need headroom above the observed 26-second Windows launch"
+        );
+    }
+
+    #[test]
+    fn devtools_wait_accepts_a_delayed_active_port() {
+        let profile = tempfile::tempdir().expect("temporary browser profile");
+        let active_port = profile.path().join("DevToolsActivePort");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            fs::write(active_port, "49321\n/devtools/browser/test\n")
+                .expect("write delayed DevToolsActivePort");
+        });
+
+        let endpoint =
+            wait_for_devtools_endpoint_with(profile.path(), Duration::from_secs(2), || Ok(None))
+                .expect("delayed DevToolsActivePort is accepted");
+        writer.join().expect("active-port writer exits");
+
+        assert_eq!(endpoint, "http://127.0.0.1:49321");
+    }
+
+    #[test]
+    fn devtools_wait_reports_an_early_browser_exit() {
+        let profile = tempfile::tempdir().expect("temporary browser profile");
+        let error = wait_for_devtools_endpoint_with(profile.path(), Duration::from_secs(2), || {
+            Ok(Some("exit code: 7".to_string()))
+        })
+        .expect_err("an exited browser cannot become ready");
+
+        assert!(error.to_string().contains("exited with exit code: 7"));
+        assert!(error.to_string().contains("DevToolsActivePort"));
+    }
+
+    #[test]
+    fn devtools_wait_rechecks_browser_exit_at_the_deadline() {
+        let profile = tempfile::tempdir().expect("temporary browser profile");
+        let mut checks = 0;
+        let error = wait_for_devtools_endpoint_with(profile.path(), Duration::ZERO, || {
+            checks += 1;
+            Ok(Some("exit code: 9".to_string()))
+        })
+        .expect_err("the deadline check must report an exited browser");
+
+        assert_eq!(checks, 1);
+        assert!(error.to_string().contains("exited with exit code: 9"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn chrome_for_testing_uses_mock_keychain_on_macos() {
@@ -471,11 +542,29 @@ fn chrome_for_testing_cache_dir() -> PathBuf {
         .join("chrome-for-testing")
 }
 
-fn wait_for_devtools_endpoint(profile_dir: &Path) -> Result<String> {
+fn wait_for_devtools_endpoint(
+    profile_dir: &Path,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<String> {
+    wait_for_devtools_endpoint_with(profile_dir, timeout, || {
+        child
+            .try_wait()
+            .context("failed to inspect the Chrome for Testing process")
+            .map(|status| status.map(|status| status.to_string()))
+    })
+}
+
+fn wait_for_devtools_endpoint_with(
+    profile_dir: &Path,
+    timeout: Duration,
+    mut exited: impl FnMut() -> Result<Option<String>>,
+) -> Result<String> {
     let active_port = profile_dir.join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + timeout;
     let mut last_error = None;
     while Instant::now() < deadline {
+        require_browser_running(&active_port, &mut exited)?;
         match fs::read_to_string(&active_port) {
             Ok(contents) => {
                 let parsed = contents
@@ -494,15 +583,37 @@ fn wait_for_devtools_endpoint(profile_dir: &Path) -> Result<String> {
             }
             Err(error) => last_error = Some(error.into()),
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(REAL_BROWSER_START_POLL);
     }
+    require_browser_running(&active_port, &mut exited)?;
 
     match last_error {
-        Some(error) => {
-            Err(error).with_context(|| format!("timed out waiting for `{}`", active_port.display()))
-        }
-        None => bail!("timed out waiting for `{}`", active_port.display()),
+        Some(error) => Err(error).with_context(|| {
+            format!(
+                "timed out after {} seconds waiting for `{}` without observing Chrome for Testing exit",
+                timeout.as_secs_f64(),
+                active_port.display()
+            )
+        }),
+        None => bail!(
+            "timed out after {} seconds waiting for `{}` without observing Chrome for Testing exit",
+            timeout.as_secs_f64(),
+            active_port.display()
+        ),
     }
+}
+
+fn require_browser_running(
+    active_port: &Path,
+    exited: &mut impl FnMut() -> Result<Option<String>>,
+) -> Result<()> {
+    if let Some(status) = exited()? {
+        bail!(
+            "Chrome for Testing exited with {status} before `{}` became available",
+            active_port.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn run_live_smoke(
